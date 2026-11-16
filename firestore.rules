@@ -1,0 +1,481 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 0: Global Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isShortId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId && request.auth.token.email_verified == true;
+    }
+
+    function isOwnerRead(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Validation Blueprint: UserProfile
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'displayName', 'plan', 'creditsRemaining', 'weeklyQuota',
+          'nextResetAt', 'twoFactorEnabled', 'autoLockMinutes', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'plan', 'creditsRemaining', 'weeklyQuota',
+          'nextResetAt', 'twoFactorEnabled', 'autoLockMinutes', 'createdAt', 'updatedAt'
+        ])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.plan in ['free', 'pro']
+        && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 100
+        && data.weeklyQuota is int && data.weeklyQuota == 10
+        && data.nextResetAt is string && data.nextResetAt.size() >= 10 && data.nextResetAt.size() <= 64
+        && data.twoFactorEnabled is bool
+        && data.autoLockMinutes is int && data.autoLockMinutes >= 1 && data.autoLockMinutes <= 60
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: UserPrivateSecurity (PII & 2FA Vault)
+    function isValidPrivateSecurity(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'email', 'totpEncryptedSecret', 'totpPendingSecret',
+          'backupCodeHashes', 'last2faVerifiedAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'email', 'totpEncryptedSecret', 'totpPendingSecret',
+          'backupCodeHashes', 'last2faVerifiedAt', 'updatedAt'
+        ])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && data.totpEncryptedSecret is string && data.totpEncryptedSecret.size() <= 512
+        && data.totpPendingSecret is string && data.totpPendingSecret.size() <= 512
+        && data.backupCodeHashes is list && data.backupCodeHashes.size() <= 8
+        && (data.backupCodeHashes.size() == 0 || (data.backupCodeHashes[0] is string && data.backupCodeHashes[0].size() == 64))
+        && data.last2faVerifiedAt is string && data.last2faVerifiedAt.size() <= 64
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: StrategyConfig
+    function isValidStrategyConfig(data, userId, strategyId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'marketType', 'strategyKey', 'name', 'enabled',
+          'dailySignalLimit', 'minConfidence', 'riskPerTradePct', 'leverage',
+          'pairs', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'marketType', 'strategyKey', 'name', 'enabled',
+          'dailySignalLimit', 'minConfidence', 'riskPerTradePct', 'leverage',
+          'pairs', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == strategyId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.marketType in ['spot', 'futures']
+        && data.strategyKey is string && data.strategyKey.size() >= 2 && data.strategyKey.size() <= 64
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.enabled is bool
+        && data.dailySignalLimit is int && data.dailySignalLimit >= 1 && data.dailySignalLimit <= 20
+        && data.minConfidence is int && data.minConfidence >= 50 && data.minConfidence <= 95
+        && (data.riskPerTradePct is int || data.riskPerTradePct is float) && data.riskPerTradePct >= 0.25 && data.riskPerTradePct <= 10.0
+        && data.leverage is int && data.leverage >= 1 && data.leverage <= 20
+        && data.pairs is list && data.pairs.size() >= 1 && data.pairs.size() <= 10
+        && data.pairs[0] is string && data.pairs[0].size() >= 3 && data.pairs[0].size() <= 24
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: AnalysisRecord
+    function isValidAnalysisRecord(data, userId, analysisId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'symbol', 'marketType', 'timeframe', 'strategyKey',
+          'strategyName', 'direction', 'confidence', 'entryZone', 'stopLoss',
+          'takeProfits', 'riskReward', 'summary', 'newsSentiment',
+          'newsSourcesCount', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'symbol', 'marketType', 'timeframe', 'strategyKey',
+          'strategyName', 'direction', 'confidence', 'entryZone', 'stopLoss',
+          'takeProfits', 'riskReward', 'summary', 'newsSentiment',
+          'newsSourcesCount', 'createdAt'
+        ])
+        && data.id is string && data.id == analysisId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.symbol is string && data.symbol.size() >= 3 && data.symbol.size() <= 24
+        && data.marketType in ['spot', 'futures']
+        && data.timeframe is string && data.timeframe.size() >= 2 && data.timeframe.size() <= 12
+        && data.strategyKey is string && data.strategyKey.size() >= 2 && data.strategyKey.size() <= 64
+        && data.strategyName is string && data.strategyName.size() >= 2 && data.strategyName.size() <= 120
+        && data.direction in ['LONG', 'SHORT', 'WAIT']
+        && data.confidence is int && data.confidence >= 0 && data.confidence <= 100
+        && data.entryZone is string && data.entryZone.size() >= 1 && data.entryZone.size() <= 80
+        && data.stopLoss is string && data.stopLoss.size() >= 1 && data.stopLoss.size() <= 40
+        && data.takeProfits is list && data.takeProfits.size() >= 1 && data.takeProfits.size() <= 3
+        && data.takeProfits[0] is string && data.takeProfits[0].size() >= 1 && data.takeProfits[0].size() <= 40
+        && data.riskReward is string && data.riskReward.size() >= 1 && data.riskReward.size() <= 24
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 2500
+        && data.newsSentiment in ['BULLISH', 'BEARISH', 'NEUTRAL']
+        && data.newsSourcesCount is int && data.newsSourcesCount >= 0 && data.newsSourcesCount <= 50
+        && data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: SecurityAuditLog
+    function isValidAuditLog(data, userId, logId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'eventType', 'description', 'deviceLabel', 'status', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'eventType', 'description', 'deviceLabel', 'status', 'createdAt'
+        ])
+        && data.id is string && data.id == logId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.eventType is string && data.eventType.size() >= 2 && data.eventType.size() <= 64
+        && data.description is string && data.description.size() >= 2 && data.description.size() <= 300
+        && data.deviceLabel is string && data.deviceLabel.size() >= 2 && data.deviceLabel.size() <= 120
+        && data.status in ['SUCCESS', 'BLOCKED', 'WARNING']
+        && data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: PushSubscriptionRecord
+    function isValidPushSubscription(data, userId, subId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'endpoint', 'p256dh', 'auth', 'notifySignals',
+          'notifyMarketMoves', 'notifyNews', 'notifyAuthLogins',
+          'notifyStrategyChanges', 'notifySignalLimits', 'enabled', 'deviceLabel',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'endpoint', 'p256dh', 'auth', 'notifySignals',
+          'notifyMarketMoves', 'notifyNews', 'notifyAuthLogins',
+          'notifyStrategyChanges', 'notifySignalLimits', 'enabled', 'deviceLabel',
+          'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == subId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.endpoint is string && data.endpoint.size() >= 10 && data.endpoint.size() <= 600
+        && data.p256dh is string && data.p256dh.size() >= 10 && data.p256dh.size() <= 256
+        && data.auth is string && data.auth.size() >= 10 && data.auth.size() <= 128
+        && data.notifySignals is bool
+        && data.notifyMarketMoves is bool
+        && data.notifyNews is bool
+        && data.notifyAuthLogins is bool
+        && data.notifyStrategyChanges is bool
+        && data.notifySignalLimits is bool
+        && data.enabled is bool
+        && data.deviceLabel is string && data.deviceLabel.size() >= 2 && data.deviceLabel.size() <= 120
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: UserSessionRecord
+    function isValidUserSession(data, userId, sessionId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'deviceLabel', 'deviceType', 'browserLabel',
+          'status', 'lastLoginAt', 'lastActiveAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'deviceLabel', 'deviceType', 'browserLabel',
+          'status', 'ipAddress', 'city', 'country', 'countryCode',
+          'latitude', 'longitude', 'isSuspicious',
+          'lastLoginAt', 'lastActiveAt', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == sessionId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.deviceLabel is string && data.deviceLabel.size() >= 2 && data.deviceLabel.size() <= 120
+        && data.deviceType in ['mobile', 'desktop', 'pwa']
+        && data.browserLabel is string && data.browserLabel.size() >= 2 && data.browserLabel.size() <= 80
+        && data.status in ['active', 'revoked']
+        && (!('ipAddress' in data) || (data.ipAddress is string && data.ipAddress.size() <= 64))
+        && (!('city' in data) || (data.city is string && data.city.size() <= 80))
+        && (!('country' in data) || (data.country is string && data.country.size() <= 80))
+        && (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() <= 8))
+        && (!('latitude' in data) || ((data.latitude is int || data.latitude is float) && data.latitude >= -90 && data.latitude <= 90))
+        && (!('longitude' in data) || ((data.longitude is int || data.longitude is float) && data.longitude >= -180 && data.longitude <= 180))
+        && (!('isSuspicious' in data) || data.isSuspicious is bool)
+        && data.lastLoginAt is timestamp
+        && data.lastActiveAt is timestamp
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: PriceAlertRecord
+    function isValidPriceAlert(data, userId, alertId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'symbol', 'marketType', 'condition', 'targetPrice',
+          'active', 'triggeredAt', 'triggeredPrice', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'symbol', 'marketType', 'condition', 'targetPrice',
+          'active', 'triggeredAt', 'triggeredPrice', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == alertId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.symbol is string && data.symbol.size() >= 3 && data.symbol.size() <= 24
+        && data.marketType in ['spot', 'futures']
+        && data.condition in ['above', 'below']
+        && (data.targetPrice is int || data.targetPrice is float) && data.targetPrice > 0 && data.targetPrice <= 100000000
+        && data.active is bool
+        && data.triggeredAt is string && data.triggeredAt.size() <= 64
+        && (data.triggeredPrice is int || data.triggeredPrice is float) && data.triggeredPrice >= 0 && data.triggeredPrice <= 100000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Master Gate: /users/{userId}
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwnerRead(userId);
+      allow list: if false;
+
+      allow create: if isValidId(userId)
+        && isVerifiedOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().plan == 'free'
+        && incoming().creditsRemaining == 10
+        && incoming().twoFactorEnabled == false
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId)
+        && isVerifiedOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Consume or Reset Weekly Credits
+          (incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
+          // Action 2: Toggle 2FA or Auto-Lock Timeout
+          (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
+          // Action 3: Upgrade / Switch Subscription Plan
+          (incoming().diff(existing()).affectedKeys().hasOnly(['plan', 'creditsRemaining', 'updatedAt'])) ||
+          // Action 4: Update Display Name
+          (incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
+        );
+
+      allow delete: if false;
+
+      // Split Collection: Isolated PII & 2FA Secret Vault
+      match /private/{docId} {
+        allow get: if isValidId(userId) && docId == 'security' && isOwnerRead(userId);
+        allow list: if false;
+
+        allow create: if isValidId(userId)
+          && docId == 'security'
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPrivateSecurity(incoming(), userId)
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && docId == 'security'
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPrivateSecurity(incoming(), userId)
+          && incoming().uid == existing().uid
+          && incoming().updatedAt == request.time
+          && (
+            (incoming().diff(existing()).affectedKeys().hasOnly(['totpPendingSecret', 'updatedAt'])) ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['totpEncryptedSecret', 'totpPendingSecret', 'backupCodeHashes', 'last2faVerifiedAt', 'updatedAt'])) ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['backupCodeHashes', 'last2faVerifiedAt', 'updatedAt'])) ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['last2faVerifiedAt', 'updatedAt']))
+          );
+
+        allow delete: if false;
+      }
+
+      // Subcollection: Configured Spot & Futures Strategies
+      match /strategies/{strategyId} {
+        allow get: if isValidId(userId) && isShortId(strategyId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(strategyId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidStrategyConfig(incoming(), userId, strategyId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
+            || incoming().dailySignalLimit == 1
+          );
+
+        allow update: if isValidId(userId)
+          && isShortId(strategyId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidStrategyConfig(incoming(), userId, strategyId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
+            || incoming().dailySignalLimit == 1
+          )
+          && (
+            (incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt'])) ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['dailySignalLimit', 'minConfidence', 'riskPerTradePct', 'leverage', 'pairs', 'enabled', 'updatedAt']))
+          );
+
+        allow delete: if isValidId(userId) && isShortId(strategyId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: Saved Chart & News Analyses
+      match /analyses/{analysisId} {
+        allow get: if isValidId(userId) && isShortId(analysisId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(analysisId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidAnalysisRecord(incoming(), userId, analysisId)
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+        allow delete: if isValidId(userId) && isShortId(analysisId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: Immutable Security Audit Logs
+      match /auditLogs/{logId} {
+        allow get: if isValidId(userId) && isShortId(logId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(logId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidAuditLog(incoming(), userId, logId)
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+        allow delete: if false;
+      }
+
+      // Subcollection: PWA Web Push Subscriptions
+      match /pushSubscriptions/{subId} {
+        allow get: if isValidId(userId) && isShortId(subId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(subId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPushSubscription(incoming(), userId, subId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(subId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPushSubscription(incoming(), userId, subId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'endpoint', 'p256dh', 'auth', 'notifySignals', 'notifyMarketMoves',
+              'notifyNews', 'notifyAuthLogins', 'notifyStrategyChanges', 'notifySignalLimits',
+              'enabled', 'deviceLabel', 'updatedAt'
+            ])
+          );
+
+        allow delete: if isValidId(userId) && isShortId(subId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: Active & Revoked Device Sessions
+      match /sessions/{sessionId} {
+        allow get: if isValidId(userId) && isShortId(sessionId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(sessionId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidUserSession(incoming(), userId, sessionId)
+          && incoming().status == 'active'
+          && incoming().lastLoginAt == request.time
+          && incoming().lastActiveAt == request.time
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(sessionId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidUserSession(incoming(), userId, sessionId)
+          && existing().status == 'active'
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (incoming().status == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['deviceLabel', 'deviceType', 'browserLabel', 'ipAddress', 'city', 'country', 'countryCode', 'latitude', 'longitude', 'lastLoginAt', 'lastActiveAt', 'updatedAt'])) ||
+            (incoming().status == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['isSuspicious', 'updatedAt'])) ||
+            (incoming().status == 'revoked' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+            (incoming().status == 'revoked' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'isSuspicious', 'updatedAt']))
+          );
+
+        allow delete: if isValidId(userId) && isShortId(sessionId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: User Price Threshold Alerts
+      match /priceAlerts/{alertId} {
+        allow get: if isValidId(userId) && isShortId(alertId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(alertId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPriceAlert(incoming(), userId, alertId)
+          && incoming().active == true
+          && incoming().triggeredAt == ''
+          && incoming().triggeredPrice == 0
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(alertId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPriceAlert(incoming(), userId, alertId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'active', 'targetPrice', 'condition', 'triggeredAt', 'triggeredPrice', 'updatedAt'
+            ])
+          );
+
+        allow delete: if isValidId(userId) && isShortId(alertId) && isVerifiedOwner(userId);
+      }
+    }
+  }
+}

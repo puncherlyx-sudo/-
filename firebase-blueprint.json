@@ -1,0 +1,199 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public-safe account metadata, subscription tier, weekly credit quota, and 2FA enablement state.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "plan": { "type": "string", "enum": ["free", "pro"] },
+        "creditsRemaining": { "type": "integer" },
+        "weeklyQuota": { "type": "integer" },
+        "nextResetAt": { "type": "string", "minLength": 10, "maxLength": 64 },
+        "twoFactorEnabled": { "type": "boolean" },
+        "autoLockMinutes": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "plan", "creditsRemaining", "weeklyQuota", "nextResetAt", "twoFactorEnabled", "autoLockMinutes", "createdAt", "updatedAt"]
+    },
+    "UserPrivateSecurity": {
+      "title": "UserPrivateSecurity",
+      "description": "Isolated PII and 2FA cryptographic vault containing user email, encrypted TOTP secret, and SHA-256 backup code hashes.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "totpEncryptedSecret": { "type": "string", "maxLength": 512 },
+        "totpPendingSecret": { "type": "string", "maxLength": 512 },
+        "backupCodeHashes": { "type": "array" },
+        "last2faVerifiedAt": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "totpEncryptedSecret", "totpPendingSecret", "backupCodeHashes", "last2faVerifiedAt", "updatedAt"]
+    },
+    "StrategyConfig": {
+      "title": "StrategyConfig",
+      "description": "User-configured Spot or Futures trading strategy parameters and PRO daily signal limit.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "marketType": { "type": "string", "enum": ["spot", "futures"] },
+        "strategyKey": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "enabled": { "type": "boolean" },
+        "dailySignalLimit": { "type": "integer" },
+        "minConfidence": { "type": "integer" },
+        "riskPerTradePct": { "type": "number" },
+        "leverage": { "type": "integer" },
+        "pairs": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "marketType", "strategyKey", "name", "enabled", "dailySignalLimit", "minConfidence", "riskPerTradePct", "leverage", "pairs", "createdAt", "updatedAt"]
+    },
+    "AnalysisRecord": {
+      "title": "AnalysisRecord",
+      "description": "Saved AI market, chart, and news analysis generated for a selected Spot or Futures strategy.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "symbol": { "type": "string", "minLength": 3, "maxLength": 24 },
+        "marketType": { "type": "string", "enum": ["spot", "futures"] },
+        "timeframe": { "type": "string", "minLength": 2, "maxLength": 12 },
+        "strategyKey": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "strategyName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "direction": { "type": "string", "enum": ["LONG", "SHORT", "WAIT"] },
+        "confidence": { "type": "integer" },
+        "entryZone": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "stopLoss": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "takeProfits": { "type": "array" },
+        "riskReward": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2500 },
+        "newsSentiment": { "type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"] },
+        "newsSourcesCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "symbol", "marketType", "timeframe", "strategyKey", "strategyName", "direction", "confidence", "entryZone", "stopLoss", "takeProfits", "riskReward", "summary", "newsSentiment", "newsSourcesCount", "createdAt"]
+    },
+    "SecurityAuditLog": {
+      "title": "SecurityAuditLog",
+      "description": "Immutable chronological audit trail of authentication, 2FA verification, strategy updates, and subscription events.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "eventType": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "description": { "type": "string", "minLength": 2, "maxLength": 300 },
+        "deviceLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["SUCCESS", "BLOCKED", "WARNING"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "eventType", "description", "deviceLabel", "status", "createdAt"]
+    },
+    "PushSubscriptionRecord": {
+      "title": "PushSubscriptionRecord",
+      "description": "Browser/PWA Web Push subscription endpoint, encryption keys, and alert category preferences.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "endpoint": { "type": "string", "minLength": 10, "maxLength": 600 },
+        "p256dh": { "type": "string", "minLength": 10, "maxLength": 256 },
+        "auth": { "type": "string", "minLength": 10, "maxLength": 128 },
+        "notifySignals": { "type": "boolean" },
+        "notifyMarketMoves": { "type": "boolean" },
+        "notifyNews": { "type": "boolean" },
+        "notifyAuthLogins": { "type": "boolean" },
+        "notifyStrategyChanges": { "type": "boolean" },
+        "notifySignalLimits": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "deviceLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "endpoint", "p256dh", "auth", "notifySignals", "notifyMarketMoves", "notifyNews", "notifyAuthLogins", "notifyStrategyChanges", "notifySignalLimits", "enabled", "deviceLabel", "createdAt", "updatedAt"]
+    },
+    "UserSessionRecord": {
+      "title": "UserSessionRecord",
+      "description": "Tracked device login session with IP geolocation, last login timestamp, device type, browser label, and active/revoked status.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "deviceLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "deviceType": { "type": "string", "enum": ["mobile", "desktop", "pwa"] },
+        "browserLabel": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["active", "revoked"] },
+        "ipAddress": { "type": "string", "maxLength": 64 },
+        "city": { "type": "string", "maxLength": 80 },
+        "country": { "type": "string", "maxLength": 80 },
+        "countryCode": { "type": "string", "maxLength": 8 },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "isSuspicious": { "type": "boolean" },
+        "lastLoginAt": { "type": "string", "format": "date-time" },
+        "lastActiveAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "deviceLabel", "deviceType", "browserLabel", "status", "lastLoginAt", "lastActiveAt", "createdAt", "updatedAt"]
+    },
+    "PriceAlertRecord": {
+      "title": "PriceAlertRecord",
+      "description": "User-configured price threshold alert for a trading pair triggering Web Push notifications.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "symbol": { "type": "string", "minLength": 3, "maxLength": 24 },
+        "marketType": { "type": "string", "enum": ["spot", "futures"] },
+        "condition": { "type": "string", "enum": ["above", "below"] },
+        "targetPrice": { "type": "number" },
+        "active": { "type": "boolean" },
+        "triggeredAt": { "type": "string", "maxLength": 64 },
+        "triggeredPrice": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "symbol", "marketType", "condition", "targetPrice", "active", "triggeredAt", "triggeredPrice", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile, plan status, weekly credits, and 2FA toggle state."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateSecurity" },
+      "description": "Isolated PII and encrypted TOTP / SHA-256 backup code vault."
+    },
+    "/users/{userId}/strategies/{strategyId}": {
+      "schema": { "$ref": "#/entities/StrategyConfig" },
+      "description": "Configured Spot and Futures strategies and daily signal limits."
+    },
+    "/users/{userId}/analyses/{analysisId}": {
+      "schema": { "$ref": "#/entities/AnalysisRecord" },
+      "description": "Saved AI chart and news analysis records."
+    },
+    "/users/{userId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/SecurityAuditLog" },
+      "description": "Immutable security and 2FA audit trail."
+    },
+    "/users/{userId}/pushSubscriptions/{subId}": {
+      "schema": { "$ref": "#/entities/PushSubscriptionRecord" },
+      "description": "PWA Web Push subscription keys and notification preferences per device."
+    },
+    "/users/{userId}/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/UserSessionRecord" },
+      "description": "Tracked active and revoked login sessions per device."
+    },
+    "/users/{userId}/priceAlerts/{alertId}": {
+      "schema": { "$ref": "#/entities/PriceAlertRecord" },
+      "description": "User-defined pair price threshold alerts for background Web Push delivery."
+    }
+  }
+}
