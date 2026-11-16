@@ -2,8 +2,18 @@ import crypto from 'crypto';
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
+const FALLBACK_VAULT_SECRET = 'aegisquant-institutional-vault-2026';
+let fallbackVaultWarningShown = false;
+
 function getVaultKey(uid: string): Buffer {
-  const master = process.env.TOTP_MASTER_KEY || process.env.GEMINI_API_KEY || 'aegisquant-institutional-vault-2026';
+  const configured = process.env.TOTP_MASTER_KEY || process.env.GEMINI_API_KEY;
+  if (!configured && !fallbackVaultWarningShown) {
+    fallbackVaultWarningShown = true;
+    console.warn(
+      '[security] TOTP_MASTER_KEY не задан: TOTP-секреты шифруются публичным запасным ключом. Задайте TOTP_MASTER_KEY в окружении.',
+    );
+  }
+  const master = configured || FALLBACK_VAULT_SECRET;
   return crypto.createHash('sha256').update(`${master}:${uid}:totp-v1`).digest();
 }
 

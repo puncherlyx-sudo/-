@@ -180,7 +180,7 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
     WIDGET_TABS.find((t) => t.kind === widgetKind)?.tab ?? 'market';
 
   return (
-    <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col justify-between p-4 sm:p-6">
+    <div className="min-h-dvh bg-[#0B0F17] text-slate-100 flex flex-col justify-between p-4 sm:p-6">
       <div className="w-full max-w-xl mx-auto space-y-4">
         {/* Compact Widget Mode Top Navigation */}
         <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-white/10">

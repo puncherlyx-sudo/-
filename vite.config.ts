@@ -27,6 +27,7 @@ export default defineConfig(() => {
           display_override: ['standalone', 'minimal-ui'],
           orientation: 'portrait-primary',
           categories: ['finance', 'productivity'],
+          lang: 'ru',
           start_url: '/',
           scope: '/',
           icons: [

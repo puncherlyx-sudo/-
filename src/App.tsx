@@ -459,7 +459,7 @@ export default function App() {
 
   return (
     <MotionConfig reducedMotion="user">
-      <div className="min-h-screen text-slate-100 flex flex-col">
+      <div className="min-h-dvh text-slate-100 flex flex-col">
         {/* Desktop 3-Zone Top Bar Contract */}
         <header className="hidden md:block sticky top-0 z-30 border-b border-white/8 bg-[#0B0F17]/88 backdrop-blur-md">
           <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-8">
