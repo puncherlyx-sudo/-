@@ -32,6 +32,7 @@ import {
   type UserProfile,
   type UserSessionRecord,
 } from '../types/domain';
+import { authFetch } from '../lib/authFetch';
 
 function nextWeekIso(): string {
   return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -1006,7 +1007,7 @@ export function useAuthAndVault() {
 
     const syncToServer = async () => {
       try {
-        const res = await fetch('/api/push/price-alerts/sync', {
+        const res = await authFetch('/api/push/price-alerts/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1057,7 +1058,7 @@ export function useAuthAndVault() {
       return { checkedAlerts: 0, alertsSent: 0, triggeredCount: 0 };
     }
     const uid = firebaseUser.uid;
-    const res = await fetch('/api/push/price-alerts/check', {
+    const res = await authFetch('/api/push/price-alerts/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ uid }),

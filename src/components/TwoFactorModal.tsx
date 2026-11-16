@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { KeyRound, ShieldCheck, X } from 'lucide-react';
+import { authFetch } from '../lib/authFetch';
 
 interface TwoFactorModalProps {
   open: boolean;
@@ -34,7 +35,7 @@ export const TwoFactorModal: React.FC<TwoFactorModalProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/security/totp/verify', {
+      const res = await authFetch('/api/security/totp/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -32,6 +32,7 @@ import { SecurityAuditActivityChart } from './SecurityAuditActivityChart';
 import { SecurityFaqSection } from './SecurityFaqSection';
 import { SecurityStrengthIndicator } from './SecurityStrengthIndicator';
 import { SessionGeoMapPanel } from './SessionGeoMapPanel';
+import { authFetch } from '../lib/authFetch';
 
 export type SecuritySection = 'meter' | '2fa' | 'push' | 'alerts' | 'sessions' | 'audit';
 
@@ -149,7 +150,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
     setError(null);
     setBackupCodes(null);
     try {
-      const res = await fetch('/api/security/totp/setup', {
+      const res = await authFetch('/api/security/totp/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -183,7 +184,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
     setLoadingSetup(true);
     setError(null);
     try {
-      const res = await fetch('/api/security/totp/confirm', {
+      const res = await authFetch('/api/security/totp/confirm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

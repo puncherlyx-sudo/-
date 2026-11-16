@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { PushSubscriptionRecord } from '../types/domain';
+import { authFetch } from '../lib/authFetch';
 
 export interface PushPreferences {
   notifySignals: boolean;
@@ -133,7 +134,7 @@ export function usePushNotifications({
               }
             : preferences;
 
-          await fetch('/api/push/subscribe', {
+          await authFetch('/api/push/subscribe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -204,7 +205,7 @@ export function usePushNotifications({
         throw new Error('Браузер вернул неполные криптографические ключи подписки.');
       }
 
-      const apiRes = await fetch('/api/push/subscribe', {
+      const apiRes = await authFetch('/api/push/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -254,7 +255,7 @@ export function usePushNotifications({
         await existing.unsubscribe();
       }
       if (endpointToRemove) {
-        await fetch('/api/push/unsubscribe', {
+        await authFetch('/api/push/unsubscribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ endpoint: endpointToRemove }),
@@ -285,7 +286,7 @@ export function usePushNotifications({
         const keys = extractKeys(existing);
         if (!keys) return;
 
-        await fetch('/api/push/subscribe', {
+        await authFetch('/api/push/subscribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -322,7 +323,7 @@ export function usePushNotifications({
     setError(null);
     setStatusMessage(null);
     try {
-      const res = await fetch('/api/push/send-test', {
+      const res = await authFetch('/api/push/send-test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ uid }),
@@ -344,7 +345,7 @@ export function usePushNotifications({
     setError(null);
     setStatusMessage(null);
     try {
-      const res = await fetch('/api/push/scan-market', { method: 'POST' });
+      const res = await authFetch('/api/push/scan-market', { method: 'POST' });
       const data = (await res.json()) as {
         checkedPairs?: number;
         alertsSent?: number;
@@ -379,7 +380,7 @@ export function usePushNotifications({
       if (params.category === 'signal_limit' && !preferences.notifySignalLimits) return;
 
       try {
-        await fetch('/api/push/security-event', {
+        await authFetch('/api/push/security-event', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

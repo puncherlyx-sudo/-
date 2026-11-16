@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import path from 'path';
 import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
+import { isAllowedPushEndpoint, requireAuth } from './server/auth.ts';
 import {
   fetchEconomicCalendar,
   fetchGroundedCryptoNews,
@@ -43,11 +44,44 @@ async function startServer() {
   // Security headers hardened against XSS, MIME sniffing, and clickjacking
   app.use(
     helmet({
-      contentSecurityPolicy: false,
+      // CSP в разработке отключён (Vite HMR требует inline-скриптов), в продакшене включён.
+      contentSecurityPolicy: isProd
+        ? {
+            useDefaults: false,
+            directives: {
+              'default-src': ["'self'"],
+              'script-src': ["'self'", 'https://apis.google.com'],
+              'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+              'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
+              'img-src': ["'self'", 'data:', 'blob:', 'https:'],
+              'connect-src': [
+                "'self'",
+                'https://*.googleapis.com',
+                'https://*.firebaseio.com',
+                'https://*.firebaseapp.com',
+                'wss://*.firebaseio.com',
+              ],
+              'frame-src': ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com', 'https://apis.google.com'],
+              'worker-src': ["'self'", 'blob:'],
+              'manifest-src': ["'self'"],
+              'object-src': ["'none'"],
+              'base-uri': ["'self'"],
+              'form-action': ["'self'"],
+              // Запрет встраивания в чужие страницы (защита от clickjacking).
+              // Разрешён предпросмотр внутри Google AI Studio.
+              'frame-ancestors': ["'self'", 'https://aistudio.google.com', 'https://*.google.com'],
+              'upgrade-insecure-requests': [],
+            },
+          }
+        : false,
       crossOriginEmbedderPolicy: false,
-      frameguard: false, // Allow AI Studio preview iframe hosting
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' }, // нужно для входа Google через popup
+      frameguard: false, // замена: frame-ancestors в CSP
+      hsts: { maxAge: 31536000, includeSubDomains: true },
+      referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
     })
   );
+  app.disable('x-powered-by');
 
   app.use(express.json({ limit: '256kb' }));
 
@@ -65,6 +99,14 @@ async function startServer() {
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Слишком много попыток 2FA. Подождите 5 минут для защиты аккаунта.' },
+  });
+
+  const expensiveLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 12,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Слишком много тяжёлых запросов. Повторите через минуту.' },
   });
 
   app.use('/api', generalApiLimiter);
@@ -315,7 +357,7 @@ async function startServer() {
   });
 
   // AI Strategy + Chart + News analysis
-  app.post('/api/analyze', async (req, res) => {
+  app.post('/api/analyze', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as Record<string, unknown>;
       const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
@@ -357,7 +399,7 @@ async function startServer() {
   });
 
   // Quantitative Strategy PnL Portfolio Backtest (based on live/cached exchange candles)
-  app.post('/api/strategies/pnl', async (req, res) => {
+  app.post('/api/strategies/pnl', expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as {
         strategies?: StrategySimulationInput[];
@@ -382,10 +424,13 @@ async function startServer() {
   });
 
   // 2FA Step 1: Generate TOTP secret + QR code + encrypted pending secret
-  app.post('/api/security/totp/setup', strictAuthLimiter, async (req, res) => {
+  app.post('/api/security/totp/setup', requireAuth, strictAuthLimiter, async (req, res) => {
     try {
-      const { uid, email } = req.body as { uid?: string; email?: string };
-      if (!uid || !email || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid)) {
+      const uid = req.user!.uid;
+      const email = req.user!.email || (typeof (req.body as { email?: unknown })?.email === 'string'
+        ? String((req.body as { email: string }).email).slice(0, 254)
+        : '');
+      if (!email) {
         res.status(400).json({ error: 'Некорректные параметры пользователя.' });
         return;
       }
@@ -409,14 +454,14 @@ async function startServer() {
   });
 
   // 2FA Step 2: Verify initial 6-digit TOTP code and issue 8 SHA-256 hashed backup codes
-  app.post('/api/security/totp/confirm', strictAuthLimiter, (req, res) => {
+  app.post('/api/security/totp/confirm', requireAuth, strictAuthLimiter, (req, res) => {
     try {
-      const { uid, encryptedPendingSecret, code } = req.body as {
-        uid?: string;
+      const uid = req.user!.uid;
+      const { encryptedPendingSecret, code } = req.body as {
         encryptedPendingSecret?: string;
         code?: string;
       };
-      if (!uid || !encryptedPendingSecret || !code) {
+      if (!encryptedPendingSecret || !code) {
         res.status(400).json({ error: 'Укажите код подтверждения 2FA.' });
         return;
       }
@@ -438,15 +483,15 @@ async function startServer() {
   });
 
   // 2FA Step-Up & Lock Screen Verification (supports TOTP OR single-use backup code)
-  app.post('/api/security/totp/verify', strictAuthLimiter, (req, res) => {
+  app.post('/api/security/totp/verify', requireAuth, strictAuthLimiter, (req, res) => {
     try {
-      const { uid, encryptedSecret, code, backupCodeHashes } = req.body as {
-        uid?: string;
+      const uid = req.user!.uid;
+      const { encryptedSecret, code, backupCodeHashes } = req.body as {
         encryptedSecret?: string;
         code?: string;
         backupCodeHashes?: string[];
       };
-      if (!uid || !encryptedSecret || !code) {
+      if (typeof code !== 'string' || typeof encryptedSecret !== 'string' || !code || !encryptedSecret) {
         res.status(400).json({ error: 'Недостаточно данных для проверки 2FA.' });
         return;
       }
@@ -615,7 +660,7 @@ async function startServer() {
   });
 
   // Web Push: Register or update device push subscription
-  app.post('/api/push/subscribe', (req, res) => {
+  app.post('/api/push/subscribe', requireAuth, (req, res) => {
     try {
       const body = req.body as {
         uid?: string;
@@ -631,12 +676,12 @@ async function startServer() {
         notifySignalLimits?: boolean;
         enabled?: boolean;
       };
-      const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
+      const uid = req.user!.uid;
       const endpoint = typeof body.subscription?.endpoint === 'string' ? body.subscription.endpoint.trim() : '';
       const p256dh = typeof body.subscription?.keys?.p256dh === 'string' ? body.subscription.keys.p256dh : '';
       const authKey = typeof body.subscription?.keys?.auth === 'string' ? body.subscription.keys.auth : '';
 
-      if (!uid || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid) || !endpoint.startsWith('https://') || !p256dh || !authKey) {
+      if (!isAllowedPushEndpoint(endpoint) || !p256dh || !authKey || p256dh.length > 256 || authKey.length > 64) {
         res.status(400).json({ error: 'Некорректные данные Push-подписки.' });
         return;
       }
@@ -664,26 +709,20 @@ async function startServer() {
   });
 
   // Web Push: Remove device subscription
-  app.post('/api/push/unsubscribe', (req, res) => {
+  app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
     const endpoint = typeof (req.body as { endpoint?: unknown })?.endpoint === 'string'
       ? String((req.body as { endpoint: string }).endpoint).trim()
       : '';
     if (endpoint) {
-      unregisterPushSubscription(endpoint);
+      unregisterPushSubscription(endpoint, req.user!.uid);
     }
     res.json({ ok: true });
   });
 
   // Web Push: Dispatch test notification to verify background Service Worker delivery
-  app.post('/api/push/send-test', async (req, res) => {
+  app.post('/api/push/send-test', requireAuth, expensiveLimiter, async (req, res) => {
     try {
-      const uid = typeof (req.body as { uid?: unknown })?.uid === 'string'
-        ? String((req.body as { uid: string }).uid).trim()
-        : '';
-      if (!uid) {
-        res.status(400).json({ error: 'Требуется идентификатор пользователя.' });
-        return;
-      }
+      const uid = req.user!.uid;
       const result = await dispatchPushToUser(uid, {
         title: 'AegisQuant · Тест фоновых уведомлений',
         body: 'Push-канал активен. Вы будете получать сигналы стратегий и рыночные импульсы даже при закрытом приложении.',
@@ -705,10 +744,9 @@ async function startServer() {
   });
 
   // Web Push: Notify user when a strategy analysis issues a LONG or SHORT signal
-  app.post('/api/push/trigger-signal', async (req, res) => {
+  app.post('/api/push/trigger-signal', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as {
-        uid?: string;
         symbol?: string;
         marketType?: string;
         direction?: string;
@@ -716,17 +754,17 @@ async function startServer() {
         strategyName?: string;
         entryZone?: string;
       };
-      const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
+      const uid = req.user!.uid;
       const direction = body.direction === 'LONG' || body.direction === 'SHORT' ? body.direction : '';
       if (!uid || !direction) {
         res.json({ ok: true, skipped: true });
         return;
       }
-      const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
+      const symbol = String(body.symbol || 'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20);
       const marketLabel = body.marketType === 'futures' ? 'Фьючерсы' : 'Спот';
       const confidence = Math.round(Number(body.confidence || 0));
-      const strategyName = String(body.strategyName || 'Торговая стратегия');
-      const entryZone = String(body.entryZone || '');
+      const strategyName = String(body.strategyName || 'Торговая стратегия').slice(0, 80);
+      const entryZone = String(body.entryZone || '').slice(0, 80);
 
       const result = await dispatchPushToUser(uid, {
         title: `AegisQuant · Сигнал ${direction} ${symbol}`,
@@ -743,23 +781,22 @@ async function startServer() {
   });
 
   // Web Push: Critical security & limit alerts (login, strategy changes, signal limits)
-  app.post('/api/push/security-event', async (req, res) => {
+  app.post('/api/push/security-event', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as {
-        uid?: string;
         category?: string;
         title?: string;
         body?: string;
         url?: string;
       };
-      const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
+      const uid = req.user!.uid;
       const category =
         body.category === 'auth_login' ||
         body.category === 'strategy_change' ||
         body.category === 'signal_limit'
           ? body.category
           : null;
-      if (!uid || !category || !body.title || !body.body) {
+      if (!category || typeof body.title !== 'string' || typeof body.body !== 'string' || !body.title || !body.body) {
         res.status(400).json({ error: 'Некорректные параметры критического уведомления.' });
         return;
       }
@@ -767,7 +804,7 @@ async function startServer() {
         title: String(body.title).slice(0, 120),
         body: String(body.body).slice(0, 300),
         tag: `sec-${category}`,
-        url: typeof body.url === 'string' && body.url.startsWith('/') ? body.url : '/?tab=security',
+        url: typeof body.url === 'string' && /^\/(?!\/)[^\s]*$/.test(body.url) ? body.url.slice(0, 200) : '/?tab=security',
         impact: 'HIGH',
         category,
       });
@@ -778,11 +815,11 @@ async function startServer() {
   });
 
   // Web Push: On-demand market anomaly & funding rate scan
-  app.post('/api/push/scan-market', async (_req, res) => {
+  app.post('/api/push/scan-market', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const [marketResult, priceAlertsResult] = await Promise.all([
         scanMarketAndNotify(),
-        checkPriceAlertsForUser(),
+        checkPriceAlertsForUser(req.user!.uid),
       ]);
       res.json({
         ...marketResult,
@@ -795,10 +832,9 @@ async function startServer() {
   });
 
   // Web Push: Sync user custom price threshold alerts for background monitoring
-  app.post('/api/push/price-alerts/sync', (req, res) => {
+  app.post('/api/push/price-alerts/sync', requireAuth, (req, res) => {
     try {
       const body = req.body as {
-        uid?: string;
         alerts?: Array<{
           id?: string;
           symbol?: string;
@@ -809,13 +845,9 @@ async function startServer() {
           updatedAtMs?: number;
         }>;
       };
-      const uid = typeof body.uid === 'string' ? body.uid.trim() : '';
-      if (!uid || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid)) {
-        res.status(400).json({ error: 'Требуется корректный идентификатор пользователя.' });
-        return;
-      }
+      const uid = req.user!.uid;
 
-      const rawAlerts = Array.isArray(body.alerts) ? body.alerts : [];
+      const rawAlerts = Array.isArray(body.alerts) ? body.alerts.slice(0, 100) : [];
       const normalized = rawAlerts
         .filter(
           (a) =>
@@ -843,15 +875,9 @@ async function startServer() {
   });
 
   // Web Push: Immediately check custom price alerts for user against live prices
-  app.post('/api/push/price-alerts/check', async (req, res) => {
+  app.post('/api/push/price-alerts/check', requireAuth, expensiveLimiter, async (req, res) => {
     try {
-      const uid = typeof (req.body as { uid?: unknown })?.uid === 'string'
-        ? String((req.body as { uid: string }).uid).trim()
-        : '';
-      if (!uid || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid)) {
-        res.status(400).json({ error: 'Требуется корректный идентификатор пользователя.' });
-        return;
-      }
+      const uid = req.user!.uid;
       const result = await checkPriceAlertsForUser(uid);
       res.json({ ok: true, ...result });
     } catch (err) {

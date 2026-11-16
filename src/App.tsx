@@ -37,6 +37,7 @@ import type {
   PlanTier,
   Timeframe,
 } from './types/domain';
+import { authFetch } from './lib/authFetch';
 
 interface PendingStepUpAction {
   title: string;
@@ -341,7 +342,7 @@ export default function App() {
   }) => {
     if (!firebaseUser || !pushState.isSubscribed || !pushState.preferences.notifySignals) return;
     try {
-      await fetch('/api/push/trigger-signal', {
+      await authFetch('/api/push/trigger-signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
