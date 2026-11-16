@@ -263,6 +263,8 @@ export interface UserProfile {
   nextResetAt: string;
   twoFactorEnabled: boolean;
   autoLockMinutes: number;
+  /** Конец оплаченного периода PRO (мс). Выставляется только сервером. */
+  proUntil?: number;
   createdAt?: unknown;
   updatedAt?: unknown;
 }

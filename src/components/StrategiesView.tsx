@@ -539,15 +539,6 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                   </li>
                 </ul>
               </div>
-              {profile && isPro && (
-                <button
-                  type="button"
-                  onClick={() => void onSwitchPlan('free')}
-                  className="min-h-[42px] w-full rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-300 transition-colors"
-                >
-                  Переключиться на бесплатный тариф
-                </button>
-              )}
             </div>
 
             <div className="rounded-2xl border border-amber-500/30 bg-[#111827] p-5 flex flex-col justify-between gap-4">

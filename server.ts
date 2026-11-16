@@ -7,6 +7,15 @@ import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
 import { isAllowedPushEndpoint, requireAuth } from './server/auth.ts';
 import {
+  createCheckout,
+  getPlanPrices,
+  isBillingConfigured,
+  processIpn,
+  startProExpiryMonitor,
+  verifyIpnSignature,
+  type BillingPeriod,
+} from './server/billing.ts';
+import {
   fetchEconomicCalendar,
   fetchGroundedCryptoNews,
   runStrategyAnalysis,
@@ -654,6 +663,41 @@ async function startServer() {
     });
   });
 
+  // Оплата PRO (криптовалюта через NOWPayments)
+  app.get('/api/billing/plans', (_req, res) => {
+    res.json({ enabled: isBillingConfigured(), plans: getPlanPrices() });
+  });
+
+  app.post('/api/billing/checkout', requireAuth, strictAuthLimiter, async (req, res) => {
+    try {
+      const period = (req.body as { period?: unknown })?.period;
+      if (period !== 'month' && period !== 'year') {
+        res.status(400).json({ error: 'Выберите период подписки: месяц или год.' });
+        return;
+      }
+      const { invoiceUrl } = await createCheckout(req.user!.uid, period as BillingPeriod);
+      res.json({ invoiceUrl });
+    } catch (err) {
+      res.status(503).json({ error: err instanceof Error ? err.message : 'Не удалось создать счёт на оплату.' });
+    }
+  });
+
+  // Уведомления NOWPayments (IPN). Без подписи — отказ; тариф выдаёт только проверенное уведомление.
+  app.post('/api/billing/ipn', async (req, res) => {
+    const signature = req.headers['x-nowpayments-sig'];
+    if (!verifyIpnSignature(req.body, typeof signature === 'string' ? signature : undefined)) {
+      res.status(401).json({ error: 'Invalid signature' });
+      return;
+    }
+    try {
+      await processIpn(req.body as Record<string, unknown>);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('[billing] Ошибка обработки IPN:', err instanceof Error ? err.message : err);
+      res.status(500).json({ error: 'IPN processing failed' }); // NOWPayments повторит доставку
+    }
+  });
+
   // Web Push: Public VAPID key for Service Worker subscription
   app.get('/api/push/vapid-public-key', (_req, res) => {
     res.json({ publicKey: getVapidPublicKey() });
@@ -900,6 +944,7 @@ async function startServer() {
   }
 
   startMarketAlertMonitor();
+  startProExpiryMonitor();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`AegisQuant server listening on http://0.0.0.0:${PORT}`);

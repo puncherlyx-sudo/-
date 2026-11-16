@@ -641,26 +641,6 @@ export function useAuthAndVault() {
     }
   };
 
-  const updatePlan = async (targetPlan: PlanTier) => {
-    if (!firebaseUser || !profile) return;
-    const uid = firebaseUser.uid;
-    try {
-      await updateDoc(doc(db, 'users', uid), {
-        plan: targetPlan,
-        creditsRemaining: targetPlan === 'pro' ? 100 : Math.min(10, profile.creditsRemaining),
-        updatedAt: serverTimestamp(),
-      });
-      await writeAuditLog(
-        uid,
-        'PLAN_CHANGE',
-        targetPlan === 'pro' ? 'Активирована подписка PRO (безлимитный анализ и сигналы).' : 'Переход на базовый бесплатный тариф.',
-        'SUCCESS'
-      );
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-    }
-  };
-
   const updateStrategySettings = async (
     strategyId: string,
     updates: {
@@ -1202,7 +1182,6 @@ export function useAuthAndVault() {
     loginWithGoogle,
     logout,
     consumeCreditAndSaveAnalysis,
-    updatePlan,
     updateStrategySettings,
     savePendingTotp,
     activateTotp,
