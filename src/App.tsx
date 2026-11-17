@@ -533,7 +533,7 @@ export default function App() {
                   type="button"
                   whileTap={{ scale: 0.96 }}
                   onClick={() => void handleLoginWithPush()}
-                  className="min-h-[40px] px-4 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0 transition-all shadow-sm shadow-emerald-950/50"
+                  className="cta-shimmer min-h-[40px] px-4 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0 transition-all shadow-sm shadow-emerald-950/50"
                 >
                   <LogIn className="w-3.5 h-3.5" />
                   <span>Войти</span>
@@ -574,7 +574,7 @@ export default function App() {
                   type="button"
                   whileTap={{ scale: 0.95 }}
                   onClick={() => void handleLoginWithPush()}
-                  className="min-h-[38px] px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+                  className="cta-shimmer min-h-[38px] px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-xs font-semibold text-white whitespace-nowrap shrink-0"
                 >
                   Войти
                 </motion.button>
@@ -763,7 +763,7 @@ export default function App() {
       {/* Mobile Fixed Thumb-Zone Bottom Tab Bar */}
       <nav
         aria-label="Мобильная навигация"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 pb-safe border-t border-white/10 bg-[#0B0F17]/95 backdrop-blur-md grid grid-cols-5 items-center"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 pb-safe border-t border-white/10 bg-[#0B0F17]/92 backdrop-blur-xl shadow-[0_-14px_34px_-14px_rgba(0,0,0,0.85)] grid grid-cols-5 items-center"
       >
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
@@ -779,6 +779,13 @@ export default function App() {
             >
               {isActive && (
                 <motion.span
+                  layoutId="mobile-nav-spot"
+                  transition={{ type: 'spring', stiffness: 380, damping: 32 }}
+                  className="absolute inset-x-1.5 inset-y-1.5 rounded-2xl bg-emerald-400/10 ring-1 ring-emerald-400/20"
+                />
+              )}
+              {isActive && (
+                <motion.span
                   layoutId="mobile-nav-indicator"
                   transition={{ type: 'spring', stiffness: 450, damping: 35 }}
                   className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-gradient-to-r from-emerald-400 to-amber-400"
@@ -787,7 +794,7 @@ export default function App() {
               <motion.span
                 animate={{ y: isActive ? -1.5 : 0, scale: isActive ? 1.08 : 1 }}
                 transition={{ type: 'spring', stiffness: 420, damping: 28 }}
-                className="inline-flex"
+                className={`inline-flex ${isActive ? 'drop-shadow-[0_0_8px_rgba(52,211,153,0.65)]' : ''}`}
               >
                 {item.icon}
               </motion.span>

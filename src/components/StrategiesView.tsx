@@ -601,7 +601,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                 <button
                   type="button"
                   onClick={() => void onSwitchPlan('pro')}
-                  className="min-h-[42px] w-full rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold transition-colors"
+                  className="cta-shimmer min-h-[42px] w-full rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold transition-colors"
                 >
                   Активировать PRO доступ
                 </button>

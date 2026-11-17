@@ -42,7 +42,7 @@ import { CandlestickChart } from './CandlestickChart';
 import { ChartQuickAlertWidget } from './ChartQuickAlertWidget';
 import { FearGreedWidget } from './FearGreedWidget';
 import { MarketDominanceWidget } from './MarketDominanceWidget';
-import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { OrderBookPanel } from './OrderBookPanel';
 import { authFetch } from '../lib/authFetch';
 
@@ -902,7 +902,9 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                 </div>
                 <div className="mt-0.5 flex items-baseline gap-2.5">
                   <h2 className="text-xl sm:text-2xl font-bold text-white font-mono tabular-nums">
-                    {indicators ? formatUsd(indicators.lastPrice) : activeTicker ? formatUsd(activeTicker.price) : '—'}
+                    <FlashValue value={indicators?.lastPrice ?? activeTicker?.price}>
+                      {indicators ? formatUsd(indicators.lastPrice) : activeTicker ? formatUsd(activeTicker.price) : '—'}
+                    </FlashValue>
                   </h2>
                   {activeTicker && (
                     <span
