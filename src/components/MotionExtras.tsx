@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { TERMINAL_EASE } from './MotionPrimitives';
 
 function prefersReducedMotion(): boolean {
@@ -14,14 +14,15 @@ export const AnimatedNumber: React.FC<{
   fromZero?: boolean;
   className?: string;
 }> = ({ value, format, duration = 750, fromZero = false, className }) => {
-  const [display, setDisplay] = useState(fromZero ? 0 : value);
-  const fromRef = useRef(fromZero ? 0 : value);
+  const safeValue = Number.isFinite(value) ? value : 0;
+  const [display, setDisplay] = useState(fromZero ? 0 : safeValue);
+  const fromRef = useRef(fromZero ? 0 : safeValue);
 
   useEffect(() => {
     const from = fromRef.current;
-    if (prefersReducedMotion() || from === value) {
-      fromRef.current = value;
-      setDisplay(value);
+    if (prefersReducedMotion() || from === safeValue) {
+      fromRef.current = safeValue;
+      setDisplay(safeValue);
       return;
     }
     const start = performance.now();
@@ -29,14 +30,14 @@ export const AnimatedNumber: React.FC<{
     const tick = (now: number) => {
       const t = Math.min(1, (now - start) / duration);
       const eased = 1 - Math.pow(1 - t, 3);
-      const current = from + (value - from) * eased;
+      const current = from + (safeValue - from) * eased;
       fromRef.current = current;
       setDisplay(current);
       if (t < 1) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [value, duration]);
+  }, [safeValue, duration]);
 
   return <span className={className}>{format(display)}</span>;
 };

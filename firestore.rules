@@ -505,7 +505,7 @@ service cloud.firestore {
         allow delete: if isValidId(userId) && isShortId(sessionId) && isVerifiedOwner(userId);
       }
 
-      // Subcollection: User Price Threshold Alerts
+      // Subcollection: Trade Journal Entries
       match /trades/{tradeId} {
         allow get: if isValidId(userId) && isShortId(tradeId) && isOwnerRead(userId);
         allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
@@ -524,14 +524,21 @@ service cloud.firestore {
         allow update: if isValidId(userId)
           && isShortId(tradeId)
           && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
           && isValidTrade(incoming(), userId, tradeId)
+          && existing().status == 'open'
           && incoming().id == existing().id
           && incoming().userId == existing().userId
           && incoming().symbol == existing().symbol
+          && incoming().marketType == existing().marketType
           && incoming().side == existing().side
           && incoming().entryPrice == existing().entryPrice
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
+          && (
+            (incoming().status == 'open' && incoming().exitPrice == 0 && incoming().closedAt == '')
+            || (incoming().status == 'closed' && incoming().exitPrice > 0 && incoming().closedAt.size() >= 10)
+          )
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'stopPrice', 'exitPrice', 'status', 'note', 'closedAt', 'updatedAt'
           ]);
@@ -539,6 +546,7 @@ service cloud.firestore {
         allow delete: if isValidId(userId) && isShortId(tradeId) && isVerifiedOwner(userId);
       }
 
+      // Subcollection: User Price Threshold Alerts
       match /priceAlerts/{alertId} {
         allow get: if isValidId(userId) && isShortId(alertId) && isOwnerRead(userId);
         allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;

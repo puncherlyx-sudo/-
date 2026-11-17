@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { motion } from 'motion/react';
+import { motion } from 'framer-motion';
 import type { IndicatorSnapshot, MarketType, Timeframe } from '../types/domain';
 
 const FRAMES: Array<{ tf: Timeframe; label: string }> = [

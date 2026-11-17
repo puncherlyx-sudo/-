@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
+import http from 'http';
 import path from 'path';
 import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
@@ -1083,9 +1084,16 @@ async function startServer() {
     }
   );
 
+  const httpServer = http.createServer(app);
+
   if (!isProd) {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: hmrDisabled ? false : { server: httpServer },
+        hmr: hmrDisabled ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1100,7 +1108,7 @@ async function startServer() {
   startMarketAlertMonitor();
   startProExpiryMonitor();
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`AegisQuant server listening on http://0.0.0.0:${PORT}`);
   });
 }

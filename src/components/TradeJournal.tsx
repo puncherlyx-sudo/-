@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { collection, deleteDoc, doc, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { BookOpen, CircleCheck, Lock, Plus, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
 import { TRADING_PAIRS } from '../data/strategies';
 import { db } from '../lib/firebase';
@@ -136,12 +136,12 @@ export const TradeJournal: React.FC<TradeJournalProps> = ({ uid, onRequireLogin 
     }
     const entryPrice = Number(entry.replace(',', '.'));
     const stopPrice = stop.trim() ? Number(stop.replace(',', '.')) : 0;
-    if (!(entryPrice > 0)) {
-      setFormError('Введите цену входа больше нуля.');
+    if (!Number.isFinite(entryPrice) || !(entryPrice > 0) || entryPrice > 100_000_000) {
+      setFormError('Введите корректную цену входа (до 100 000 000).');
       return;
     }
-    if (stop.trim() && !(stopPrice > 0)) {
-      setFormError('Стоп должен быть числом больше нуля (или оставьте поле пустым).');
+    if (stop.trim() && (!Number.isFinite(stopPrice) || !(stopPrice > 0) || stopPrice > 100_000_000)) {
+      setFormError('Стоп должен быть числом больше нуля (до 100 000 000), либо оставьте поле пустым.');
       return;
     }
     if (stopPrice > 0 && (side === 'LONG' ? stopPrice >= entryPrice : stopPrice <= entryPrice)) {
@@ -181,8 +181,8 @@ export const TradeJournal: React.FC<TradeJournalProps> = ({ uid, onRequireLogin 
   const handleClose = async (t: TradeRecord) => {
     if (!uid) return;
     const exitPrice = Number(exitInput.replace(',', '.'));
-    if (!(exitPrice > 0)) {
-      setActionError('Введите цену выхода больше нуля.');
+    if (!Number.isFinite(exitPrice) || !(exitPrice > 0) || exitPrice > 100_000_000) {
+      setActionError('Введите корректную цену выхода (до 100 000 000).');
       return;
     }
     setBusyId(t.id);

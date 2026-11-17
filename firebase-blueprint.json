@@ -180,6 +180,27 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "contactEmail", "category", "subject", "message", "status", "createdAt", "updatedAt"]
+    },
+    "TradeRecord": {
+      "title": "TradeRecord",
+      "description": "User trade journal entry tracking entry, optional stop, exit price, status, and R-multiple note.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "symbol": { "type": "string", "minLength": 3, "maxLength": 24 },
+        "marketType": { "type": "string", "enum": ["spot", "futures"] },
+        "side": { "type": "string", "enum": ["LONG", "SHORT"] },
+        "entryPrice": { "type": "number" },
+        "stopPrice": { "type": "number" },
+        "exitPrice": { "type": "number" },
+        "status": { "type": "string", "enum": ["open", "closed"] },
+        "note": { "type": "string", "maxLength": 280 },
+        "closedAt": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "symbol", "marketType", "side", "entryPrice", "stopPrice", "exitPrice", "status", "note", "closedAt", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -218,6 +239,10 @@
     "/users/{userId}/supportTickets/{ticketId}": {
       "schema": { "$ref": "#/entities/SupportTicketRecord" },
       "description": "User-submitted support and feedback tickets created from the terminal FAQ."
+    },
+    "/users/{userId}/trades/{tradeId}": {
+      "schema": { "$ref": "#/entities/TradeRecord" },
+      "description": "Personal trade journal entries persisted per user."
     }
   }
 }
