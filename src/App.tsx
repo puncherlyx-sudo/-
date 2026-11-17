@@ -25,6 +25,7 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { SecurityCenterView, type SecuritySection } from './components/SecurityCenterView';
 import { StandaloneWidgetView } from './components/StandaloneWidgetView';
 import { StrategiesView } from './components/StrategiesView';
+import { SplashIntro } from './components/MotionExtras';
 import { TickerTape } from './components/TickerTape';
 import { PricingModal } from './components/PricingModal';
 import { TwoFactorModal } from './components/TwoFactorModal';
@@ -493,6 +494,7 @@ export default function App() {
 
   return (
     <MotionConfig reducedMotion="user">
+      <SplashIntro imageSrc="/src/assets/images/aegis_terminal_emblem_1794855840828.jpg" />
       <LayoutGroup id="aegis-app-shell">
         <div className="min-h-dvh text-slate-100 flex flex-col">
         {/* Desktop 3-Zone Top Bar Contract */}
