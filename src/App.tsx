@@ -165,7 +165,8 @@ export default function App() {
       return tab;
     });
     if (typeof window !== 'undefined') {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      // Snap scroll synchronously before Framer Motion measures shared layoutId bounds
+      window.scrollTo({ top: 0, behavior: 'auto' });
     }
   }, []);
 
@@ -179,7 +180,7 @@ export default function App() {
           tf,
         });
         window.history.pushState({}, '', `/?${params.toString()}`);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        window.scrollTo({ top: 0, behavior: 'auto' });
       }
     },
     []
@@ -194,7 +195,7 @@ export default function App() {
       }
       if (typeof window !== 'undefined') {
         window.history.pushState({}, '', `/?tab=${targetTab}`);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        window.scrollTo({ top: 0, behavior: 'auto' });
       }
     },
     [handleSwitchTab]
@@ -516,8 +517,8 @@ export default function App() {
               <span>AegisQuant</span>
             </motion.button>
 
-            {/* Zone 2: 4 Single-line Nav Links with Sliding Active Indicator */}
-            <nav className="flex items-center gap-7 text-sm font-medium">
+            {/* Zone 2: Single-line Nav Links with Shared Frosted Pill & Gradient Underline */}
+            <nav className="flex items-center gap-2 text-sm font-medium">
               {navItems.map((item) => {
                 const isActive = activeTab === item.id;
                 return (
@@ -528,16 +529,23 @@ export default function App() {
                     whileTap={{ scale: 0.96 }}
                     transition={{ duration: 0.14 }}
                     onClick={() => handleSwitchTab(item.id)}
-                    className={`relative py-2 whitespace-nowrap shrink-0 transition-colors ${
+                    className={`relative px-3 py-2 rounded-lg whitespace-nowrap shrink-0 transition-colors ${
                       isActive ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    <span>{item.label}</span>
-                      {isActive && (
+                    {isActive && (
+                      <motion.span
+                        layoutId="desktop-nav-active-pill"
+                        transition={NATIVE_PILL_SPRING}
+                        className="absolute inset-0 rounded-lg bg-white/[0.06] border border-white/[0.08]"
+                      />
+                    )}
+                    <span className="relative z-10">{item.label}</span>
+                    {isActive && (
                       <motion.span
                         layoutId="desktop-nav-underline"
                         transition={NATIVE_PILL_SPRING}
-                        className="absolute left-0 right-0 -bottom-px h-0.5 rounded-full bg-gradient-to-r from-emerald-400 to-amber-400"
+                        className="absolute left-2.5 right-2.5 -bottom-px h-0.5 rounded-full bg-gradient-to-r from-emerald-400 via-cyan-400 to-amber-400"
                       />
                     )}
                   </motion.button>
@@ -699,16 +707,17 @@ export default function App() {
           </div>
         )}
 
-        <AnimatePresence mode="wait" custom={tabDirection}>
-          <motion.div
-            key={activeTab}
-            custom={tabDirection}
-            variants={tabSlideBlurVariants}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            className="will-change-transform"
-          >
+        <div className="relative w-full">
+          <AnimatePresence mode="popLayout" initial={false} custom={tabDirection}>
+            <motion.div
+              key={activeTab}
+              custom={tabDirection}
+              variants={tabSlideBlurVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              className="w-full will-change-transform"
+            >
             {activeTab === 'market' && (
               <MarketTerminalView
                 profile={profile}
@@ -813,8 +822,9 @@ export default function App() {
                 onStartTour={handleStartTour}
               />
             )}
-          </motion.div>
-        </AnimatePresence>
+            </motion.div>
+          </AnimatePresence>
+        </div>
       </main>
 
       {/* Mobile Fixed Thumb-Zone Bottom Tab Bar */}
@@ -845,7 +855,7 @@ export default function App() {
                 <motion.span
                   layoutId="mobile-nav-indicator"
                   transition={NATIVE_PILL_SPRING}
-                  className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-gradient-to-r from-emerald-400 to-amber-400"
+                  className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-gradient-to-r from-emerald-400 via-cyan-400 to-amber-400"
                 />
               )}
               <motion.span

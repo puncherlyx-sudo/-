@@ -17,37 +17,42 @@ export const NATIVE_PILL_SPRING = {
   mass: 0.75,
 };
 
+export const WORKSPACE_SHARED_SPRING = {
+  type: 'spring' as const,
+  stiffness: 340,
+  damping: 30,
+  mass: 0.85,
+};
+
 /**
- * Native mobile-app directional Page Transition with spring physics + subtle scale/blur.
+ * Native mobile-app directional Page Transition with spring physics + subtle blur.
  * Animates only compositor-friendly transform, opacity, and filter properties.
+ * Omits ancestor scale so inner layoutId Shared Element Transitions project without distortion.
  */
 export const tabSlideBlurVariants: Variants = {
   initial: (direction: number) => ({
     opacity: 0,
-    x: direction * 36,
-    scale: 0.985,
-    filter: 'blur(4px)',
+    x: direction * 42,
+    filter: 'blur(3px)',
   }),
   animate: {
     opacity: 1,
     x: 0,
-    scale: 1,
     filter: 'blur(0px)',
     transition: {
       x: NATIVE_SPRING,
-      scale: NATIVE_SPRING,
       opacity: { duration: 0.2, ease: TERMINAL_EASE },
       filter: { duration: 0.22, ease: TERMINAL_EASE },
     },
   },
   exit: (direction: number) => ({
     opacity: 0,
-    x: direction * -28,
-    scale: 0.988,
+    x: direction * -32,
     filter: 'blur(3px)',
     transition: {
-      duration: 0.15,
-      ease: [0.4, 0, 1, 1],
+      x: { duration: 0.22, ease: [0.4, 0, 1, 1] },
+      opacity: { duration: 0.16, ease: [0.4, 0, 1, 1] },
+      filter: { duration: 0.16, ease: [0.4, 0, 1, 1] },
     },
   }),
 };
@@ -259,78 +264,130 @@ export function WorkspaceShell<T extends string>({
         ? 'border-amber-400/40 bg-amber-500/14 text-amber-200'
         : 'border-emerald-400/40 bg-emerald-500/14 text-emerald-200';
 
+  const shellBorderClass =
+    accent === 'cyan'
+      ? 'border-cyan-500/20'
+      : accent === 'amber'
+        ? 'border-amber-500/20'
+        : 'border-emerald-500/20';
+
+  const iconContainerClass =
+    accent === 'cyan'
+      ? 'border-cyan-400/30 bg-cyan-500/10'
+      : accent === 'amber'
+        ? 'border-amber-400/30 bg-amber-500/10'
+        : 'border-emerald-400/30 bg-emerald-500/10';
+
+  const accentBarGradient =
+    accent === 'cyan'
+      ? 'from-cyan-400 via-teal-400 to-emerald-400'
+      : accent === 'amber'
+        ? 'from-amber-400 via-orange-400 to-emerald-400'
+        : 'from-emerald-400 via-teal-400 to-cyan-400';
+
   return (
-    <LayoutGroup id={`workspace-${layoutId}`}>
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-        {/* Left Navigation Sidebar (Desktop) / Compact Quick Grid (Mobile) */}
-        <motion.aside
-          layout="position"
-          transition={NATIVE_SPRING}
-          className="lg:col-span-3 lg:sticky lg:top-20 rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-3 sm:p-4 space-y-3"
+    <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+      {/* Sticky outer column kept free of layoutId so projection coordinates remain accurate */}
+      <aside className="lg:col-span-3 lg:sticky lg:top-20">
+        <motion.div
+          layoutId="aegis-workspace-sidebar-card"
+          transition={WORKSPACE_SHARED_SPRING}
+          className={`relative overflow-hidden rounded-2xl border ${shellBorderClass} bg-[#111827] card-surface-glow p-3 sm:p-4 space-y-3`}
         >
+          <motion.div
+            layoutId="aegis-workspace-accent-bar"
+            transition={WORKSPACE_SHARED_SPRING}
+            aria-hidden="true"
+            className={`absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r ${accentBarGradient}`}
+          />
+
           <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-white/8">
-            <div className="flex items-center gap-2 min-w-0">
-              {icon && <span className="shrink-0">{icon}</span>}
-              <div className="min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0">
+              {icon && (
+                <motion.span
+                  layoutId="aegis-workspace-icon"
+                  transition={WORKSPACE_SHARED_SPRING}
+                  className={`w-9 h-9 rounded-xl border ${iconContainerClass} flex items-center justify-center shrink-0 overflow-hidden`}
+                >
+                  {icon}
+                </motion.span>
+              )}
+              <motion.div layout="position" transition={WORKSPACE_SHARED_SPRING} className="min-w-0">
                 <h2 className="text-sm font-bold text-white truncate">{title}</h2>
                 {subtitle && <div className="text-[11px] text-slate-400 truncate">{subtitle}</div>}
-              </div>
+              </motion.div>
             </div>
           </div>
 
-          {sidebarTopSlot && <div className="pb-2.5 border-b border-white/8">{sidebarTopSlot}</div>}
+          {sidebarTopSlot && (
+            <motion.div
+              layout="position"
+              transition={WORKSPACE_SHARED_SPRING}
+              className="pb-2.5 border-b border-white/8"
+            >
+              {sidebarTopSlot}
+            </motion.div>
+          )}
 
-          {/* Mobile/Tablet: All buttons visible immediately in a compact 2-col grid */}
-          <nav
-            aria-label={`Разделы: ${title}`}
-            className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-1 gap-1.5"
-          >
-            {items.map((item) => {
-              const isActive = item.id === activeId;
-              return (
-                <motion.button
-                  key={item.id}
-                  type="button"
-                  whileTap={{ scale: 0.96 }}
-                  onClick={() => onChange(item.id)}
-                  className={`relative min-h-[40px] px-2.5 sm:px-3 rounded-xl text-left text-xs font-medium flex items-center justify-between gap-2 transition-colors ${
-                    isActive
-                      ? 'text-white'
-                      : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.03] border border-white/5 lg:border-transparent'
-                  }`}
-                >
-                  {isActive && (
-                    <motion.span
-                      layoutId={layoutId}
-                      transition={NATIVE_PILL_SPRING}
-                      className={`absolute inset-0 rounded-xl border ${activeBorder}`}
-                    />
-                  )}
-                  <span className="relative z-10 flex items-center gap-2 min-w-0">
-                    {item.icon && <span className="shrink-0 opacity-90">{item.icon}</span>}
-                    <span className="truncate">{item.label}</span>
-                  </span>
-                  {item.meta !== undefined && item.meta !== '' && (
-                    <span className="relative z-10 font-mono tabular-nums text-[11px] opacity-75 shrink-0">
-                      {item.meta}
+          {/* Isolate only inner section active pill LayoutGroup so outer shell layoutIds stay shared across tabs */}
+          <LayoutGroup id={`workspace-nav-${layoutId}`}>
+            <nav
+              aria-label={`Разделы: ${title}`}
+              className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-1 gap-1.5"
+            >
+              {items.map((item) => {
+                const isActive = item.id === activeId;
+                return (
+                  <motion.button
+                    key={item.id}
+                    type="button"
+                    whileTap={{ scale: 0.96 }}
+                    onClick={() => onChange(item.id)}
+                    className={`relative min-h-[40px] px-2.5 sm:px-3 rounded-xl text-left text-xs font-medium flex items-center justify-between gap-2 transition-colors ${
+                      isActive
+                        ? 'text-white'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.03] border border-white/5 lg:border-transparent'
+                    }`}
+                  >
+                    {isActive && (
+                      <motion.span
+                        layoutId={layoutId}
+                        transition={NATIVE_PILL_SPRING}
+                        className={`absolute inset-0 rounded-xl border ${activeBorder}`}
+                      />
+                    )}
+                    <span className="relative z-10 flex items-center gap-2 min-w-0">
+                      {item.icon && <span className="shrink-0 opacity-90">{item.icon}</span>}
+                      <span className="truncate">{item.label}</span>
                     </span>
-                  )}
-                </motion.button>
-              );
-            })}
-          </nav>
+                    {item.meta !== undefined && item.meta !== '' && (
+                      <span className="relative z-10 font-mono tabular-nums text-[11px] opacity-75 shrink-0">
+                        {item.meta}
+                      </span>
+                    )}
+                  </motion.button>
+                );
+              })}
+            </nav>
+          </LayoutGroup>
 
           {sidebarBottomSlot && (
-            <div className="hidden lg:block pt-2.5 border-t border-white/8">{sidebarBottomSlot}</div>
+            <motion.div
+              layout="position"
+              transition={WORKSPACE_SHARED_SPRING}
+              className="hidden lg:block pt-2.5 border-t border-white/8"
+            >
+              {sidebarBottomSlot}
+            </motion.div>
           )}
-        </motion.aside>
-
-        {/* Right Active Workspace Viewport */}
-        <motion.div layout="position" transition={NATIVE_SPRING} className="lg:col-span-9 min-w-0">
-          <SubSectionFrame sectionKey={activeId}>{children}</SubSectionFrame>
         </motion.div>
-      </div>
-    </LayoutGroup>
+      </aside>
+
+      {/* Right Active Workspace Viewport */}
+      <motion.div layout="position" transition={WORKSPACE_SHARED_SPRING} className="lg:col-span-9 min-w-0">
+        <SubSectionFrame sectionKey={activeId}>{children}</SubSectionFrame>
+      </motion.div>
+    </div>
   );
 }
 

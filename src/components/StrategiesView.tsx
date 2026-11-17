@@ -283,14 +283,14 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             src="/src/assets/images/terminal_icon_strategy_1794855842754.jpg"
             alt="Стратегии AegisQuant"
             referrerPolicy="no-referrer"
-            className="w-8 h-8 rounded-lg object-cover border border-emerald-500/25"
+            className="w-8 h-8 rounded-lg object-cover border border-amber-500/25"
           />
         }
         items={sectionTabs}
         activeId={section}
         onChange={setSection}
         layoutId="strategies-workspace-nav"
-        accent="emerald"
+        accent="amber"
         sidebarBottomSlot={sidebarBottom}
       >
         {section === 'catalog' && (
