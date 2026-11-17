@@ -29,7 +29,7 @@ function readPrice(envName: string, fallback: number): number {
 export function getPlanPrices(): Record<BillingPeriod, { priceUsd: number; days: number }> {
   return {
     month: { priceUsd: readPrice('PRO_PRICE_MONTH_USD', 29), days: PERIOD_DAYS.month },
-    year: { priceUsd: readPrice('PRO_PRICE_YEAR_USD', 290), days: PERIOD_DAYS.year },
+    year: { priceUsd: readPrice('PRO_PRICE_YEAR_USD', 264), days: PERIOD_DAYS.year },
   };
 }
 

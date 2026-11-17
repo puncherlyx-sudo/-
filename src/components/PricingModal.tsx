@@ -87,7 +87,9 @@ export const PricingModal: React.FC<PricingModalProps> = ({ open, onClose, proUn
       key: 'year',
       title: '1 год',
       price: year?.priceUsd,
-      note: yearSavingPct > 0 ? `Выгода ${yearSavingPct}% · 365 дней` : '365 дней доступа',
+      note: year
+        ? `≈ $${(Math.round((year.priceUsd / 12) * 100) / 100).toString()} / мес${yearSavingPct > 0 ? ` · выгода ${yearSavingPct}%` : ''}`
+        : '365 дней доступа',
     },
   ];
 
