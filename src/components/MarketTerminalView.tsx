@@ -83,6 +83,13 @@ import {
   WorkspaceShell,
 } from './MotionPrimitives';
 import { MultiTimeframeStrip } from './MultiTimeframeStrip';
+import {
+  ChartEngineSwitch,
+  readChartEngine,
+  saveChartEngine,
+  TradingViewChart,
+  type ChartEngine,
+} from './TradingViewChart';
 import { OrderBookPanel } from './OrderBookPanel';
 import { QuickAnswersCard } from './QuickAnswersCard';
 import { QuickAssetAlertModal, type QuickAlertTargetAsset } from './QuickAssetAlertModal';
@@ -272,6 +279,11 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
 
   const [showEma, setShowEma] = useState(false);
   const [showBollinger, setShowBollinger] = useState(false);
+  const [chartEngine, setChartEngine] = useState<ChartEngine>(() => readChartEngine());
+  const handleChartEngineChange = useCallback((engine: ChartEngine) => {
+    setChartEngine(engine);
+    saveChartEngine(engine);
+  }, []);
   const [showRibbon, setShowRibbon] = useState(true);
   const [showRibbonSettings, setShowRibbonSettings] = useState(false);
   const [showQuickAlert, setShowQuickAlert] = useState(false);
@@ -1746,8 +1758,21 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
               )}
             </AnimatePresence>
 
+            {/* Chart engine switch: our chart or the official TradingView widget */}
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <ChartEngineSwitch engine={chartEngine} onChange={handleChartEngineChange} />
+              {chartEngine === 'tradingview' && (
+                <span className="text-[11px] text-slate-500 text-right">
+                  Слои Ribbon/EMA/Bollinger относятся к нашему графику
+                </span>
+              )}
+            </div>
+
             {/* Candlestick Chart */}
             <div className="mt-3">
+              {chartEngine === 'tradingview' ? (
+                <TradingViewChart symbol={symbol} marketType={marketType} timeframe={timeframe} />
+              ) : (
               <CandlestickChart
                 candles={candles}
                 symbol={symbol}
@@ -1766,6 +1791,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   setShowQuickAlert(true);
                 }}
               />
+              )}
             </div>
 
             {/* Collapsible Quick Price Alert Widget */}

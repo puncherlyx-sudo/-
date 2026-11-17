@@ -179,6 +179,22 @@ export default defineConfig(() => {
         },
       },
     ],
+    build: {
+      // Библиотеки выносим в отдельные файлы: они меняются редко, поэтому после обновления приложения
+      // телефон перекачивает только изменившийся код, а не всё целиком.
+      chunkSizeWarningLimit: 700,
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              { name: 'vendor-firebase', test: /node_modules[\\/](firebase|@firebase)[\\/]/, priority: 30 },
+              { name: 'vendor-charts', test: /node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor|internmap|decimal\.js-light)[\\/]/, priority: 20 },
+              { name: 'vendor-motion', test: /node_modules[\\/](framer-motion|motion|motion-dom|motion-utils)[\\/]/, priority: 10 },
+            ],
+          },
+        },
+      },
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

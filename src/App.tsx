@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useState } from 'react';
 import {
   ArrowUp,
   BarChart3,
@@ -12,23 +12,29 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { AnimatePresence, LayoutGroup, MotionConfig, motion, useScroll, useSpring } from 'framer-motion';
-import { AndroidWidgetsModal } from './components/AndroidWidgetsModal';
 import { InterfaceTour, TOUR_STORAGE_KEY } from './components/InterfaceTour';
 import { LockScreenOverlay } from './components/LockScreenOverlay';
-import { MarketScreenerView, type ScreenerSection } from './components/MarketScreenerView';
+import type { ScreenerSection } from './components/MarketScreenerView';
 import { MarketTerminalView } from './components/MarketTerminalView';
 import { MiniPortfolioWidget } from './components/MiniPortfolioWidget';
 import { NATIVE_PILL_SPRING, tabSlideBlurVariants } from './components/MotionPrimitives';
-import { NewsFeedView } from './components/NewsFeedView';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAInstallButton } from './components/PWAInstallButton';
-import { SecurityCenterView, type SecuritySection } from './components/SecurityCenterView';
-import { StandaloneWidgetView } from './components/StandaloneWidgetView';
-import { StrategiesView } from './components/StrategiesView';
+import type { SecuritySection } from './components/SecurityCenterView';
 import { SplashIntro } from './components/MotionExtras';
 import { TickerTape } from './components/TickerTape';
 import { PricingModal } from './components/PricingModal';
 import { TwoFactorModal } from './components/TwoFactorModal';
+import { ViewFallback } from './components/ViewFallback';
+import {
+  AndroidWidgetsModal,
+  MarketScreenerView,
+  NewsFeedView,
+  prefetchViews,
+  SecurityCenterView,
+  StandaloneWidgetView,
+  StrategiesView,
+} from './lazyViews';
 import { useAuthAndVault } from './hooks/useAuthAndVault';
 import { usePaperPortfolio } from './hooks/usePaperPortfolio';
 import { usePushNotifications } from './hooks/usePushNotifications';
@@ -153,6 +159,11 @@ export default function App() {
       window.removeEventListener('scroll', onScroll);
       window.removeEventListener('popstate', onPopState);
     };
+  }, []);
+
+  // Остальные экраны подгружаются в простое, чтобы переключение вкладок оставалось мгновенным
+  useEffect(() => {
+    prefetchViews();
   }, []);
 
   const handleSwitchTab = useCallback((tab: AppTab) => {
@@ -478,6 +489,7 @@ export default function App() {
   if (standaloneWidget) {
     return (
       <MotionConfig reducedMotion="user">
+        <Suspense fallback={<ViewFallback />}>
         <StandaloneWidgetView
           widgetKind={standaloneWidget.kind}
           initialSymbol={standaloneWidget.symbol}
@@ -488,6 +500,7 @@ export default function App() {
           onChangeWidget={launchStandaloneWidget}
           onExitToTerminal={exitStandaloneWidget}
         />
+        </Suspense>
         <OfflineIndicator />
       </MotionConfig>
     );
@@ -718,6 +731,7 @@ export default function App() {
               exit="exit"
               className="w-full will-change-transform"
             >
+            <Suspense fallback={<ViewFallback />}>
             {activeTab === 'market' && (
               <MarketTerminalView
                 profile={profile}
@@ -822,6 +836,7 @@ export default function App() {
                 onStartTour={handleStartTour}
               />
             )}
+            </Suspense>
             </motion.div>
           </AnimatePresence>
         </div>
@@ -935,14 +950,16 @@ export default function App() {
       />
 
       {/* Android Home Screen & Widgets Hub */}
-      <AndroidWidgetsModal
-        open={widgetsModalOpen}
-        onClose={() => setWidgetsModalOpen(false)}
-        portfolioReport={paperPortfolio.report}
-        holdingsCount={paperPortfolio.holdings.length}
-        strategies={strategies}
-        onLaunchStandaloneWidget={launchStandaloneWidget}
-      />
+      <Suspense fallback={null}>
+        <AndroidWidgetsModal
+          open={widgetsModalOpen}
+          onClose={() => setWidgetsModalOpen(false)}
+          portfolioReport={paperPortfolio.report}
+          holdingsCount={paperPortfolio.holdings.length}
+          strategies={strategies}
+          onLaunchStandaloneWidget={launchStandaloneWidget}
+        />
+      </Suspense>
       </div>
       </LayoutGroup>
     </MotionConfig>
