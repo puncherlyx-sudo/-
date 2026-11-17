@@ -75,7 +75,14 @@ import {
   skeletonSwapVariants,
 } from './MarketSkeletons';
 import { MiniSparkline } from './MiniSparkline';
-import { NATIVE_PILL_SPRING, NATIVE_SPRING, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import {
+  FlashValue,
+  NATIVE_PILL_SPRING,
+  NATIVE_SPRING,
+  StaggerDeck,
+  WorkspaceShell,
+} from './MotionPrimitives';
+import { MultiTimeframeStrip } from './MultiTimeframeStrip';
 import { OrderBookPanel } from './OrderBookPanel';
 import { QuickAnswersCard } from './QuickAnswersCard';
 import { QuickAssetAlertModal, type QuickAlertTargetAsset } from './QuickAssetAlertModal';
@@ -1613,6 +1620,15 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   <RefreshCw className={`w-3.5 h-3.5 ${loadingChart ? 'animate-spin' : ''}`} />
                 </button>
               </div>
+            </div>
+
+            <div className="mt-3">
+              <MultiTimeframeStrip
+                symbol={symbol}
+                marketType={marketType}
+                activeTimeframe={timeframe}
+                onSelectTimeframe={setTimeframe}
+              />
             </div>
 
             {/* Collapsible MA Ribbon Configurator */}

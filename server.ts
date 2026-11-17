@@ -25,7 +25,13 @@ import {
   runStrategyAnalysis,
   type TerminalChatTurn,
 } from './server/aiAnalyst.ts';
-import { getFearAndGreedIndex, getMarketCandles, getMarketDepth, getMarketOverview } from './server/market.ts';
+import {
+  getFearAndGreedIndex,
+  getMarketCandles,
+  getMarketDepth,
+  getMarketOverview,
+  SUPPORTED_SYMBOLS,
+} from './server/market.ts';
 import { runStrategyPortfolioBacktest, type StrategySimulationInput } from './server/strategyBacktest.ts';
 import {
   checkPriceAlertsForUser,
@@ -359,7 +365,10 @@ async function startServer() {
   app.get('/api/news', async (req, res) => {
     try {
       res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-      const symbol = String(req.query.symbol || 'ALL').toUpperCase();
+      // Только известные активы: иначе произвольный текст попадал бы в запрос к ИИ и в ключ кэша
+      const requested = String(req.query.symbol || 'ALL').toUpperCase().slice(0, 12);
+      const allowedNews = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
+      const symbol = allowedNews.has(requested) ? requested : 'ALL';
       const forceRefresh = req.query.refresh === '1';
       const news = await fetchGroundedCryptoNews(symbol, forceRefresh);
       const topHigh = news.items.find((n) => n.impact === 'HIGH');
@@ -398,10 +407,11 @@ async function startServer() {
       const body = req.body as Record<string, unknown>;
       const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
       const marketType = body.marketType === 'futures' ? 'futures' : 'spot';
-      const timeframe = String(body.timeframe || '1h');
-      const strategyKey = String(body.strategyKey || 'spot_trend_breakout');
-      const strategyName = String(body.strategyName || 'Импульсный пробой тренда');
-      const strategyRules = String(body.strategyRules || '');
+      const timeframe = ['15m', '1h', '4h', '1d'].includes(String(body.timeframe)) ? String(body.timeframe) : '1h';
+      // Ограничиваем длину текста, который уходит в запрос к ИИ (защита от злоупотребления квотой и подмены инструкций)
+      const strategyKey = String(body.strategyKey || 'spot_trend_breakout').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+      const strategyName = String(body.strategyName || 'Импульсный пробой тренда').replace(/[\r\n"]/g, ' ').slice(0, 120);
+      const strategyRules = String(body.strategyRules || '').replace(/\r/g, '').slice(0, 1500);
       const depositUsdt = Math.min(10_000_000, Math.max(10, Number(body.depositUsdt || 1000)));
       const riskPerTradePct = Math.min(10, Math.max(0.25, Number(body.riskPerTradePct || 1.5)));
       const dbPlan = await getUserPlanTier(req.user!.uid);
