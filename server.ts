@@ -9,16 +9,21 @@ import { isAllowedPushEndpoint, requireAuth } from './server/auth.ts';
 import {
   createCheckout,
   getPlanPrices,
+  getUserPlanTier,
   isBillingConfigured,
   processIpn,
   startProExpiryMonitor,
   verifyIpnSignature,
   type BillingPeriod,
 } from './server/billing.ts';
+import { FREE_MAX_LEVERAGE, isProOnlyStrategy } from './src/data/strategies.ts';
 import {
+  AiServiceError,
+  askTerminalAssistant,
   fetchEconomicCalendar,
   fetchGroundedCryptoNews,
   runStrategyAnalysis,
+  type TerminalChatTurn,
 } from './server/aiAnalyst.ts';
 import { getFearAndGreedIndex, getMarketCandles, getMarketDepth, getMarketOverview } from './server/market.ts';
 import { runStrategyPortfolioBacktest, type StrategySimulationInput } from './server/strategyBacktest.ts';
@@ -127,9 +132,11 @@ async function startServer() {
   // Market tickers (Spot / Futures)
   app.get('/api/market/overview', async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
-      const tickers = await getMarketOverview(marketType);
-      res.json({ marketType, tickers });
+      const forceRefresh = req.query.refresh === '1';
+      const tickers = await getMarketOverview(marketType, forceRefresh);
+      res.json({ marketType, tickers, updatedAt: new Date().toISOString() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки рынка' });
     }
@@ -138,10 +145,12 @@ async function startServer() {
   // Market OHLCV + technical indicators
   app.get('/api/market/candles', async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const symbol = String(req.query.symbol || 'BTCUSDT').toUpperCase();
       const interval = String(req.query.interval || '1h');
       const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
-      const data = await getMarketCandles(symbol, interval, marketType);
+      const forceRefresh = req.query.refresh === '1';
+      const data = await getMarketCandles(symbol, interval, marketType, forceRefresh);
       res.json(data);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки графика' });
@@ -151,9 +160,11 @@ async function startServer() {
   // Market Order Book Depth (Bids / Asks / Spread)
   app.get('/api/market/depth', async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const symbol = String(req.query.symbol || 'BTCUSDT').toUpperCase();
       const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
-      const depth = await getMarketDepth(symbol, marketType);
+      const forceRefresh = req.query.refresh === '1';
+      const depth = await getMarketDepth(symbol, marketType, forceRefresh);
       res.json(depth);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки стакана ордеров' });
@@ -161,9 +172,11 @@ async function startServer() {
   });
 
   // Crypto Fear & Greed Index (live Alternative.me + quantitative fallback)
-  app.get('/api/market/fear-greed', async (_req, res) => {
+  app.get('/api/market/fear-greed', async (req, res) => {
     try {
-      const sentiment = await getFearAndGreedIndex();
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+      const forceRefresh = req.query.refresh === '1';
+      const sentiment = await getFearAndGreedIndex(forceRefresh);
       res.json(sentiment);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки индекса настроений' });
@@ -173,17 +186,19 @@ async function startServer() {
   // Live Android / PWA Desktop Widget Feed (JSON for W3C Widgets, KWGT, MacroDroid, and standalone views)
   app.get('/api/widgets/feed', async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const symbol = String(req.query.symbol || 'BTCUSDT').toUpperCase();
       const interval = String(req.query.interval || '1h');
       const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
+      const forceRefresh = req.query.refresh === '1';
       const depositUsdt = Math.min(10_000_000, Math.max(50, Number(req.query.deposit || 2500)));
       const riskPct = Math.min(10, Math.max(0.25, Number(req.query.risk || 1.5)));
       const stopPct = Math.min(25, Math.max(0.25, Number(req.query.stopPct || 2.5)));
 
       const [tickers, candlesData, fearGreed] = await Promise.all([
-        getMarketOverview(marketType),
-        getMarketCandles(symbol, interval, marketType),
-        getFearAndGreedIndex(),
+        getMarketOverview(marketType, forceRefresh),
+        getMarketCandles(symbol, interval, marketType, forceRefresh),
+        getFearAndGreedIndex(forceRefresh),
       ]);
 
       const ticker = tickers.find((t) => t.symbol === candlesData.symbol) || tickers[0];
@@ -340,27 +355,39 @@ async function startServer() {
     });
   });
 
-  // Grounded crypto news feed
+  // Grounded crypto news feed (with live RSS fallback + explicit notice on quota limits)
   app.get('/api/news', async (req, res) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const symbol = String(req.query.symbol || 'ALL').toUpperCase();
-      const news = await fetchGroundedCryptoNews(symbol);
+      const forceRefresh = req.query.refresh === '1';
+      const news = await fetchGroundedCryptoNews(symbol, forceRefresh);
       const topHigh = news.items.find((n) => n.impact === 'HIGH');
       if (topHigh) {
         void notifyHighImpactNews(topHigh);
       }
       res.json(news);
     } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки новостей' });
     }
   });
 
-  // Grounded macro & crypto economic calendar
-  app.get('/api/economic-calendar', async (_req, res) => {
+  // Grounded macro & crypto economic calendar (with live Deribit/OKX/Fed/Investing fallback)
+  app.get('/api/economic-calendar', async (req, res) => {
     try {
-      const calendar = await fetchEconomicCalendar();
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+      const forceRefresh = req.query.refresh === '1';
+      const calendar = await fetchEconomicCalendar(forceRefresh);
       res.json(calendar);
     } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки экономического календаря' });
     }
   });
@@ -372,13 +399,24 @@ async function startServer() {
       const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
       const marketType = body.marketType === 'futures' ? 'futures' : 'spot';
       const timeframe = String(body.timeframe || '1h');
-      const strategyKey = String(body.strategyKey || 'trend_breakout');
-      const strategyName = String(body.strategyName || 'Пробой тренда');
+      const strategyKey = String(body.strategyKey || 'spot_trend_breakout');
+      const strategyName = String(body.strategyName || 'Импульсный пробой тренда');
       const strategyRules = String(body.strategyRules || '');
       const depositUsdt = Math.min(10_000_000, Math.max(10, Number(body.depositUsdt || 1000)));
       const riskPerTradePct = Math.min(10, Math.max(0.25, Number(body.riskPerTradePct || 1.5)));
-      const leverage = Math.min(20, Math.max(1, Number(body.leverage || 1)));
-      const isPro = Boolean(body.isPro);
+      const dbPlan = await getUserPlanTier(req.user!.uid);
+      const isPro = dbPlan === 'pro';
+
+      if (isProOnlyStrategy(strategyKey) && !isPro) {
+        res.status(403).json({
+          error: 'Выбранная стратегия доступна только в подписке PRO. Выберите базовую стратегию или обновите тариф.',
+          code: 'PRO_REQUIRED',
+        });
+        return;
+      }
+
+      const maxAllowedLeverage = isPro ? 20 : FREE_MAX_LEVERAGE;
+      const leverage = Math.min(maxAllowedLeverage, Math.max(1, Number(body.leverage || 1)));
 
       const marketData = await getMarketCandles(symbol, timeframe, marketType);
       const analysis = await runStrategyAnalysis({
@@ -403,6 +441,10 @@ async function startServer() {
         source: marketData.source,
       });
     } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка AI-анализа' });
     }
   });
@@ -714,6 +756,8 @@ async function startServer() {
         };
         notifySignals?: boolean;
         notifyMarketMoves?: boolean;
+        notifyVolatilitySpikes?: boolean;
+        volatilityThresholdPct?: number;
         notifyNews?: boolean;
         notifyAuthLogins?: boolean;
         notifyStrategyChanges?: boolean;
@@ -730,6 +774,12 @@ async function startServer() {
         return;
       }
 
+      const rawVolThreshold = Number(body.volatilityThresholdPct);
+      const volatilityThresholdPct =
+        Number.isFinite(rawVolThreshold) && rawVolThreshold >= 1 && rawVolThreshold <= 25
+          ? Math.round(rawVolThreshold * 10) / 10
+          : 5;
+
       registerPushSubscription({
         uid,
         endpoint,
@@ -739,6 +789,8 @@ async function startServer() {
         },
         notifySignals: body.notifySignals !== false,
         notifyMarketMoves: body.notifyMarketMoves !== false,
+        notifyVolatilitySpikes: body.notifyVolatilitySpikes !== false,
+        volatilityThresholdPct,
         notifyNews: body.notifyNews !== false,
         notifyAuthLogins: body.notifyAuthLogins !== false,
         notifyStrategyChanges: body.notifyStrategyChanges !== false,
@@ -928,6 +980,98 @@ async function startServer() {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка проверки ценовых алертов' });
     }
   });
+
+  // Support & Feedback intake for guest or fallback submissions
+  app.post('/api/support', expensiveLimiter, (req, res) => {
+    const body = req.body as Record<string, unknown>;
+    const contactEmail = typeof body.contactEmail === 'string' ? body.contactEmail.trim() : '';
+    const category = typeof body.category === 'string' ? body.category : 'other';
+    const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+
+    const allowedCategories = new Set(['alerts', 'chart', 'billing', 'security', 'other']);
+    if (!contactEmail || contactEmail.length < 3 || contactEmail.length > 200 || !contactEmail.includes('@')) {
+      res.status(400).json({ error: 'Укажите корректный email для обратной связи.' });
+      return;
+    }
+    if (!allowedCategories.has(category)) {
+      res.status(400).json({ error: 'Некорректная категория обращения.' });
+      return;
+    }
+    if (subject.length < 3 || subject.length > 140) {
+      res.status(400).json({ error: 'Тема должна содержать от 3 до 140 символов.' });
+      return;
+    }
+    if (message.length < 10 || message.length > 2000) {
+      res.status(400).json({ error: 'Сообщение должно содержать от 10 до 2000 символов.' });
+      return;
+    }
+
+    const ticketId = `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    res.json({ ok: true, ticketId, createdAt: new Date().toISOString() });
+  });
+
+  // Gemini-powered Terminal Help Assistant Chat
+  app.post('/api/support/chat', expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as { message?: unknown; history?: unknown };
+      const message = typeof body.message === 'string' ? body.message.trim() : '';
+      if (message.length < 2 || message.length > 800) {
+        res.status(400).json({ error: 'Вопрос должен содержать от 2 до 800 символов.' });
+        return;
+      }
+
+      const history: TerminalChatTurn[] = Array.isArray(body.history)
+        ? body.history
+            .filter(
+              (item): item is { role: 'user' | 'model'; text: string } =>
+                typeof item === 'object' &&
+                item !== null &&
+                ((item as { role?: unknown }).role === 'user' ||
+                  (item as { role?: unknown }).role === 'model') &&
+                typeof (item as { text?: unknown }).text === 'string'
+            )
+            .slice(-8)
+        : [];
+
+      const reply = await askTerminalAssistant({ message, history });
+      res.json({ reply });
+    } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Не удалось получить ответ от ассистента.',
+      });
+    }
+  });
+
+  // Ensure /api requests never fall through to Vite/SPA HTML fallback or Express HTML error pages
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API-маршрут не найден.', code: 'NOT_FOUND' });
+  });
+
+  app.use(
+    '/api',
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
+      const status =
+        typeof err === 'object' && err !== null && 'status' in err
+          ? Number((err as { status?: number }).status) || 500
+          : 500;
+      const msg = err instanceof Error ? err.message : 'Внутренняя ошибка API.';
+      res.status(status).json({ error: msg });
+    }
+  );
 
   if (!isProd) {
     const vite = await createViteServer({

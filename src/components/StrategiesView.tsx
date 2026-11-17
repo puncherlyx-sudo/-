@@ -13,8 +13,21 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { STRATEGY_CATALOG, TRADING_PAIRS } from '../data/strategies';
-import type { MarketType, PlanTier, StrategyConfig, UserProfile } from '../types/domain';
+import {
+  CREDIT_COSTS,
+  FREE_DAILY_SIGNAL_LIMIT,
+  FREE_MAX_LEVERAGE,
+  FREE_WEEKLY_QUOTA,
+  PRO_MONTHLY_QUOTA,
+  STRATEGY_CATALOG,
+  TRADING_PAIRS,
+  countTodayStrategySignals,
+  formatProUntilDate,
+  getCreditQuotaForProfile,
+  isProSubscriptionActive,
+  isProSubscriptionExpired,
+} from '../data/strategies';
+import type { AnalysisRecord, MarketType, PlanTier, StrategyConfig, UserProfile } from '../types/domain';
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { PositionSizeCalculator } from './PositionSizeCalculator';
 import { StrategyPnlChart } from './StrategyPnlChart';
@@ -24,11 +37,13 @@ type StrategiesSection = 'catalog' | 'analytics' | 'calculator' | 'plans';
 interface StrategiesViewProps {
   profile: UserProfile | null;
   strategies: StrategyConfig[];
+  analyses?: AnalysisRecord[];
   isSignedIn: boolean;
   pushSubscribed?: boolean;
   onOpenPushSettings?: () => void;
   onRequireLogin: () => void;
   onSwitchPlan: (target: PlanTier) => Promise<void>;
+  onConsumeCredits?: (amount: number, auditReason?: string) => Promise<boolean>;
   onSaveStrategy: (
     strategyId: string,
     updates: {
@@ -45,11 +60,13 @@ interface StrategiesViewProps {
 export const StrategiesView: React.FC<StrategiesViewProps> = ({
   profile,
   strategies,
+  analyses = [],
   isSignedIn,
   pushSubscribed = false,
   onOpenPushSettings,
   onRequireLogin,
   onSwitchPlan,
+  onConsumeCredits,
   onSaveStrategy,
 }) => {
   const [section, setSection] = useState<StrategiesSection>('catalog');
@@ -69,7 +86,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   const [marketFilter, setMarketFilter] = useState<'all' | MarketType>('all');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [draftLimit, setDraftLimit] = useState<number>(5);
+  const [draftLimit, setDraftLimit] = useState<number>(0);
   const [draftConfidence, setDraftConfidence] = useState<number>(72);
   const [draftRisk, setDraftRisk] = useState<number>(1.5);
   const [draftLeverage, setDraftLeverage] = useState<number>(5);
@@ -77,7 +94,10 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   const [savingId, setSavingId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
 
-  const isPro = profile?.plan === 'pro';
+  const isPro = isProSubscriptionActive(profile);
+  const isExpiredPro = isProSubscriptionExpired(profile);
+  const totalCreditQuota = getCreditQuotaForProfile(profile);
+  const isCreditsExhausted = Boolean(isSignedIn && profile && profile.creditsRemaining <= 0);
 
   useEffect(() => {
     const handleTourFocus = (evt: Event) => {
@@ -92,10 +112,10 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
 
   const startEdit = (cfg: StrategyConfig) => {
     setEditingId(cfg.id);
-    setDraftLimit(cfg.dailySignalLimit);
+    setDraftLimit(isPro ? (cfg.dailySignalLimit === 1 ? 0 : cfg.dailySignalLimit) : FREE_DAILY_SIGNAL_LIMIT);
     setDraftConfidence(cfg.minConfidence);
     setDraftRisk(cfg.riskPerTradePct);
-    setDraftLeverage(cfg.leverage);
+    setDraftLeverage(isPro ? cfg.leverage : Math.min(FREE_MAX_LEVERAGE, cfg.leverage));
     setDraftPairs(cfg.pairs);
     setFeedback(null);
   };
@@ -106,10 +126,10 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     try {
       await onSaveStrategy(cfg.id, {
         enabled: cfg.enabled,
-        dailySignalLimit: isPro ? draftLimit : 1,
+        dailySignalLimit: isPro ? draftLimit : FREE_DAILY_SIGNAL_LIMIT,
         minConfidence: draftConfidence,
         riskPerTradePct: draftRisk,
-        leverage: cfg.marketType === 'spot' ? 1 : draftLeverage,
+        leverage: cfg.marketType === 'spot' ? 1 : isPro ? draftLeverage : Math.min(FREE_MAX_LEVERAGE, draftLeverage),
         pairs: draftPairs.length > 0 ? draftPairs : ['BTCUSDT'],
       });
       setEditingId(null);
@@ -126,10 +146,10 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     try {
       await onSaveStrategy(cfg.id, {
         enabled: !cfg.enabled,
-        dailySignalLimit: cfg.dailySignalLimit,
+        dailySignalLimit: isPro ? cfg.dailySignalLimit : FREE_DAILY_SIGNAL_LIMIT,
         minConfidence: cfg.minConfidence,
         riskPerTradePct: cfg.riskPerTradePct,
-        leverage: cfg.leverage,
+        leverage: isPro ? cfg.leverage : Math.min(FREE_MAX_LEVERAGE, cfg.leverage),
         pairs: cfg.pairs,
       });
     } finally {
@@ -150,10 +170,15 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
       return statusFilter === 'active' ? isEnabled : !isEnabled;
     });
 
-  const activeCount = strategies.filter((s) => s.enabled).length;
-  const totalConfiguredSignals = strategies
-    .filter((s) => s.enabled)
-    .reduce((acc, s) => acc + (isPro ? s.dailySignalLimit : 1), 0);
+  const activeStrategies = strategies.filter(
+    (s) => s.enabled && (isPro || !STRATEGY_CATALOG.some((t) => t.key === s.strategyKey && t.tier === 'pro'))
+  );
+  const activeCount = activeStrategies.length;
+  const hasUnlimitedProSignals = isPro && activeStrategies.some((s) => s.dailySignalLimit === 0);
+  const totalConfiguredSignals = activeStrategies.reduce(
+    (acc, s) => acc + (isPro ? s.dailySignalLimit : FREE_DAILY_SIGNAL_LIMIT),
+    0
+  );
 
   const sectionTabs = useMemo(
     () => [
@@ -182,23 +207,54 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     [activeCount]
   );
 
+  const dailySignalsLabel = isPro
+    ? hasUnlimitedProSignals || activeCount > 0
+      ? 'Без ограничений (PRO)'
+      : '0'
+    : `${totalConfiguredSignals} / день (Free)`;
+
   const sidebarBottom = (
     <div className="space-y-1.5 text-xs font-mono tabular-nums">
+      {profile && (
+        <div className="flex items-center justify-between">
+          <span className="font-sans text-slate-400">Кредиты</span>
+          <span className={profile.creditsRemaining > 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
+            {profile.creditsRemaining} / {totalCreditQuota}
+          </span>
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <span className="font-sans text-slate-400">Сигналов/день</span>
-        <span className="text-emerald-400 font-semibold">{totalConfiguredSignals}</span>
+        <span className="text-emerald-400 font-semibold">{dailySignalsLabel}</span>
       </div>
       <div className="flex items-center justify-between">
         <span className="font-sans text-slate-400">Тариф</span>
-        <span className={isPro ? 'text-amber-400 font-semibold' : 'text-slate-200'}>
-          {isPro ? 'PRO' : 'Бесплатный'}
+        <span className={isPro ? 'text-amber-400 font-semibold' : isExpiredPro ? 'text-rose-400 font-semibold' : 'text-slate-200'}>
+          {isPro
+            ? `PRO · до ${formatProUntilDate(profile?.proUntil)}`
+            : isExpiredPro
+              ? 'PRO истёк'
+              : 'Бесплатный'}
         </span>
       </div>
+      {(!isPro || isCreditsExhausted) && (
+        <button
+          type="button"
+          onClick={() => void onSwitchPlan('pro')}
+          className="pt-1 font-sans text-left font-semibold text-amber-300 hover:text-amber-200 transition-colors"
+        >
+          {isCreditsExhausted && isPro
+            ? `Продлить PRO (+${PRO_MONTHLY_QUOTA} кр.) →`
+            : isExpiredPro
+              ? 'Продлить подписку PRO →'
+              : 'Перейти на PRO →'}
+        </button>
+      )}
       {onOpenPushSettings && (
         <button
           type="button"
           onClick={onOpenPushSettings}
-          className={`pt-1 font-sans text-left font-medium transition-colors ${
+          className={`pt-1 font-sans text-left font-medium transition-colors block ${
             pushSubscribed ? 'text-emerald-400 hover:text-emerald-300' : 'text-amber-300 hover:text-amber-200'
           }`}
         >
@@ -212,7 +268,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     <StaggerDeck>
       <WorkspaceShell
         title="Стратегии"
-        subtitle={`${activeCount} активных · ${totalConfiguredSignals}/день`}
+        subtitle={`${activeCount} активных · ${isPro ? 'PRO ∞/день' : `${totalConfiguredSignals}/день`}`}
         icon={
           <img
             src="/src/assets/images/terminal_icon_strategy_1794855842754.jpg"
@@ -230,6 +286,37 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
       >
         {section === 'catalog' && (
           <div className="space-y-4">
+            {(isCreditsExhausted || isExpiredPro) && (
+              <div className="rounded-2xl border border-amber-500/35 bg-amber-500/10 p-4 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-2.5 text-xs text-amber-100 max-w-2xl">
+                  <Crown className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="font-semibold text-amber-200">
+                      {isExpiredPro
+                        ? `Срок действия подписки PRO истёк (${formatProUntilDate(profile?.proUntil)})`
+                        : isPro
+                          ? `Месячные кредиты PRO исчерпаны (0/${PRO_MONTHLY_QUOTA})`
+                          : `Лимит бесплатных кредитов достигнут (0/${totalCreditQuota})`}
+                    </div>
+                    <p className="text-amber-200/80 leading-relaxed">
+                      {isPro
+                        ? `Продлите подписку PRO, чтобы сразу пополнить +${PRO_MONTHLY_QUOTA} кредитов для анализа и бэктеста.`
+                        : `Перейдите на тариф PRO: получите ${PRO_MONTHLY_QUOTA} кредитов в месяц, доступ ко всем ${STRATEGY_CATALOG.length} стратегиям, плечу до 20x и снятию ограничений на количество сигналов в день.`}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void onSwitchPlan('pro')}
+                  className="cta-shimmer min-h-[40px] px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+                >
+                  <Crown className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {isPro ? `Продлить PRO (+${PRO_MONTHLY_QUOTA} кр.)` : isExpiredPro ? 'Продлить PRO' : 'Перейти на PRO'}
+                  </span>
+                </button>
+              </div>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2.5">
               <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex items-center p-1 rounded-xl bg-[#111827] border border-white/8">
@@ -287,7 +374,12 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {displayList.map(({ tpl, cfg }, idx) => {
                 const isEditing = cfg && editingId === cfg.id;
-                const isActive = Boolean(cfg?.enabled);
+                const isProStrategy = tpl.tier === 'pro';
+                const isLockedForUser = isProStrategy && !isPro;
+                const isActive = Boolean(cfg?.enabled) && !isLockedForUser;
+                const usedSignalsToday = isSignedIn ? countTodayStrategySignals(analyses, tpl.key) : 0;
+                const isDailyFreeLimitHit = !isPro && isSignedIn && usedSignalsToday >= FREE_DAILY_SIGNAL_LIMIT;
+                const isProUnlimitedLimit = isPro && (cfg?.dailySignalLimit ?? 0) === 0;
                 return (
                   <motion.div
                     key={tpl.key}
@@ -295,77 +387,150 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.2, delay: Math.min(idx * 0.03, 0.15) }}
                     className={`rounded-2xl border bg-[#111827] card-surface-glow p-4 flex flex-col justify-between gap-3.5 transition-colors ${
-                      isActive ? 'border-emerald-500/30' : 'border-white/8'
+                      isLockedForUser
+                        ? 'border-amber-500/20'
+                        : isActive
+                          ? 'border-emerald-500/30'
+                          : 'border-white/8'
                     }`}
                   >
                     <div>
                       <div className="flex items-start justify-between gap-3">
                         <div>
                           <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-400">
+                            {isProStrategy && (
+                              <span className="font-mono font-semibold text-amber-400 inline-flex items-center gap-1">
+                                <Crown className="w-3 h-3" />
+                                <span>PRO</span>
+                              </span>
+                            )}
+                            {isProStrategy && <span aria-hidden="true">·</span>}
                             <span>{tpl.shortTag}</span>
                             <span aria-hidden="true">·</span>
                             <span>{tpl.riskProfile}</span>
                             <span aria-hidden="true">·</span>
                             <span>ТФ {tpl.timeframeDefault.toUpperCase()}</span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono text-slate-300">
+                              {`${tpl.creditCost} кр.`}
+                            </span>
                           </div>
                           <h3 className="mt-1 text-sm font-semibold text-white">{tpl.name}</h3>
                         </div>
 
-                        {cfg && (
+                        {isLockedForUser ? (
                           <button
                             type="button"
-                            disabled={savingId === cfg.id}
-                            onClick={() => void handleToggle(cfg)}
-                            aria-pressed={cfg.enabled}
-                            className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-                              cfg.enabled
-                                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
-                                : 'border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
-                            }`}
+                            onClick={() => void onSwitchPlan('pro')}
+                            className="min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors"
                           >
-                            {cfg.enabled ? (
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                            ) : (
-                              <CircleOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                            )}
-                            <span>{cfg.enabled ? 'Активен' : 'Выкл'}</span>
+                            <Lock className="w-3.5 h-3.5 shrink-0" />
+                            <span>PRO</span>
                           </button>
+                        ) : (
+                          cfg && (
+                            <button
+                              type="button"
+                              disabled={savingId === cfg.id}
+                              onClick={() => void handleToggle(cfg)}
+                              aria-pressed={cfg.enabled}
+                              className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                                cfg.enabled
+                                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                                  : 'border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
+                              }`}
+                            >
+                              {cfg.enabled ? (
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              ) : (
+                                <CircleOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                              )}
+                              <span>{cfg.enabled ? 'Активен' : 'Выкл'}</span>
+                            </button>
+                          )
                         )}
                       </div>
 
                       <p className="mt-2 text-xs text-slate-300 leading-relaxed">{tpl.description}</p>
-                      <div className="mt-2 text-[11px] text-slate-400">
-                        Индикаторы: {tpl.indicatorsUsed.join(' · ')}
+                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-400">
+                        <span>Индикаторы: {tpl.indicatorsUsed.join(' · ')}</span>
+                        <span className="text-slate-500">· {tpl.marketCondition}</span>
                       </div>
                     </div>
 
-                    {cfg ? (
+                    {isLockedForUser ? (
+                      <div className="pt-3 border-t border-white/8 flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-400 inline-flex items-center gap-1.5">
+                          <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <span>Доступно только в подписке PRO</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void onSwitchPlan('pro')}
+                          className="min-h-[34px] px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold whitespace-nowrap transition-colors"
+                        >
+                          Открыть
+                        </button>
+                      </div>
+                    ) : cfg ? (
                       isEditing ? (
                         <div className="pt-3 border-t border-white/10 space-y-3">
                           <div>
-                            <div className="flex items-center justify-between text-xs mb-1">
+                            <div className="flex items-center justify-between text-xs mb-1.5">
                               <span className="text-slate-300 flex items-center gap-1.5">
                                 <BellRing className="w-3.5 h-3.5 text-amber-400" />
                                 <span>Сигналов в день</span>
                               </span>
                               <span className="font-mono font-bold text-amber-400">
-                                {isPro ? `${draftLimit} / день` : '1 / день (Free)'}
+                                {isPro
+                                  ? draftLimit === 0
+                                    ? 'Без ограничений (PRO)'
+                                    : `${draftLimit} / день`
+                                  : `${FREE_DAILY_SIGNAL_LIMIT} / день (Free)`}
                               </span>
                             </div>
                             {isPro ? (
-                              <input
-                                type="range"
-                                min={1}
-                                max={20}
-                                value={draftLimit}
-                                onChange={(e) => setDraftLimit(Number(e.target.value))}
-                                className="w-full accent-amber-500"
-                              />
+                              <div className="space-y-2">
+                                <div className="grid grid-cols-2 p-1 rounded-xl bg-[#0B0F17] border border-white/8 text-xs">
+                                  <button
+                                    type="button"
+                                    onClick={() => setDraftLimit(0)}
+                                    className={`min-h-[32px] rounded-lg font-medium transition-colors ${
+                                      draftLimit === 0
+                                        ? 'bg-emerald-600 text-white'
+                                        : 'text-slate-400 hover:text-slate-200'
+                                    }`}
+                                  >
+                                    Без ограничений
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDraftLimit((prev) => (prev > 0 ? prev : 10))}
+                                    className={`min-h-[32px] rounded-lg font-medium transition-colors ${
+                                      draftLimit > 0
+                                        ? 'bg-amber-500 text-slate-950 font-semibold'
+                                        : 'text-slate-400 hover:text-slate-200'
+                                    }`}
+                                  >
+                                    Свой порог
+                                  </button>
+                                </div>
+                                {draftLimit > 0 && (
+                                  <input
+                                    type="range"
+                                    min={1}
+                                    max={100}
+                                    value={draftLimit}
+                                    onChange={(e) => setDraftLimit(Number(e.target.value))}
+                                    className="w-full accent-amber-500"
+                                  />
+                                )}
+                              </div>
                             ) : (
                               <div className="flex items-center justify-between rounded-xl bg-[#0B0F17] border border-white/8 px-3 py-2 text-xs text-slate-400">
                                 <span className="flex items-center gap-1.5">
                                   <Lock className="w-3.5 h-3.5 text-amber-400" />
-                                  До 20/день в PRO
+                                  Снятие дневного лимита в PRO
                                 </span>
                                 <button
                                   type="button"
@@ -407,14 +572,27 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                           {cfg.marketType === 'futures' && (
                             <div>
                               <div className="flex items-center justify-between text-xs mb-1">
-                                <span className="text-slate-400">Макс. плечо</span>
-                                <span className="font-mono text-amber-300">{draftLeverage}x</span>
+                                <span className="text-slate-400">
+                                  Макс. плечо{!isPro ? ` (Free до ${FREE_MAX_LEVERAGE}x)` : ''}
+                                </span>
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-amber-300">{draftLeverage}x</span>
+                                  {!isPro && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void onSwitchPlan('pro')}
+                                      className="text-[11px] font-medium text-amber-400 hover:underline"
+                                    >
+                                      PRO до 20x
+                                    </button>
+                                  )}
+                                </div>
                               </div>
                               <input
                                 type="range"
                                 min={1}
-                                max={20}
-                                value={draftLeverage}
+                                max={isPro ? 20 : FREE_MAX_LEVERAGE}
+                                value={Math.min(isPro ? 20 : FREE_MAX_LEVERAGE, draftLeverage)}
                                 onChange={(e) => setDraftLeverage(Number(e.target.value))}
                                 className="w-full accent-amber-500"
                               />
@@ -468,10 +646,25 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                         </div>
                       ) : (
                         <div className="pt-3 border-t border-white/8 flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex items-center gap-3 text-xs font-mono tabular-nums text-slate-300">
-                            <span>{isPro ? cfg.dailySignalLimit : 1}/день</span>
+                          <div className="flex flex-wrap items-center gap-2.5 text-xs font-mono tabular-nums text-slate-300">
+                            <span>
+                              {isPro
+                                ? isProUnlimitedLimit
+                                  ? '∞/день'
+                                  : `${cfg.dailySignalLimit}/день`
+                                : `${usedSignalsToday}/${FREE_DAILY_SIGNAL_LIMIT} сегодня`}
+                            </span>
                             <span>{cfg.minConfidence}%</span>
                             {cfg.marketType === 'futures' && <span>{cfg.leverage}x</span>}
+                            {isDailyFreeLimitHit && (
+                              <button
+                                type="button"
+                                onClick={() => void onSwitchPlan('pro')}
+                                className="font-sans text-[11px] font-semibold text-amber-300 hover:underline"
+                              >
+                                Лимит Free · PRO →
+                              </button>
+                            )}
                           </div>
                           <button
                             type="button"
@@ -520,7 +713,15 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
 
         {section === 'analytics' && (
           <div data-tour-id="tour-strategies-pnl">
-            <StrategyPnlChart strategies={strategies} isPro={isPro} />
+            <StrategyPnlChart
+              strategies={strategies}
+              isPro={isPro}
+              isSignedIn={isSignedIn}
+              creditsRemaining={profile?.creditsRemaining}
+              creditQuota={totalCreditQuota}
+              onUpgradePro={() => void onSwitchPlan('pro')}
+              onConsumeCredits={onConsumeCredits}
+            />
           </div>
         )}
 
@@ -535,20 +736,22 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                   <span className="font-mono text-sm font-semibold text-slate-300">$0 / мес</span>
                 </div>
                 <p className="mt-1.5 text-xs text-slate-400">
-                  Для тестирования стратегий и периодической проверки графиков.
+                  Для старта: оценка рынка на 4 базовых стратегиях и тестирование сигналов по недельной квоте.
                 </p>
                 <ul className="mt-3.5 space-y-2 text-xs sm:text-sm text-slate-300">
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>10 бесплатных кредитов каждую неделю</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    <span>
+                      {FREE_WEEKLY_QUOTA} кредитов каждые 7 дней: Спот-анализ — 1 кр., Фьючерсы — 2 кр., ручной пересчёт PnL — 1 кр.
+                    </span>
                   </li>
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>Базовый технический анализ графика и 2FA-защита</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    <span>4 базовые стратегии (3 Спот + 1 Фьючерсы), плечо до {FREE_MAX_LEVERAGE}x и 1 сигнал/день</span>
                   </li>
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <span>Фиксированный лимит: 1 сигнал/день на стратегию</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    <span>Свечной график, стандартная EMA Ribbon (8·13·21·55), алерты и 2FA-защита</span>
                   </li>
                 </ul>
               </div>
@@ -566,20 +769,20 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                   </span>
                 </div>
                 <p className="mt-1.5 text-xs text-slate-400">
-                  Полный институциональный анализ, новости в реальном времени и настройка дневных сигналов.
+                  {PRO_MONTHLY_QUOTA} кредитов в месяц и полный доступ ко всем закрытым инструментам и PRO-стратегиям.
                 </p>
                 <ul className="mt-3.5 space-y-2 text-xs sm:text-sm text-slate-200">
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>Безлимитный глубокий AI-анализ графиков и новостей</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>{PRO_MONTHLY_QUOTA} кредитов в месяц для AI-анализа (Спот — 1 кр., Фьючерсы — 2 кр., бэктест — 1 кр.)</span>
                   </li>
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>Настройка от 1 до 20 сигналов в день по стратегии</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>Снятие ограничений на количество сигналов в день, все {STRATEGY_CATALOG.length} стратегий и плечо до 20x</span>
                   </li>
-                  <li className="flex items-center gap-2">
-                    <Check className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>Тонкая настройка плеча, минимальной вероятности и пар</span>
+                  <li className="flex items-start gap-2">
+                    <Check className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>Биржевой стакан TOP-10, конструктор периодов MA Ribbon (EMA/SMA), 4H-бэктесты и экспорт CSV</span>
                   </li>
                 </ul>
               </div>
@@ -593,9 +796,20 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                   Войти и активировать PRO
                 </button>
               ) : isPro ? (
-                <div className="min-h-[42px] w-full rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 text-xs font-semibold flex items-center justify-center gap-2">
-                  <ShieldCheck className="w-4 h-4" />
-                  <span>Подписка PRO активна</span>
+                <div className="space-y-2">
+                  <div className="min-h-[40px] w-full rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 text-xs font-semibold flex items-center justify-center gap-2">
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>
+                      PRO активен до {formatProUntilDate(profile?.proUntil)} · Остаток {profile?.creditsRemaining ?? 0}/{PRO_MONTHLY_QUOTA} кр.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void onSwitchPlan('pro')}
+                    className="min-h-[40px] w-full rounded-xl border border-amber-500/40 bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 text-xs font-semibold transition-colors"
+                  >
+                    Продлить PRO и пополнить +{PRO_MONTHLY_QUOTA} кредитов
+                  </button>
                 </div>
               ) : (
                 <button
@@ -603,7 +817,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                   onClick={() => void onSwitchPlan('pro')}
                   className="cta-shimmer min-h-[42px] w-full rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold transition-colors"
                 >
-                  Активировать PRO доступ
+                  {isExpiredPro ? 'Продлить PRO доступ' : 'Активировать PRO доступ'}
                 </button>
               )}
             </div>

@@ -149,8 +149,10 @@ export interface TickerOverview {
   high24h: number;
   low24h: number;
   volume24hUsdt: number;
+  marketCapUsdt?: number;
   fundingRatePct?: number;
   openInterestUsdt?: number;
+  sparkline24h?: number[];
   source: 'live' | 'cached';
 }
 
@@ -175,6 +177,10 @@ export interface IndicatorSnapshot {
 export interface StrategyTemplate {
   key: string;
   marketType: MarketType;
+  tier: PlanTier;
+  creditCost: number;
+  marketCondition: string;
+  expectedHorizon: string;
   name: string;
   shortTag: string;
   timeframeDefault: Timeframe;
@@ -297,6 +303,8 @@ export interface PushSubscriptionRecord {
   auth: string;
   notifySignals: boolean;
   notifyMarketMoves: boolean;
+  notifyVolatilitySpikes?: boolean;
+  volatilityThresholdPct?: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
@@ -341,6 +349,20 @@ export interface PriceAlertRecord {
   active: boolean;
   triggeredAt: string;
   triggeredPrice: number;
+  createdAt?: { seconds?: number } | unknown;
+  updatedAt?: { seconds?: number } | unknown;
+}
+
+export type SupportTicketCategory = 'alerts' | 'chart' | 'billing' | 'security' | 'other';
+
+export interface SupportTicketRecord {
+  id: string;
+  userId: string;
+  contactEmail: string;
+  category: SupportTicketCategory;
+  subject: string;
+  message: string;
+  status: 'open' | 'resolved';
   createdAt?: { seconds?: number } | unknown;
   updatedAt?: { seconds?: number } | unknown;
 }

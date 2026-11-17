@@ -46,7 +46,7 @@ export const TickerTape: React.FC = () => {
     const load = async () => {
       if (typeof document !== 'undefined' && document.hidden) return;
       try {
-        const res = await fetch('/api/market/overview?marketType=spot');
+        const res = await fetch('/api/market/overview?marketType=spot', { cache: 'no-store' });
         if (!res.ok) return;
         const data = (await res.json()) as { tickers?: TickerOverview[] };
         if (!cancelled && Array.isArray(data.tickers) && data.tickers.length > 0) {
@@ -59,9 +59,16 @@ export const TickerTape: React.FC = () => {
     };
     void load();
     const timer = window.setInterval(() => void load(), REFRESH_MS);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void load();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
 

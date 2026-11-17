@@ -36,6 +36,13 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isActiveProUser(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
+        && ('proUntil' in get(/databases/$(database)/documents/users/$(userId)).data)
+        && get(/databases/$(database)/documents/users/$(userId)).data.proUntil is int
+        && get(/databases/$(database)/documents/users/$(userId)).data.proUntil > request.time.toMillis();
+    }
+
     // Validation Blueprint: UserProfile
     function isValidUserProfile(data, userId) {
       return data.keys().hasAll([
@@ -52,8 +59,8 @@ service cloud.firestore {
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
         && data.plan in ['free', 'pro']
         && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 100
-        && (data.plan == 'pro' || data.creditsRemaining <= 10)
-        && data.weeklyQuota is int && data.weeklyQuota == 10
+        && (data.plan == 'pro' || data.creditsRemaining <= 15)
+        && data.weeklyQuota is int && data.weeklyQuota in [10, 15]
         && data.nextResetAt is string && data.nextResetAt.size() >= 10 && data.nextResetAt.size() <= 64
         && data.twoFactorEnabled is bool
         && data.autoLockMinutes is int && data.autoLockMinutes >= 1 && data.autoLockMinutes <= 60
@@ -99,7 +106,7 @@ service cloud.firestore {
         && data.strategyKey is string && data.strategyKey.size() >= 2 && data.strategyKey.size() <= 64
         && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
         && data.enabled is bool
-        && data.dailySignalLimit is int && data.dailySignalLimit >= 1 && data.dailySignalLimit <= 20
+        && data.dailySignalLimit is int && data.dailySignalLimit >= 0 && data.dailySignalLimit <= 100
         && data.minConfidence is int && data.minConfidence >= 50 && data.minConfidence <= 95
         && (data.riskPerTradePct is int || data.riskPerTradePct is float) && data.riskPerTradePct >= 0.25 && data.riskPerTradePct <= 10.0
         && data.leverage is int && data.leverage >= 1 && data.leverage <= 20
@@ -170,7 +177,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'userId', 'endpoint', 'p256dh', 'auth', 'notifySignals',
-          'notifyMarketMoves', 'notifyNews', 'notifyAuthLogins',
+          'notifyMarketMoves', 'notifyVolatilitySpikes', 'volatilityThresholdPct',
+          'notifyNews', 'notifyAuthLogins',
           'notifyStrategyChanges', 'notifySignalLimits', 'enabled', 'deviceLabel',
           'createdAt', 'updatedAt'
         ])
@@ -181,6 +189,8 @@ service cloud.firestore {
         && data.auth is string && data.auth.size() >= 10 && data.auth.size() <= 128
         && data.notifySignals is bool
         && data.notifyMarketMoves is bool
+        && (!('notifyVolatilitySpikes' in data) || data.notifyVolatilitySpikes is bool)
+        && (!('volatilityThresholdPct' in data) || ((data.volatilityThresholdPct is int || data.volatilityThresholdPct is float) && data.volatilityThresholdPct >= 1 && data.volatilityThresholdPct <= 25))
         && data.notifyNews is bool
         && data.notifyAuthLogins is bool
         && data.notifyStrategyChanges is bool
@@ -245,6 +255,27 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    // Validation Blueprint: SupportTicketRecord
+    function isValidSupportTicket(data, userId, ticketId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'contactEmail', 'category', 'subject', 'message',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'contactEmail', 'category', 'subject', 'message',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == ticketId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.contactEmail is string && data.contactEmail.size() >= 3 && data.contactEmail.size() <= 200
+        && data.category in ['alerts', 'chart', 'billing', 'security', 'other']
+        && data.subject is string && data.subject.size() >= 3 && data.subject.size() <= 140
+        && data.message is string && data.message.size() >= 10 && data.message.size() <= 2000
+        && data.status in ['open', 'resolved']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Master Gate: /users/{userId}
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwnerRead(userId);
@@ -254,7 +285,8 @@ service cloud.firestore {
         && isVerifiedOwner(userId)
         && isValidUserProfile(incoming(), userId)
         && incoming().plan == 'free'
-        && incoming().creditsRemaining == 10
+        && incoming().creditsRemaining == 15
+        && incoming().weeklyQuota == 15
         && incoming().twoFactorEnabled == false
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -267,7 +299,9 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           // Action 1: Consume or Reset Weekly Credits
-          (incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
+          (incoming().plan == existing().plan && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
+          // Action 1b: Migrate legacy Free weeklyQuota (10 -> 15) or weekly reset
+          (existing().plan == 'free' && incoming().plan == 'free' && incoming().weeklyQuota == 15 && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'weeklyQuota', 'nextResetAt', 'updatedAt'])) ||
           // Action 2: Toggle 2FA or Auto-Lock Timeout
           (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
           // Action 3 УДАЛЁН: тариф (plan) и срок (proUntil) меняет только сервер после оплаты.
@@ -319,8 +353,8 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && (
-            get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
-            || incoming().dailySignalLimit == 1
+            isActiveProUser(userId)
+            || (incoming().dailySignalLimit == 1 && incoming().leverage <= 5)
           );
 
         allow update: if isValidId(userId)
@@ -333,8 +367,8 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && (
-            get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
-            || incoming().dailySignalLimit == 1
+            isActiveProUser(userId)
+            || (incoming().dailySignalLimit == 1 && incoming().leverage <= 5)
           )
           && (
             (incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt'])) ||
@@ -401,6 +435,7 @@ service cloud.firestore {
           && (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'endpoint', 'p256dh', 'auth', 'notifySignals', 'notifyMarketMoves',
+              'notifyVolatilitySpikes', 'volatilityThresholdPct',
               'notifyNews', 'notifyAuthLogins', 'notifyStrategyChanges', 'notifySignalLimits',
               'enabled', 'deviceLabel', 'updatedAt'
             ])
@@ -477,6 +512,24 @@ service cloud.firestore {
           );
 
         allow delete: if isValidId(userId) && isShortId(alertId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: User Support & Feedback Tickets
+      match /supportTickets/{ticketId} {
+        allow get: if isValidId(userId) && isShortId(ticketId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(ticketId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidSupportTicket(incoming(), userId, ticketId)
+          && incoming().status == 'open'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if false;
+        allow delete: if isValidId(userId) && isShortId(ticketId) && isVerifiedOwner(userId);
       }
     }
   }

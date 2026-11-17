@@ -11,23 +11,21 @@ import {
   Radar,
   ShieldCheck,
 } from 'lucide-react';
-import { AnimatePresence, MotionConfig, motion, useScroll, useSpring } from 'motion/react';
+import { AnimatePresence, LayoutGroup, MotionConfig, motion, useScroll, useSpring } from 'framer-motion';
 import { AndroidWidgetsModal } from './components/AndroidWidgetsModal';
 import { InterfaceTour, TOUR_STORAGE_KEY } from './components/InterfaceTour';
 import { LockScreenOverlay } from './components/LockScreenOverlay';
 import { MarketScreenerView, type ScreenerSection } from './components/MarketScreenerView';
 import { MarketTerminalView } from './components/MarketTerminalView';
 import { MiniPortfolioWidget } from './components/MiniPortfolioWidget';
-import { tabSlideBlurVariants } from './components/MotionPrimitives';
+import { NATIVE_PILL_SPRING, tabSlideBlurVariants } from './components/MotionPrimitives';
 import { NewsFeedView } from './components/NewsFeedView';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { SecurityCenterView, type SecuritySection } from './components/SecurityCenterView';
 import { StandaloneWidgetView } from './components/StandaloneWidgetView';
 import { StrategiesView } from './components/StrategiesView';
-import { SplashIntro } from './components/MotionExtras';
 import { TickerTape } from './components/TickerTape';
-import { hapticTap } from './lib/haptics';
 import { PricingModal } from './components/PricingModal';
 import { TwoFactorModal } from './components/TwoFactorModal';
 import { useAuthAndVault } from './hooks/useAuthAndVault';
@@ -41,6 +39,11 @@ import type {
   PlanTier,
   Timeframe,
 } from './types/domain';
+import {
+  countTodayStrategySignals,
+  FREE_DAILY_SIGNAL_LIMIT,
+  isProSubscriptionActive,
+} from './data/strategies';
 import { authFetch } from './lib/authFetch';
 
 interface PendingStepUpAction {
@@ -123,6 +126,7 @@ export default function App() {
   } | null>(null);
   const [securitySectionSelection, setSecuritySectionSelection] = useState<{
     section: SecuritySection;
+    sub?: 'chart' | 'log' | 'faq';
     nonce: number;
   } | null>(null);
 
@@ -159,7 +163,6 @@ export default function App() {
       }
       return tab;
     });
-    hapticTap();
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
@@ -208,11 +211,13 @@ export default function App() {
     pushSubscriptions,
     sessions,
     priceAlerts,
+    supportTickets,
     currentSessionId,
     isLocked,
     setIsLocked,
     loginWithGoogle,
     logout,
+    consumeCredits,
     consumeCreditAndSaveAnalysis,
     updateStrategySettings,
     savePendingTotp,
@@ -229,6 +234,7 @@ export default function App() {
     togglePriceAlert,
     deletePriceAlert,
     checkPriceAlertsNow,
+    createSupportTicket,
   } = useAuthAndVault();
 
   const isSignedIn = Boolean(authReady && firebaseUser);
@@ -310,38 +316,48 @@ export default function App() {
     timeframe: string;
     strategyKey: string;
     strategyName: string;
+    creditCost?: number;
     result: AnalysisResultPayload;
   }) => {
+    const cost = Math.max(1, Math.round(params.creditCost ?? (params.marketType === 'futures' ? 2 : 1)));
+    const wasProActive = isProSubscriptionActive(profile);
+    const remainingAfter = Math.max(0, (profile?.creditsRemaining ?? 0) - cost);
     await consumeCreditAndSaveAnalysis(params);
 
-    if (profile?.plan === 'free' && profile.creditsRemaining <= 1) {
+    if (remainingAfter <= 0) {
       void pushState.triggerSecurityPush({
         category: 'signal_limit',
-        title: 'AegisQuant · Недельные кредиты исчерпаны',
-        body: 'Использованы все 10 бесплатных кредитов недели. Перейдите на PRO для безлимитного анализа.',
+        title: wasProActive
+          ? 'AegisQuant · Месячные кредиты PRO исчерпаны'
+          : 'AegisQuant · Недельные кредиты исчерпаны',
+        body: wasProActive
+          ? 'Использованы все 100 кредитов текущего месяца PRO. Продлите подписку для пополнения баланса.'
+          : 'Использованы все 15 бесплатных кредитов недели. Перейдите на PRO (+100 кр./мес. и безлимит сигналов).',
         url: '/?tab=strategies',
       });
     }
 
     const matchedStrategy = strategies.find((s) => s.strategyKey === params.strategyKey);
-    const effectiveDailyLimit =
-      profile?.plan === 'pro' ? matchedStrategy?.dailySignalLimit ?? 1 : 1;
-    const now = new Date();
-    const startOfTodaySec =
-      new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000;
-    const todayCountBefore = analyses.filter((a) => {
-      if (a.strategyKey !== params.strategyKey) return false;
-      const sec = (a.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
-      return sec >= startOfTodaySec;
-    }).length;
+    const todayCountBefore = countTodayStrategySignals(analyses, params.strategyKey);
 
-    if (todayCountBefore + 1 >= effectiveDailyLimit) {
-      void pushState.triggerSecurityPush({
-        category: 'signal_limit',
-        title: `AegisQuant · Лимит сигналов: ${params.strategyName}`,
-        body: `Достигнут дневной лимит сигналов по стратегии (${effectiveDailyLimit} / ${effectiveDailyLimit} в сутки).`,
-        url: '/?tab=strategies',
-      });
+    if (!wasProActive) {
+      if (todayCountBefore + 1 >= FREE_DAILY_SIGNAL_LIMIT) {
+        void pushState.triggerSecurityPush({
+          category: 'signal_limit',
+          title: `AegisQuant · Дневной лимит Free: ${params.strategyName}`,
+          body: `Достигнут дневной лимит на Free (${FREE_DAILY_SIGNAL_LIMIT} / ${FREE_DAILY_SIGNAL_LIMIT} в сутки). На PRO лимит сигналов снят.`,
+          url: '/?tab=strategies',
+        });
+      }
+    } else if (matchedStrategy && matchedStrategy.dailySignalLimit > 0) {
+      if (todayCountBefore + 1 >= matchedStrategy.dailySignalLimit) {
+        void pushState.triggerSecurityPush({
+          category: 'signal_limit',
+          title: `AegisQuant · Порог сигналов: ${params.strategyName}`,
+          body: `Достигнут настроенный вами порог сигналов (${matchedStrategy.dailySignalLimit} / ${matchedStrategy.dailySignalLimit} в сутки).`,
+          url: '/?tab=strategies',
+        });
+      }
     }
   };
 
@@ -416,11 +432,17 @@ export default function App() {
       'Для защиты торговых правил и лимитов сигналов подтвердите действие кодом 2FA.',
       async () => {
         await updateStrategySettings(strategyId, updates);
-        const effectiveDailyLimit = profile?.plan === 'pro' ? updates.dailySignalLimit : 1;
+        const effectiveDailyLimit = isProSubscriptionActive(profile)
+          ? updates.dailySignalLimit
+          : FREE_DAILY_SIGNAL_LIMIT;
+        const limitLabel =
+          effectiveDailyLimit === 0
+            ? 'без ограничений/день'
+            : `лимит ${effectiveDailyLimit} сигн./день`;
         void pushState.triggerSecurityPush({
           category: 'strategy_change',
           title: 'AegisQuant · Изменены настройки стратегии',
-          body: `«${stratName}»: ${updates.enabled ? 'Активна' : 'Неактивна'}, лимит ${effectiveDailyLimit} сигн./день, риск ${updates.riskPerTradePct}%.`,
+          body: `«${stratName}»: ${updates.enabled ? 'Активна' : 'Неактивна'}, ${limitLabel}, риск ${updates.riskPerTradePct}%.`,
           url: '/?tab=strategies',
         });
       }
@@ -471,8 +493,8 @@ export default function App() {
 
   return (
     <MotionConfig reducedMotion="user">
-      <SplashIntro imageSrc="/src/assets/images/aegis_terminal_emblem_1794855840828.jpg" />
-      <div className="min-h-dvh text-slate-100 flex flex-col">
+      <LayoutGroup id="aegis-app-shell">
+        <div className="min-h-dvh text-slate-100 flex flex-col">
         {/* Desktop 3-Zone Top Bar Contract */}
         <header className="hidden md:block sticky top-0 z-30 border-b border-white/8 bg-[#0B0F17]/88 backdrop-blur-md">
           <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-8">
@@ -509,10 +531,10 @@ export default function App() {
                     }`}
                   >
                     <span>{item.label}</span>
-                    {isActive && (
+                      {isActive && (
                       <motion.span
                         layoutId="desktop-nav-underline"
-                        transition={{ type: 'spring', stiffness: 460, damping: 35 }}
+                        transition={NATIVE_PILL_SPRING}
                         className="absolute left-0 right-0 -bottom-px h-0.5 rounded-full bg-gradient-to-r from-emerald-400 to-amber-400"
                       />
                     )}
@@ -538,7 +560,7 @@ export default function App() {
                   type="button"
                   whileTap={{ scale: 0.96 }}
                   onClick={() => void handleLoginWithPush()}
-                  className="cta-shimmer min-h-[40px] px-4 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0 transition-all shadow-sm shadow-emerald-950/50"
+                  className="min-h-[40px] px-4 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-semibold text-white inline-flex items-center gap-2 whitespace-nowrap shrink-0 transition-all shadow-sm shadow-emerald-950/50"
                 >
                   <LogIn className="w-3.5 h-3.5" />
                   <span>Войти</span>
@@ -579,7 +601,7 @@ export default function App() {
                   type="button"
                   whileTap={{ scale: 0.95 }}
                   onClick={() => void handleLoginWithPush()}
-                  className="cta-shimmer min-h-[38px] px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+                  className="min-h-[38px] px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-xs font-semibold text-white whitespace-nowrap shrink-0"
                 >
                   Войти
                 </motion.button>
@@ -603,9 +625,10 @@ export default function App() {
           />
         </header>
 
-      {/* Main Content Container */}
-      <TickerTape />
+        {/* Live Market Ticker Tape & Pulse Bar */}
+        <TickerTape />
 
+      {/* Main Content Container */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-3 sm:px-6 py-3 sm:py-4 pb-24 md:pb-8 overflow-x-hidden">
         {/* Compact Single-Row Top Bar: Mini Portfolio + Widgets + Tour + PWA */}
         <MiniPortfolioWidget
@@ -688,16 +711,30 @@ export default function App() {
               <MarketTerminalView
                 profile={profile}
                 isSignedIn={isSignedIn}
+                userEmail={firebaseUser?.email || privateSecurity?.email || ''}
                 analyses={analyses}
                 priceAlerts={priceAlerts}
+                supportTickets={supportTickets}
                 pushSubscribed={pushState.isSubscribed}
                 externalSelection={marketSelection}
                 onRequireLogin={() => void handleLoginWithPush()}
-                onUpgradePro={() => handleSwitchTab('strategies')}
+                onUpgradePro={() => {
+                  if (!isSignedIn) {
+                    void handleLoginWithPush();
+                  } else {
+                    setPricingOpen(true);
+                  }
+                }}
                 onOpenPushSettings={() => {
                   setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
                   handleSwitchTab('security');
                 }}
+                onOpenFullFaq={() => {
+                  setSecuritySectionSelection({ section: 'audit', sub: 'faq', nonce: Date.now() });
+                  handleSwitchTab('security');
+                }}
+                onStartTour={handleStartTour}
+                onCreateSupportTicket={createSupportTicket}
                 onCreatePriceAlert={createPriceAlert}
                 onTogglePriceAlert={togglePriceAlert}
                 onDeletePriceAlert={deletePriceAlert}
@@ -709,6 +746,14 @@ export default function App() {
 
             {activeTab === 'screener' && (
               <MarketScreenerView
+                isPro={isProSubscriptionActive(profile)}
+                onUpgradePro={() => {
+                  if (!isSignedIn) {
+                    void handleLoginWithPush();
+                  } else {
+                    setPricingOpen(true);
+                  }
+                }}
                 onOpenPairOnMarket={handleOpenPairOnMarket}
                 holdings={paperPortfolio.holdings}
                 portfolioReport={paperPortfolio.report}
@@ -722,6 +767,7 @@ export default function App() {
               <StrategiesView
                 profile={profile}
                 strategies={strategies}
+                analyses={analyses}
                 isSignedIn={isSignedIn}
                 pushSubscribed={pushState.isSubscribed}
                 onOpenPushSettings={() => {
@@ -730,6 +776,7 @@ export default function App() {
                 }}
                 onRequireLogin={() => void handleLoginWithPush()}
                 onSwitchPlan={handleProtectedPlanSwitch}
+                onConsumeCredits={consumeCredits}
                 onSaveStrategy={handleProtectedStrategySave}
               />
             )}
@@ -770,7 +817,7 @@ export default function App() {
       {/* Mobile Fixed Thumb-Zone Bottom Tab Bar */}
       <nav
         aria-label="Мобильная навигация"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 pb-safe border-t border-white/10 bg-[#0B0F17]/92 backdrop-blur-xl shadow-[0_-14px_34px_-14px_rgba(0,0,0,0.85)] grid grid-cols-5 items-center"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 pb-safe border-t border-white/10 bg-[#0B0F17]/95 backdrop-blur-md grid grid-cols-5 items-center"
       >
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
@@ -786,26 +833,26 @@ export default function App() {
             >
               {isActive && (
                 <motion.span
-                  layoutId="mobile-nav-spot"
-                  transition={{ type: 'spring', stiffness: 380, damping: 32 }}
-                  className="absolute inset-x-1.5 inset-y-1.5 rounded-2xl bg-emerald-400/10 ring-1 ring-emerald-400/20"
+                  layoutId="mobile-nav-pill-bg"
+                  transition={NATIVE_PILL_SPRING}
+                  className="absolute inset-x-1.5 inset-y-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20"
                 />
               )}
               {isActive && (
                 <motion.span
                   layoutId="mobile-nav-indicator"
-                  transition={{ type: 'spring', stiffness: 450, damping: 35 }}
+                  transition={NATIVE_PILL_SPRING}
                   className="absolute top-0 left-4 right-4 h-0.5 rounded-full bg-gradient-to-r from-emerald-400 to-amber-400"
                 />
               )}
               <motion.span
                 animate={{ y: isActive ? -1.5 : 0, scale: isActive ? 1.08 : 1 }}
-                transition={{ type: 'spring', stiffness: 420, damping: 28 }}
-                className={`inline-flex ${isActive ? 'drop-shadow-[0_0_8px_rgba(52,211,153,0.65)]' : ''}`}
+                transition={NATIVE_PILL_SPRING}
+                className="relative z-10 inline-flex"
               >
                 {item.icon}
               </motion.span>
-              <span className="text-[11px] font-medium tracking-tight">{item.mobileLabel}</span>
+              <span className="relative z-10 text-[11px] font-medium tracking-tight">{item.mobileLabel}</span>
             </motion.button>
           );
         })}
@@ -884,6 +931,7 @@ export default function App() {
         onLaunchStandaloneWidget={launchStandaloneWidget}
       />
       </div>
+      </LayoutGroup>
     </MotionConfig>
   );
 }

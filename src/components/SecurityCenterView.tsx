@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   Copy,
   FileClock,
+  Flame,
   Globe2,
   KeyRound,
   Lock,
@@ -60,7 +61,11 @@ interface SecurityCenterViewProps {
   currentSessionId: string;
   isSignedIn: boolean;
   pushState: PushControlState;
-  externalSection?: { section: SecuritySection; nonce: number } | null;
+  externalSection?: {
+    section: SecuritySection;
+    sub?: 'chart' | 'log' | 'faq';
+    nonce: number;
+  } | null;
   onRequireLogin: () => void;
   onSavePendingTotp: (encryptedPending: string) => Promise<void>;
   onActivateTotp: (encryptedSecret: string, backupCodeHashes: string[]) => Promise<void>;
@@ -127,6 +132,9 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   useEffect(() => {
     if (externalSection) {
       setSection(externalSection.section);
+      if (externalSection.section === 'audit' && externalSection.sub) {
+        setAuditSub(externalSection.sub);
+      }
     }
   }, [externalSection]);
 
@@ -520,6 +528,89 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                     {pushState.statusMessage}
                   </div>
                 )}
+
+                {/* Dedicated Volatility Spike Alert Toggle */}
+                <div
+                  className={`rounded-xl border p-3.5 transition-colors space-y-2.5 ${
+                    pushState.preferences.notifyVolatilitySpikes
+                      ? 'border-cyan-500/40 bg-cyan-500/8'
+                      : 'border-white/8 bg-[#0B0F17]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <Flame
+                        className={`w-4 h-4 mt-0.5 shrink-0 ${
+                          pushState.preferences.notifyVolatilitySpikes ? 'text-cyan-400' : 'text-slate-500'
+                        }`}
+                      />
+                      <div className="min-w-0">
+                        <div className="text-xs sm:text-sm font-semibold text-white">
+                          Скачки волатильности (&gt;{pushState.preferences.volatilityThresholdPct}% за час)
+                        </div>
+                        <p className="mt-0.5 text-[11px] text-slate-400 leading-relaxed">
+                          Мгновенные оповещения о резких ценовых аномалиях по всем 44 торговым парам.
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={pushState.preferences.notifyVolatilitySpikes}
+                      aria-label="Переключить уведомления о резких скачках волатильности"
+                      disabled={!pushState.isSupported || pushState.loading}
+                      onClick={() =>
+                        void pushState.updatePreferences({
+                          ...pushState.preferences,
+                          notifyVolatilitySpikes: !pushState.preferences.notifyVolatilitySpikes,
+                        })
+                      }
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors disabled:opacity-50 ${
+                        pushState.preferences.notifyVolatilitySpikes
+                          ? 'border-cyan-400/60 bg-cyan-500'
+                          : 'border-white/15 bg-white/10'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                          pushState.preferences.notifyVolatilitySpikes ? 'translate-x-5' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {pushState.preferences.notifyVolatilitySpikes && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/8">
+                      <span className="text-[11px] text-slate-400">Порог аномалии за 1 час:</span>
+                      <div className="inline-flex items-center gap-1 rounded-lg bg-[#0B0F17] p-0.5 border border-white/10">
+                        {[3, 5, 10].map((pct) => {
+                          const active = pushState.preferences.volatilityThresholdPct === pct;
+                          return (
+                            <button
+                              key={pct}
+                              type="button"
+                              disabled={!pushState.isSupported || pushState.loading}
+                              onClick={() =>
+                                void pushState.updatePreferences({
+                                  ...pushState.preferences,
+                                  volatilityThresholdPct: pct,
+                                })
+                              }
+                              className={`min-h-[28px] px-2.5 rounded-md text-[11px] font-mono font-semibold transition-colors whitespace-nowrap ${
+                                active
+                                  ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-500/40'
+                                  : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              &gt;{pct}% / ч
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                   {(

@@ -113,6 +113,33 @@ function evaluateSignal(
     return null;
   }
 
+  if (strategyKey === 'spot_ema_ribbon_pullback') {
+    if (
+      ema20 >= ema50 * 0.996 &&
+      bar.low <= ema20 * 1.007 &&
+      bar.close >= ema50 * 0.99 &&
+      bar.close > bar.open &&
+      rsi >= 38 &&
+      rsi <= 68
+    ) {
+      const bounceStrength = ((bar.close - bar.low) / Math.max(1e-6, bar.close)) * 900;
+      return { direction: 'LONG', confidence: Math.min(93, Math.round(70 + bounceStrength)) };
+    }
+    return null;
+  }
+
+  if (strategyKey === 'spot_bb_squeeze_breakout') {
+    const windowVols = candles.slice(Math.max(0, idx - 12), idx).map((c) => c.volume);
+    const avgVol =
+      windowVols.length > 0 ? windowVols.reduce((acc, v) => acc + v, 0) / windowVols.length : bar.volume;
+    const bandWidthPct = ((bbUpper - bbLower) / Math.max(1e-6, bar.close)) * 100;
+    if (bandWidthPct <= 6.2 && bar.close >= bbUpper * 0.992 && bar.volume >= avgVol * 1.1 && rsi <= 78) {
+      const volBoost = Math.min(18, ((bar.volume / Math.max(1e-6, avgVol)) - 1) * 18);
+      return { direction: 'LONG', confidence: Math.min(94, Math.round(71 + volBoost)) };
+    }
+    return null;
+  }
+
   if (strategyKey === 'futures_momentum_atr') {
     if (bar.close > ema20 && ema20 >= ema50 * 0.998 && rsi >= 48 && rsi <= 75) {
       const spreadPct = Math.abs((ema20 - ema50) / Math.max(1e-6, ema50)) * 100;
@@ -143,6 +170,21 @@ function evaluateSignal(
     }
     if (bar.low <= bbLower * 1.006 && rsi < 42) {
       return { direction: 'LONG', confidence: Math.min(92, Math.round(69 + (44 - rsi) * 1.1)) };
+    }
+    return null;
+  }
+
+  if (strategyKey === 'futures_oi_volatility_breakout') {
+    const atrNow = estimateBarAtr(candles, idx);
+    const atrPrev = estimateBarAtr(candles, Math.max(14, idx - 4));
+    const recentHigh = Math.max(...candles.slice(Math.max(0, idx - 6), idx).map((c) => c.high));
+    const recentLow = Math.min(...candles.slice(Math.max(0, idx - 6), idx).map((c) => c.low));
+    const isExpanding = atrNow >= atrPrev * 1.06;
+    if (isExpanding && bar.close > recentHigh * 0.998 && bar.close > ema20 && rsi >= 50 && rsi <= 79) {
+      return { direction: 'LONG', confidence: Math.min(93, Math.round(71 + (atrNow / Math.max(1e-6, atrPrev) - 1) * 40)) };
+    }
+    if (isExpanding && bar.close < recentLow * 1.002 && bar.close < ema20 && rsi <= 50 && rsi >= 21) {
+      return { direction: 'SHORT', confidence: Math.min(93, Math.round(71 + (atrNow / Math.max(1e-6, atrPrev) - 1) * 40)) };
     }
     return null;
   }

@@ -21,8 +21,10 @@ export interface TickerOverview {
   high24h: number;
   low24h: number;
   volume24hUsdt: number;
+  marketCapUsdt?: number;
   fundingRatePct?: number;
   openInterestUsdt?: number;
+  sparkline24h?: number[];
   source: 'live' | 'cached';
 }
 
@@ -55,6 +57,40 @@ export const SUPPORTED_SYMBOLS = [
   'LINKUSDT',
   'DOGEUSDT',
   'ARBUSDT',
+  'SUIUSDT',
+  'APTUSDT',
+  'NEARUSDT',
+  'ADAUSDT',
+  'DOTUSDT',
+  'OPUSDT',
+  'INJUSDT',
+  'AAVEUSDT',
+  'UNIUSDT',
+  'LTCUSDT',
+  'TRXUSDT',
+  'ATOMUSDT',
+  'TIAUSDT',
+  'WLDUSDT',
+  'ENAUSDT',
+  'SEIUSDT',
+  'POLUSDT',
+  'RENDERUSDT',
+  'FETUSDT',
+  'FILUSDT',
+  'BCHUSDT',
+  'ETCUSDT',
+  'HBARUSDT',
+  'ICPUSDT',
+  'STXUSDT',
+  'IMXUSDT',
+  'JUPUSDT',
+  'PYTHUSDT',
+  'ORDIUSDT',
+  'LDOUSDT',
+  'CRVUSDT',
+  'GRTUSDT',
+  'ALGOUSDT',
+  'XLMUSDT',
 ] as const;
 
 const REFERENCE_PRICES: Record<string, number> = {
@@ -68,11 +104,51 @@ const REFERENCE_PRICES: Record<string, number> = {
   LINKUSDT: 14.85,
   DOGEUSDT: 0.372,
   ARBUSDT: 0.745,
+  SUIUSDT: 3.25,
+  APTUSDT: 11.4,
+  NEARUSDT: 5.65,
+  ADAUSDT: 0.78,
+  DOTUSDT: 5.95,
+  OPUSDT: 1.82,
+  INJUSDT: 24.6,
+  AAVEUSDT: 172.5,
+  UNIUSDT: 9.4,
+  LTCUSDT: 88.2,
+  TRXUSDT: 0.198,
+  ATOMUSDT: 6.35,
+  TIAUSDT: 5.45,
+  WLDUSDT: 2.38,
+  ENAUSDT: 0.62,
+  SEIUSDT: 0.49,
+  POLUSDT: 0.44,
+  RENDERUSDT: 7.45,
+  FETUSDT: 1.38,
+  FILUSDT: 4.55,
+  BCHUSDT: 445.0,
+  ETCUSDT: 25.8,
+  HBARUSDT: 0.142,
+  ICPUSDT: 9.15,
+  STXUSDT: 1.94,
+  IMXUSDT: 1.36,
+  JUPUSDT: 1.08,
+  PYTHUSDT: 0.41,
+  ORDIUSDT: 38.4,
+  LDOUSDT: 1.32,
+  CRVUSDT: 0.46,
+  GRTUSDT: 0.215,
+  ALGOUSDT: 0.21,
+  XLMUSDT: 0.24,
 };
 
 const marketCache = new Map<string, { expiresAt: number; payload: unknown }>();
+const lastLiveOverviewByMarket = new Map<'spot' | 'futures', TickerOverview[]>();
+const lastLiveCandlesByKey = new Map<
+  string,
+  { candles: CandlePoint[]; fundingRatePct?: number; openInterestUsdt?: number }
+>();
 
-function getCached<T>(key: string): T | null {
+function getCached<T>(key: string, forceRefresh = false): T | null {
+  if (forceRefresh) return null;
   const hit = marketCache.get(key);
   if (hit && hit.expiresAt > Date.now()) {
     return hit.payload as T;
@@ -90,7 +166,11 @@ async function fetchJsonWithTimeout(url: string, timeoutMs = 4500): Promise<unkn
   try {
     const res = await fetch(url, {
       signal: controller.signal,
-      headers: { Accept: 'application/json', 'User-Agent': 'AegisQuant/1.0' },
+      headers: {
+        Accept: 'application/json',
+        'Cache-Control': 'no-cache',
+        'User-Agent': 'AegisQuant/1.0',
+      },
     });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -99,6 +179,18 @@ async function fetchJsonWithTimeout(url: string, timeoutMs = 4500): Promise<unkn
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJsonWithMirrors(urls: string[], timeoutMs = 4500): Promise<unknown> {
+  let lastError: unknown = null;
+  for (const url of urls) {
+    try {
+      return await fetchJsonWithTimeout(url, timeoutMs);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError ?? new Error('All market endpoints failed');
 }
 
 function computeEMA(values: number[], period: number): number[] {
@@ -256,19 +348,176 @@ function generateResilientCandles(symbol: string, interval: string, limit = 80):
   return candles;
 }
 
-export async function getMarketOverview(marketType: 'spot' | 'futures'): Promise<TickerOverview[]> {
-  const cacheKey = `overview:${marketType}`;
-  const cached = getCached<TickerOverview[]>(cacheKey);
+function buildFallbackSparkline(symbol: string, lastPrice: number, change24hPct: number): number[] {
+  const count = 24;
+  const safeLast = Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : 1;
+  const pctRatio = Math.max(-0.45, Math.min(0.85, (change24hPct || 0) / 100));
+  const startPrice = safeLast / (1 + pctRatio);
+  const seed = symbol.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  const points: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const progress = i / (count - 1);
+    const trend = startPrice + (safeLast - startPrice) * progress;
+    const envelope = Math.sin(progress * Math.PI);
+    const wave =
+      (Math.sin((i + seed) * 0.65) * 0.011 + Math.cos((i + seed) * 0.31) * 0.007) * envelope;
+    const val = i === count - 1 ? safeLast : Math.max(safeLast * 0.35, trend * (1 + wave));
+    points.push(Number(val.toPrecision(6)));
+  }
+  return points;
+}
+
+async function get24hSparklinesMap(
+  marketType: 'spot' | 'futures',
+  forceRefresh = false
+): Promise<Record<string, number[]>> {
+  const cacheKey = `sparklines24h:${marketType}`;
+  const cached = getCached<Record<string, number[]>>(cacheKey, forceRefresh);
   if (cached) return cached;
 
-  const baseUrl =
+  const primaryUrls =
     marketType === 'futures'
-      ? 'https://fapi.binance.com/fapi/v1/ticker/24hr'
-      : 'https://api.binance.com/api/v3/ticker/24hr';
+      ? ['https://fapi.binance.com/fapi/v1/klines', 'https://api.binance.com/api/v3/klines', 'https://data-api.binance.vision/api/v3/klines']
+      : ['https://api.binance.com/api/v3/klines', 'https://data-api.binance.vision/api/v3/klines'];
+
+  const entries = await Promise.all(
+    SUPPORTED_SYMBOLS.map(async (sym): Promise<[string, number[] | null]> => {
+      try {
+        const klines = (await fetchJsonWithMirrors(
+          primaryUrls.map((base) => `${base}?symbol=${sym}&interval=1h&limit=24`),
+          3200
+        )) as Array<[number, string, string, string, string]>;
+        if (Array.isArray(klines) && klines.length >= 6) {
+          return [sym, klines.map((k) => Number(k[4])).filter((v) => Number.isFinite(v))];
+        }
+      } catch {
+        // Fall through to deterministic fallback below
+      }
+      return [sym, null];
+    })
+  );
+
+  const result: Record<string, number[]> = {};
+  for (const [sym, series] of entries) {
+    if (series && series.length >= 6) {
+      result[sym] = series;
+    }
+  }
+  setCached(cacheKey, result, 2 * 60_000);
+  return result;
+}
+
+const CIRCULATING_SUPPLY_ESTIMATES: Record<string, number> = {
+  BTCUSDT: 19_850_000,
+  ETHUSDT: 120_500_000,
+  SOLUSDT: 488_000_000,
+  BNBUSDT: 142_500_000,
+  TONUSDT: 2_510_000_000,
+  XRPUSDT: 57_800_000_000,
+  AVAXUSDT: 412_000_000,
+  LINKUSDT: 638_000_000,
+  DOGEUSDT: 148_000_000_000,
+  ARBUSDT: 4_350_000_000,
+  SUIUSDT: 3_090_000_000,
+  APTUSDT: 575_000_000,
+  NEARUSDT: 1_180_000_000,
+  ADAUSDT: 35_200_000_000,
+  DOTUSDT: 1_540_000_000,
+  OPUSDT: 1_350_000_000,
+  INJUSDT: 99_000_000,
+  AAVEUSDT: 15_050_000,
+  UNIUSDT: 600_500_000,
+  LTCUSDT: 75_500_000,
+  TRXUSDT: 86_100_000_000,
+  ATOMUSDT: 391_000_000,
+  TIAUSDT: 515_000_000,
+  WLDUSDT: 970_000_000,
+  ENAUSDT: 3_120_000_000,
+  SEIUSDT: 4_450_000_000,
+  POLUSDT: 8_450_000_000,
+  RENDERUSDT: 518_000_000,
+  FETUSDT: 2_440_000_000,
+  FILUSDT: 630_000_000,
+  BCHUSDT: 19_820_000,
+  ETCUSDT: 150_700_000,
+  HBARUSDT: 38_300_000_000,
+  ICPUSDT: 480_000_000,
+  STXUSDT: 1_510_000_000,
+  IMXUSDT: 1_740_000_000,
+  JUPUSDT: 1_700_000_000,
+  PYTHUSDT: 3_625_000_000,
+  ORDIUSDT: 21_000_000,
+  LDOUSDT: 896_000_000,
+  CRVUSDT: 1_270_000_000,
+  GRTUSDT: 9_550_000_000,
+  ALGOUSDT: 8_450_000_000,
+  XLMUSDT: 30_600_000_000,
+};
+
+async function getMarketCapsMap(): Promise<Record<string, number>> {
+  const cacheKey = 'marketcaps:cg';
+  const cached = getCached<Record<string, number>>(cacheKey);
+  if (cached) return cached;
 
   try {
-    const symbolsParam = encodeURIComponent(JSON.stringify(SUPPORTED_SYMBOLS));
-    const data = (await fetchJsonWithTimeout(`${baseUrl}?symbols=${symbolsParam}`)) as Array<Record<string, string>>;
+    const coins = (await fetchJsonWithTimeout(
+      'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1',
+      4500
+    )) as Array<{ symbol?: string; id?: string; market_cap?: number }>;
+
+    if (Array.isArray(coins) && coins.length > 0) {
+      const map: Record<string, number> = {};
+      for (const coin of coins) {
+        if (typeof coin.symbol !== 'string' || typeof coin.market_cap !== 'number' || coin.market_cap <= 0) {
+          continue;
+        }
+        const upper = coin.symbol.toUpperCase();
+        if (map[upper] === undefined) {
+          map[upper] = Math.round(coin.market_cap);
+        }
+        if (coin.id === 'polygon-ecosystem-token' || upper === 'MATIC') {
+          map.POL = map.POL ?? Math.round(coin.market_cap);
+        }
+        if (coin.id === 'render-token' || upper === 'RNDR') {
+          map.RENDER = map.RENDER ?? Math.round(coin.market_cap);
+        }
+      }
+      setCached(cacheKey, map, 10 * 60_000);
+      return map;
+    }
+  } catch {
+    // Fall through to circulating supply estimation
+  }
+  return {};
+}
+
+export async function getMarketOverview(
+  marketType: 'spot' | 'futures',
+  forceRefresh = false
+): Promise<TickerOverview[]> {
+  const cacheKey = `overview:${marketType}`;
+  const cached = getCached<TickerOverview[]>(cacheKey, forceRefresh);
+  if (cached) return cached;
+
+  const symbolsParam = encodeURIComponent(JSON.stringify(SUPPORTED_SYMBOLS));
+  const tickerUrls =
+    marketType === 'futures'
+      ? [
+          `https://fapi.binance.com/fapi/v1/ticker/24hr?symbols=${symbolsParam}`,
+          `https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`,
+          `https://data-api.binance.vision/api/v3/ticker/24hr?symbols=${symbolsParam}`,
+        ]
+      : [
+          `https://api.binance.com/api/v3/ticker/24hr?symbols=${symbolsParam}`,
+          `https://data-api.binance.vision/api/v3/ticker/24hr?symbols=${symbolsParam}`,
+        ];
+
+  try {
+    const [data, sparklinesMap, marketCapsMap] = await Promise.all([
+      fetchJsonWithMirrors(tickerUrls) as Promise<Array<Record<string, string>>>,
+      get24hSparklinesMap(marketType, forceRefresh).catch(() => ({} as Record<string, number[]>)),
+      getMarketCapsMap().catch(() => ({} as Record<string, number>)),
+    ]);
     let fundingMap: Record<string, number> = {};
     if (marketType === 'futures') {
       try {
@@ -285,27 +534,48 @@ export async function getMarketOverview(marketType: 'spot' | 'futures'): Promise
 
     const mapped: TickerOverview[] = SUPPORTED_SYMBOLS.map((sym) => {
       const row = data.find((d) => d.symbol === sym);
+      const baseAsset = sym.replace('USDT', '');
       const price = row ? Number(row.lastPrice) : REFERENCE_PRICES[sym] ?? 100;
+      const changePct = row ? Number(Number(row.priceChangePercent).toFixed(2)) : 0;
       const volUsdt = row ? Number(row.quoteVolume) : 250_000_000;
+      const estimatedMcap = Math.round(price * (CIRCULATING_SUPPLY_ESTIMATES[sym] ?? 150_000_000));
+      const marketCapUsdt = marketCapsMap[baseAsset] ?? estimatedMcap;
+      const rawSpark = sparklinesMap[sym];
+      const sparkline24h =
+        rawSpark && rawSpark.length >= 6
+          ? [...rawSpark.slice(0, -1), price]
+          : buildFallbackSparkline(sym, price, changePct);
       return {
         symbol: sym,
-        baseAsset: sym.replace('USDT', ''),
+        baseAsset,
         price,
-        change24hPct: row ? Number(Number(row.priceChangePercent).toFixed(2)) : 0,
+        change24hPct: changePct,
         high24h: row ? Number(row.highPrice) : price * 1.03,
         low24h: row ? Number(row.lowPrice) : price * 0.97,
         volume24hUsdt: volUsdt,
+        marketCapUsdt,
         fundingRatePct: marketType === 'futures' ? fundingMap[sym] ?? 0.01 : undefined,
         openInterestUsdt: marketType === 'futures' ? Math.round(volUsdt * 0.34) : undefined,
+        sparkline24h,
         source: 'live',
       };
     });
-    setCached(cacheKey, mapped, 25_000);
+    lastLiveOverviewByMarket.set(marketType, mapped);
+    setCached(cacheKey, mapped, 10_000);
     return mapped;
   } catch {
+    const prevLive = lastLiveOverviewByMarket.get(marketType);
+    if (prevLive && prevLive.length > 0) {
+      const staleCopy = prevLive.map((item) => ({ ...item, source: 'cached' as const }));
+      setCached(cacheKey, staleCopy, 5_000);
+      return staleCopy;
+    }
+
     const fallback: TickerOverview[] = SUPPORTED_SYMBOLS.map((sym, idx) => {
       const ref = REFERENCE_PRICES[sym] ?? 100;
-      const delta = Number((((idx % 5) - 1.8) * 1.45).toFixed(2));
+      const delta = Number((((idx % 6) - 2.1) * 1.45).toFixed(2));
+      const baseVol = Math.max(24_000_000, Math.round((SUPPORTED_SYMBOLS.length + 2 - idx) * 42_000_000));
+      const marketCapUsdt = Math.round(ref * (CIRCULATING_SUPPLY_ESTIMATES[sym] ?? 150_000_000));
       return {
         symbol: sym,
         baseAsset: sym.replace('USDT', ''),
@@ -313,13 +583,15 @@ export async function getMarketOverview(marketType: 'spot' | 'futures'): Promise
         change24hPct: delta,
         high24h: Number((ref * 1.028).toFixed(4)),
         low24h: Number((ref * 0.974).toFixed(4)),
-        volume24hUsdt: Math.round((12 - idx) * 95_000_000),
+        volume24hUsdt: baseVol,
+        marketCapUsdt,
         fundingRatePct: marketType === 'futures' ? Number((0.008 + (idx % 3) * 0.004).toFixed(4)) : undefined,
-        openInterestUsdt: marketType === 'futures' ? Math.round((12 - idx) * 42_000_000) : undefined,
+        openInterestUsdt: marketType === 'futures' ? Math.round(baseVol * 0.36) : undefined,
+        sparkline24h: buildFallbackSparkline(sym, ref, delta),
         source: 'cached',
       };
     });
-    setCached(cacheKey, fallback, 15_000);
+    setCached(cacheKey, fallback, 5_000);
     return fallback;
   }
 }
@@ -348,17 +620,25 @@ export interface OrderBookSnapshot {
 
 export async function getMarketDepth(
   symbol: string,
-  marketType: 'spot' | 'futures'
+  marketType: 'spot' | 'futures',
+  forceRefresh = false
 ): Promise<OrderBookSnapshot> {
   const safeSymbol = SUPPORTED_SYMBOLS.includes(symbol as (typeof SUPPORTED_SYMBOLS)[number]) ? symbol : 'BTCUSDT';
   const cacheKey = `depth:${marketType}:${safeSymbol}`;
-  const cached = getCached<OrderBookSnapshot>(cacheKey);
+  const cached = getCached<OrderBookSnapshot>(cacheKey, forceRefresh);
   if (cached) return cached;
 
-  const baseUrl =
+  const depthUrls =
     marketType === 'futures'
-      ? 'https://fapi.binance.com/fapi/v1/depth'
-      : 'https://api.binance.com/api/v3/depth';
+      ? [
+          `https://fapi.binance.com/fapi/v1/depth?symbol=${safeSymbol}&limit=10`,
+          `https://api.binance.com/api/v3/depth?symbol=${safeSymbol}&limit=10`,
+          `https://data-api.binance.vision/api/v3/depth?symbol=${safeSymbol}&limit=10`,
+        ]
+      : [
+          `https://api.binance.com/api/v3/depth?symbol=${safeSymbol}&limit=10`,
+          `https://data-api.binance.vision/api/v3/depth?symbol=${safeSymbol}&limit=10`,
+        ];
 
   const buildLevels = (raw: Array<[string | number, string | number]>, maxCumRef?: number) => {
     let cum = 0;
@@ -382,7 +662,7 @@ export async function getMarketDepth(
   };
 
   try {
-    const data = (await fetchJsonWithTimeout(`${baseUrl}?symbol=${safeSymbol}&limit=10`)) as {
+    const data = (await fetchJsonWithMirrors(depthUrls)) as {
       bids?: Array<[string, string]>;
       asks?: Array<[string, string]>;
     };
@@ -414,7 +694,7 @@ export async function getMarketDepth(
         asks,
         updatedAt: new Date().toISOString(),
       };
-      setCached(cacheKey, snapshot, 6_000);
+      setCached(cacheKey, snapshot, 4_000);
       return snapshot;
     }
   } catch {
@@ -455,14 +735,15 @@ export async function getMarketDepth(
     asks,
     updatedAt: new Date().toISOString(),
   };
-  setCached(cacheKey, fallback, 6_000);
+  setCached(cacheKey, fallback, 4_000);
   return fallback;
 }
 
 export async function getMarketCandles(
   symbol: string,
   interval: string,
-  marketType: 'spot' | 'futures'
+  marketType: 'spot' | 'futures',
+  forceRefresh = false
 ): Promise<{
   symbol: string;
   interval: string;
@@ -472,17 +753,28 @@ export async function getMarketCandles(
   indicators: IndicatorSnapshot;
   fundingRatePct?: number;
   openInterestUsdt?: number;
+  updatedAt: string;
 }> {
   const safeSymbol = SUPPORTED_SYMBOLS.includes(symbol as (typeof SUPPORTED_SYMBOLS)[number]) ? symbol : 'BTCUSDT';
   const safeInterval = ['15m', '1h', '4h', '1d'].includes(interval) ? interval : '1h';
   const cacheKey = `candles:${marketType}:${safeSymbol}:${safeInterval}`;
-  const cached = getCached<ReturnType<typeof getMarketCandles> extends Promise<infer R> ? R : never>(cacheKey);
+  const cached = getCached<ReturnType<typeof getMarketCandles> extends Promise<infer R> ? R : never>(
+    cacheKey,
+    forceRefresh
+  );
   if (cached) return cached;
 
-  const baseUrl =
+  const klineUrls =
     marketType === 'futures'
-      ? 'https://fapi.binance.com/fapi/v1/klines'
-      : 'https://api.binance.com/api/v3/klines';
+      ? [
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`,
+          `https://api.binance.com/api/v3/klines?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`,
+          `https://data-api.binance.vision/api/v3/klines?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`,
+        ]
+      : [
+          `https://api.binance.com/api/v3/klines?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`,
+          `https://data-api.binance.vision/api/v3/klines?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`,
+        ];
 
   let rawCandles: CandlePoint[] | null = null;
   let source: 'live' | 'cached' = 'live';
@@ -490,7 +782,7 @@ export async function getMarketCandles(
   let openInterestUsdt: number | undefined;
 
   try {
-    const klines = (await fetchJsonWithTimeout(`${baseUrl}?symbol=${safeSymbol}&interval=${safeInterval}&limit=240`)) as Array<
+    const klines = (await fetchJsonWithMirrors(klineUrls)) as Array<
       [number, string, string, string, string, string]
     >;
     if (Array.isArray(klines) && klines.length > 20) {
@@ -518,12 +810,25 @@ export async function getMarketCandles(
     source = 'cached';
   }
 
-  if (!rawCandles) {
+  if (rawCandles) {
+    lastLiveCandlesByKey.set(cacheKey, {
+      candles: rawCandles,
+      fundingRatePct,
+      openInterestUsdt,
+    });
+  } else {
     source = 'cached';
-    rawCandles = generateResilientCandles(safeSymbol, safeInterval, 240);
-    if (marketType === 'futures') {
-      fundingRatePct = 0.0112;
-      openInterestUsdt = 640_000_000;
+    const prevLive = lastLiveCandlesByKey.get(cacheKey);
+    if (prevLive) {
+      rawCandles = prevLive.candles;
+      fundingRatePct = prevLive.fundingRatePct;
+      openInterestUsdt = prevLive.openInterestUsdt;
+    } else {
+      rawCandles = generateResilientCandles(safeSymbol, safeInterval, 240);
+      if (marketType === 'futures') {
+        fundingRatePct = 0.0112;
+        openInterestUsdt = 640_000_000;
+      }
     }
   }
 
@@ -537,8 +842,9 @@ export async function getMarketCandles(
     indicators: snapshot,
     fundingRatePct,
     openInterestUsdt,
+    updatedAt: new Date().toISOString(),
   };
-  setCached(cacheKey, payload, 20_000);
+  setCached(cacheKey, payload, source === 'live' ? 10_000 : 5_000);
   return payload;
 }
 
@@ -570,9 +876,9 @@ function classifyFearGreedRu(value: number): { en: string; ru: string } {
   return { en: 'Extreme Greed', ru: 'Экстремальная жадность' };
 }
 
-export async function getFearAndGreedIndex(): Promise<FearAndGreedSnapshot> {
+export async function getFearAndGreedIndex(forceRefresh = false): Promise<FearAndGreedSnapshot> {
   const cacheKey = 'sentiment:fear_greed';
-  const cached = getCached<FearAndGreedSnapshot>(cacheKey);
+  const cached = getCached<FearAndGreedSnapshot>(cacheKey, forceRefresh);
   if (cached) return cached;
 
   try {
@@ -630,7 +936,7 @@ export async function getFearAndGreedIndex(): Promise<FearAndGreedSnapshot> {
         history,
         updatedAt: new Date().toISOString(),
       };
-      setCached(cacheKey, snapshot, 10 * 60_000);
+      setCached(cacheKey, snapshot, 5 * 60_000);
       return snapshot;
     }
   } catch {

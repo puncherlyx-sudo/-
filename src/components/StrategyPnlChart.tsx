@@ -13,8 +13,8 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { ArrowDownRight, ArrowUpRight, RefreshCw, TrendingUp } from 'lucide-react';
-import { STRATEGY_CATALOG } from '../data/strategies';
+import { ArrowDownRight, ArrowUpRight, Crown, Lock, RefreshCw, TrendingUp } from 'lucide-react';
+import { CREDIT_COSTS, FREE_MAX_LEVERAGE, PRO_MONTHLY_QUOTA, STRATEGY_CATALOG } from '../data/strategies';
 import type {
   EquityCurvePoint,
   StrategyBreakdownResult,
@@ -25,6 +25,11 @@ import type {
 interface StrategyPnlChartProps {
   strategies: StrategyConfig[];
   isPro: boolean;
+  isSignedIn?: boolean;
+  creditsRemaining?: number;
+  creditQuota?: number;
+  onUpgradePro?: () => void;
+  onConsumeCredits?: (amount: number, auditReason?: string) => Promise<boolean>;
 }
 
 function shortenStrategyName(name: string): string {
@@ -112,7 +117,15 @@ const StrategyBarTooltip: React.FC<CustomBarTooltipProps> = ({ active, payload }
   );
 };
 
-export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, isPro }) => {
+export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
+  strategies,
+  isPro,
+  isSignedIn = false,
+  creditsRemaining,
+  creditQuota = 15,
+  onUpgradePro,
+  onConsumeCredits,
+}) => {
   const [interval, setInterval] = useState<'1h' | '4h'>('1h');
   const [scope, setScope] = useState<'active' | 'all'>('active');
   const [unitMode, setUnitMode] = useState<'pct' | 'usdt'>('pct');
@@ -122,21 +135,38 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
+  const isOutOfCredits = Boolean(
+    isSignedIn &&
+      typeof creditsRemaining === 'number' &&
+      creditsRemaining < CREDIT_COSTS.portfolioBacktest
+  );
+
+  useEffect(() => {
+    if (!isPro) {
+      if (interval !== '1h') setInterval('1h');
+      if (scope !== 'active') setScope('active');
+    }
+  }, [isPro, interval, scope]);
+
   const simulationPayload = useMemo(() => {
     return STRATEGY_CATALOG.map((tpl) => {
       const cfg = strategies.find((s) => s.strategyKey === tpl.key);
+      const isAllowed = isPro || tpl.tier === 'free';
+      const defaultEnabled = tpl.key === 'spot_trend_breakout' || tpl.key === 'futures_momentum_atr';
       return {
         strategyKey: tpl.key,
         name: tpl.name,
         shortTag: tpl.shortTag,
         marketType: tpl.marketType,
-        enabled: cfg
-          ? cfg.enabled
-          : tpl.key === 'spot_trend_breakout' || tpl.key === 'futures_momentum_atr',
+        enabled: isAllowed ? (cfg ? cfg.enabled : defaultEnabled) : false,
         dailySignalLimit: cfg ? (isPro ? cfg.dailySignalLimit : 1) : 1,
         minConfidence: cfg ? cfg.minConfidence : 70,
         riskPerTradePct: cfg ? cfg.riskPerTradePct : tpl.defaultRiskPct,
-        leverage: cfg ? cfg.leverage : tpl.defaultLeverage,
+        leverage: cfg
+          ? isPro
+            ? cfg.leverage
+            : Math.min(FREE_MAX_LEVERAGE, cfg.leverage)
+          : Math.min(isPro ? 20 : FREE_MAX_LEVERAGE, tpl.defaultLeverage),
         pairs: cfg?.pairs?.length ? cfg.pairs : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
       };
     });
@@ -172,6 +202,23 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
       setLoading(false);
     }
   }, [simulationPayload, interval, depositUsdt, scope]);
+
+  const handleManualRecalculate = async () => {
+    setError(null);
+    if (isOutOfCredits) {
+      onUpgradePro?.();
+      return;
+    }
+    if (isSignedIn && onConsumeCredits) {
+      try {
+        await onConsumeCredits(CREDIT_COSTS.portfolioBacktest, 'Ручной пересчёт бэктеста PnL');
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Недостаточно кредитов для пересчёта.');
+        return;
+      }
+    }
+    await fetchBacktest();
+  };
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -225,12 +272,19 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
             </button>
             <button
               type="button"
-              onClick={() => setScope('all')}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+              onClick={() => {
+                if (!isPro) {
+                  onUpgradePro?.();
+                  return;
+                }
+                setScope('all');
+              }}
+              className={`min-h-[36px] px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
                 scope === 'all' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Все (6)
+              {!isPro && <Lock className="w-3 h-3 text-amber-400 shrink-0" />}
+              <span>Все ({STRATEGY_CATALOG.length})</span>
             </button>
           </div>
 
@@ -247,12 +301,19 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
             </button>
             <button
               type="button"
-              onClick={() => setInterval('4h')}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
+              onClick={() => {
+                if (!isPro) {
+                  onUpgradePro?.();
+                  return;
+                }
+                setInterval('4h');
+              }}
+              className={`min-h-[36px] px-3 rounded-lg text-xs font-mono font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
                 interval === '4h' ? 'bg-white/12 text-white' : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              4H · ~15д
+              {!isPro && <Lock className="w-3 h-3 text-amber-400 shrink-0" />}
+              <span>4H · ~15д</span>
             </button>
           </div>
 
@@ -293,18 +354,60 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
             />
           </label>
 
-          <button
-            type="button"
-            disabled={loading}
-            onClick={() => void fetchBacktest()}
-            aria-label="Пересчитать PnL стратегий"
-            className="min-h-[40px] px-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 text-xs inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-            <span className="hidden sm:inline">Пересчитать</span>
-          </button>
+          {isOutOfCredits ? (
+            <button
+              type="button"
+              onClick={() => onUpgradePro?.()}
+              className="cta-shimmer min-h-[40px] px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Crown className="w-3.5 h-3.5 shrink-0" />
+              <span>{isPro ? `Продлить PRO (+${PRO_MONTHLY_QUOTA} кр.)` : 'Перейти на PRO'}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={loading}
+              onClick={() => void handleManualRecalculate()}
+              aria-label="Пересчитать PnL стратегий"
+              className="min-h-[40px] px-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 text-xs inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">
+                {isSignedIn
+                  ? `Пересчитать (${CREDIT_COSTS.portfolioBacktest} кр.)`
+                  : 'Пересчитать'}
+              </span>
+            </button>
+          )}
         </div>
       </div>
+
+      {isOutOfCredits && (
+        <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-2.5 text-amber-100">
+            <Crown className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-amber-200">
+                {isPro
+                  ? `Кредиты PRO исчерпаны (${creditsRemaining ?? 0}/${PRO_MONTHLY_QUOTA} кр.)`
+                  : `Лимит бесплатных кредитов достигнут (${creditsRemaining ?? 0}/${creditQuota} кр.)`}
+              </div>
+              <p className="mt-0.5 text-amber-200/80">
+                {isPro
+                  ? `Продлите подписку PRO, чтобы пополнить +${PRO_MONTHLY_QUOTA} кредитов для новых пересчётов и AI-сигналов.`
+                  : `Перейдите на PRO: ${PRO_MONTHLY_QUOTA} кредитов на месяц, 4H-бэктест всех ${STRATEGY_CATALOG.length} стратегий и снятие дневных лимитов сигналов.`}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onUpgradePro?.()}
+            className="cta-shimmer min-h-[38px] px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold whitespace-nowrap shrink-0 transition-colors"
+          >
+            {isPro ? 'Продлить PRO' : 'Оформить PRO'}
+          </button>
+        </div>
+      )}
 
       {/* 4-Column Tabular KPI Strip (Hairline Dividers, Zero Cards-in-Cards) */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 py-4 border-y border-white/8 text-xs">
@@ -388,13 +491,23 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({ strategies, 
           <p className="text-xs text-slate-400">
             Включите хотя бы одну стратегию выше или переключите режим просмотра на все доступные алгоритмы.
           </p>
-          <button
-            type="button"
-            onClick={() => setScope('all')}
-            className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-colors"
-          >
-            Показать все 6 стратегий
-          </button>
+          {isPro ? (
+            <button
+              type="button"
+              onClick={() => setScope('all')}
+              className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-colors"
+            >
+              Показать все {STRATEGY_CATALOG.length} стратегий
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onUpgradePro?.()}
+              className="min-h-[40px] px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-xs font-semibold text-slate-950 transition-colors"
+            >
+              Открыть все {STRATEGY_CATALOG.length} стратегий в PRO
+            </button>
+          )}
         </div>
       ) : report ? (
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">

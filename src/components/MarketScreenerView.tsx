@@ -3,7 +3,9 @@ import {
   ArrowDownUp,
   ArrowRight,
   BarChart2,
+  Download,
   Flame,
+  Lock,
   PieChart as PieChartIcon,
   Plus,
   RefreshCw,
@@ -34,6 +36,8 @@ import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 export type ScreenerSection = 'table' | 'momentum' | 'portfolio';
 
 interface MarketScreenerViewProps {
+  isPro?: boolean;
+  onUpgradePro?: () => void;
   onOpenPairOnMarket: (symbol: string, marketType: MarketType) => void;
   holdings: PortfolioHolding[];
   portfolioReport: PaperPortfolioReport;
@@ -55,7 +59,36 @@ function formatUsd(val: number): string {
   return `$${val.toFixed(4)}`;
 }
 
+function downloadCsvWithBom(
+  filename: string,
+  headers: string[],
+  rows: Array<Array<string | number>>
+): void {
+  const escapeCell = (val: string | number) => {
+    const str = String(val);
+    if (/[",\n;]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+  const csvBody = [
+    headers.map(escapeCell).join(','),
+    ...rows.map((r) => r.map(escapeCell).join(',')),
+  ].join('\r\n');
+  const blob = new Blob([`\uFEFF${csvBody}`], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
+  isPro = false,
+  onUpgradePro,
   onOpenPairOnMarket,
   holdings,
   portfolioReport,
@@ -67,6 +100,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   const [marketType, setMarketType] = useState<MarketType>('spot');
   const [tickers, setTickers] = useState<TickerOverview[]>([]);
   const [loading, setLoading] = useState(true);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<ScreenerFilter>('all');
@@ -115,23 +149,45 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     }
   }, [watchlist]);
 
-  const loadOverview = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch(`/api/market/overview?marketType=${marketType}`);
-      if (res.ok) {
-        const data = (await res.json()) as { tickers: TickerOverview[] };
-        setTickers(data.tickers || []);
+  const loadOverview = useCallback(
+    async (forceRefresh = false) => {
+      setLoading(true);
+      try {
+        const refreshParam = forceRefresh ? '&refresh=1' : '';
+        const res = await fetch(`/api/market/overview?marketType=${marketType}${refreshParam}`, {
+          cache: 'no-store',
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { tickers: TickerOverview[]; updatedAt?: string };
+          setTickers(data.tickers || []);
+          setLastUpdatedAt(data.updatedAt || new Date().toISOString());
+        }
+      } catch {
+        // Keep prior tickers if network glitch
+      } finally {
+        setLoading(false);
       }
-    } catch {
-      // Keep prior tickers if network glitch
-    } finally {
-      setLoading(false);
-    }
-  }, [marketType]);
+    },
+    [marketType]
+  );
 
   useEffect(() => {
     void loadOverview();
+    const intervalId = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadOverview(false);
+      }
+    }, 15_000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadOverview(false);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [loadOverview]);
 
   const toggleWatchlist = (sym: string) => {
@@ -213,6 +269,52 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     onAddHolding(newSymbol, amountNum, entryNum);
   };
 
+  const handleExportScreenerCsv = () => {
+    if (!isPro) {
+      onUpgradePro?.();
+      return;
+    }
+    const headers = [
+      'Пара',
+      'Рынок',
+      'Цена USDT',
+      'Изменение 24ч %',
+      'Минимум 24ч',
+      'Максимум 24ч',
+      'Объем 24ч USDT',
+      ...(marketType === 'futures' ? ['Funding %'] : []),
+    ];
+    const rows = filteredTickers.map((t) => [
+      t.symbol,
+      marketType === 'futures' ? 'Futures' : 'Spot',
+      t.price,
+      t.change24hPct,
+      t.low24h,
+      t.high24h,
+      Math.round(t.volume24hUsdt),
+      ...(marketType === 'futures' ? [(t.fundingRatePct ?? 0.01).toFixed(4)] : []),
+    ]);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsvWithBom(`aegisquant-screener-${marketType}-${dateStamp}.csv`, headers, rows);
+  };
+
+  const handleExportPortfolioCsv = () => {
+    if (!isPro) {
+      onUpgradePro?.();
+      return;
+    }
+    const headers = ['Тикер', 'Количество', 'Средняя цена входа $', 'Оценка $', 'PnL %'];
+    const rows = portfolioReport.rows.map((r) => [
+      r.baseAsset,
+      r.amount,
+      r.avgEntryPrice,
+      r.valueUsdt.toFixed(2),
+      r.pnlPct.toFixed(2),
+    ]);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsvWithBom(`aegisquant-portfolio-${dateStamp}.csv`, headers, rows);
+  };
+
   const sectionTabs = useMemo(
     () => [
       {
@@ -261,13 +363,28 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
 
       <button
         type="button"
-        onClick={() => void loadOverview()}
+        onClick={() => void loadOverview(true)}
         disabled={loading}
         className="w-full min-h-[34px] px-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs text-slate-200 inline-flex items-center justify-center gap-1.5 transition-colors"
       >
         <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
         <span>Обновить котировки</span>
       </button>
+      {lastUpdatedAt && (
+        <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono tabular-nums px-1">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="live-dot" aria-hidden="true" />
+            <span className="font-sans">Онлайн</span>
+          </span>
+          <span>
+            {new Date(lastUpdatedAt).toLocaleTimeString('ru-RU', {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+            })}
+          </span>
+        </div>
+      )}
     </div>
   );
 
@@ -302,7 +419,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
         subtitle={
           marketSummary.topLeader
             ? `Лидер: ${marketSummary.topLeader.baseAsset} (${marketSummary.topLeader.change24hPct >= 0 ? '+' : ''}${marketSummary.topLeader.change24hPct}%)`
-            : '10 ликвидных пар'
+            : `${TRADING_PAIRS.length} ликвидные пары`
         }
         icon={<Flame className="w-5 h-5 text-cyan-400" />}
         items={sectionTabs}
@@ -344,15 +461,33 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                 })}
               </div>
 
-              <div className="relative w-full xl:w-56">
-                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Поиск пары (BTC, SOL)..."
-                  className="w-full min-h-[36px] rounded-xl border border-white/10 bg-[#0B0F17] pl-8 pr-3 text-xs text-white placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none"
-                />
+              <div className="flex flex-wrap items-center gap-2 w-full xl:w-auto">
+                <div className="relative flex-1 xl:w-56">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Поиск пары (BTC, SOL)..."
+                    className="w-full min-h-[36px] rounded-xl border border-white/10 bg-[#0B0F17] pl-8 pr-3 text-xs text-white placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleExportScreenerCsv}
+                  className={`min-h-[36px] px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                    isPro
+                      ? 'border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-200'
+                      : 'border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200'
+                  }`}
+                >
+                  {isPro ? (
+                    <Download className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                  ) : (
+                    <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  )}
+                  <span>{isPro ? 'Экспорт CSV' : 'CSV (PRO)'}</span>
+                </button>
               </div>
             </div>
 
@@ -566,18 +701,36 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                   Учебный портфель с автоматической переоценкой по живым котировкам.
                 </p>
               </div>
-              <div className="text-right font-mono tabular-nums">
-                <div className="text-lg font-bold text-white">
-                  ${portfolioReport.totalValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </div>
-                <div
-                  className={`text-xs font-semibold ${
-                    portfolioReport.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleExportPortfolioCsv}
+                  className={`min-h-[36px] px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                    isPro
+                      ? 'border-emerald-500/35 bg-emerald-500/12 hover:bg-emerald-500/20 text-emerald-200'
+                      : 'border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200'
                   }`}
                 >
-                  PnL: {portfolioReport.totalPnl >= 0 ? '+' : ''}${portfolioReport.totalPnl.toFixed(2)} (
-                  {portfolioReport.totalPnlPct >= 0 ? '+' : ''}
-                  {portfolioReport.totalPnlPct.toFixed(2)}%)
+                  {isPro ? (
+                    <Download className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  ) : (
+                    <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  )}
+                  <span>{isPro ? 'Экспорт CSV' : 'CSV (PRO)'}</span>
+                </button>
+                <div className="text-right font-mono tabular-nums">
+                  <div className="text-lg font-bold text-white">
+                    ${portfolioReport.totalValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                  <div
+                    className={`text-xs font-semibold ${
+                      portfolioReport.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    PnL: {portfolioReport.totalPnl >= 0 ? '+' : ''}${portfolioReport.totalPnl.toFixed(2)} (
+                    {portfolioReport.totalPnlPct >= 0 ? '+' : ''}
+                    {portfolioReport.totalPnlPct.toFixed(2)}%)
+                  </div>
                 </div>
               </div>
             </div>

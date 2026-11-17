@@ -17,10 +17,10 @@ interface PricingModalProps {
 }
 
 const FEATURES = [
-  'Безлимитный AI-анализ рынка',
-  'До 20 сигналов в день на стратегию',
-  'Push-уведомления о сигналах',
-  'Все стратегии и таймфреймы',
+  '100 кредитов в месяц для AI-анализа (Spot — 1 кр., Futures — 2 кр., бэктест — 1 кр.)',
+  'Все 9 торговых стратегий (включая BB Squeeze, Ribbon и ATR+OI)',
+  'Биржевой стакан TOP-10, конструктор MA Ribbon (EMA/SMA) и плечо до 20x',
+  'Снятие дневного лимита сигналов/день (∞ на стратегии), 4H-бэктест («Все 9») и экспорт CSV',
 ];
 
 function formatDate(ms: number): string {
@@ -110,8 +110,10 @@ export const PricingModal: React.FC<PricingModalProps> = ({ open, onClose, proUn
               <h3 className="text-base font-semibold text-white">AegisQuant PRO</h3>
               <p className="text-xs text-slate-400 mt-0.5">
                 {proUntil && proUntil > Date.now()
-                  ? `Активен до ${formatDate(proUntil)}. Оплата продлит срок.`
-                  : 'Полный доступ к терминалу'}
+                  ? `Активен до ${formatDate(proUntil)}. Оплата продлит срок и обновит 100 кредитов.`
+                  : proUntil
+                    ? `Срок PRO истёк (${formatDate(proUntil)}). Оплата восстановит доступ и 100 кр./мес.`
+                    : '100 кредитов/мес. + полный набор PRO-функций'}
               </p>
             </div>
           </div>
