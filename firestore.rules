@@ -223,6 +223,31 @@ service cloud.firestore {
     }
 
     // Validation Blueprint: PriceAlertRecord
+    // Validation Blueprint: Trade journal entry
+    function isValidTrade(data, userId, tradeId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'symbol', 'marketType', 'side', 'entryPrice', 'stopPrice',
+          'exitPrice', 'status', 'note', 'closedAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'symbol', 'marketType', 'side', 'entryPrice', 'stopPrice',
+          'exitPrice', 'status', 'note', 'closedAt', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == tradeId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.symbol is string && data.symbol.size() >= 3 && data.symbol.size() <= 24
+        && data.marketType in ['spot', 'futures']
+        && data.side in ['LONG', 'SHORT']
+        && (data.entryPrice is int || data.entryPrice is float) && data.entryPrice > 0 && data.entryPrice <= 100000000
+        && (data.stopPrice is int || data.stopPrice is float) && data.stopPrice >= 0 && data.stopPrice <= 100000000
+        && (data.exitPrice is int || data.exitPrice is float) && data.exitPrice >= 0 && data.exitPrice <= 100000000
+        && data.status in ['open', 'closed']
+        && data.note is string && data.note.size() <= 280
+        && data.closedAt is string && data.closedAt.size() <= 64
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidPriceAlert(data, userId, alertId) {
       return data.keys().hasAll([
           'id', 'userId', 'symbol', 'marketType', 'condition', 'targetPrice',
@@ -446,6 +471,39 @@ service cloud.firestore {
       }
 
       // Subcollection: User Price Threshold Alerts
+      match /trades/{tradeId} {
+        allow get: if isValidId(userId) && isShortId(tradeId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(tradeId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidTrade(incoming(), userId, tradeId)
+          && incoming().status == 'open'
+          && incoming().exitPrice == 0
+          && incoming().closedAt == ''
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(tradeId)
+          && isVerifiedOwner(userId)
+          && isValidTrade(incoming(), userId, tradeId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().symbol == existing().symbol
+          && incoming().side == existing().side
+          && incoming().entryPrice == existing().entryPrice
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'stopPrice', 'exitPrice', 'status', 'note', 'closedAt', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(userId) && isShortId(tradeId) && isVerifiedOwner(userId);
+      }
+
       match /priceAlerts/{alertId} {
         allow get: if isValidId(userId) && isShortId(alertId) && isOwnerRead(userId);
         allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;

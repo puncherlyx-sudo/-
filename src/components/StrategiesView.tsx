@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   BellRing,
+  BookOpen,
   Calculator,
   Check,
   CheckCircle2,
@@ -18,13 +19,15 @@ import type { MarketType, PlanTier, StrategyConfig, UserProfile } from '../types
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { PositionSizeCalculator } from './PositionSizeCalculator';
 import { StrategyPnlChart } from './StrategyPnlChart';
+import { TradeJournal } from './TradeJournal';
 
-type StrategiesSection = 'catalog' | 'analytics' | 'calculator' | 'plans';
+type StrategiesSection = 'catalog' | 'analytics' | 'calculator' | 'journal' | 'plans';
 
 interface StrategiesViewProps {
   profile: UserProfile | null;
   strategies: StrategyConfig[];
   isSignedIn: boolean;
+  uid?: string | null;
   pushSubscribed?: boolean;
   onOpenPushSettings?: () => void;
   onRequireLogin: () => void;
@@ -46,6 +49,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   profile,
   strategies,
   isSignedIn,
+  uid = null,
   pushSubscribed = false,
   onOpenPushSettings,
   onRequireLogin,
@@ -172,6 +176,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         id: 'calculator' as const,
         label: 'Калькулятор риска',
         icon: <Calculator className="w-3.5 h-3.5 text-amber-400" />,
+      },
+      {
+        id: 'journal' as const,
+        label: 'Дневник сделок',
+        icon: <BookOpen className="w-3.5 h-3.5 text-emerald-400" />,
       },
       {
         id: 'plans' as const,
@@ -525,6 +534,8 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         )}
 
         {section === 'calculator' && <PositionSizeCalculator strategies={strategies} />}
+
+        {section === 'journal' && <TradeJournal uid={isSignedIn ? uid : null} onRequireLogin={onRequireLogin} />}
 
         {section === 'plans' && (
           <section className="grid grid-cols-1 md:grid-cols-2 gap-4">

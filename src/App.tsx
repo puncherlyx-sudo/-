@@ -723,6 +723,7 @@ export default function App() {
                 profile={profile}
                 strategies={strategies}
                 isSignedIn={isSignedIn}
+                uid={firebaseUser?.uid ?? null}
                 pushSubscribed={pushState.isSubscribed}
                 onOpenPushSettings={() => {
                   setSecuritySectionSelection({ section: 'push', nonce: Date.now() });

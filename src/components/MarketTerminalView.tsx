@@ -43,6 +43,7 @@ import { ChartQuickAlertWidget } from './ChartQuickAlertWidget';
 import { FearGreedWidget } from './FearGreedWidget';
 import { MarketDominanceWidget } from './MarketDominanceWidget';
 import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { MultiTimeframeStrip } from './MultiTimeframeStrip';
 import { OrderBookPanel } from './OrderBookPanel';
 import { authFetch } from '../lib/authFetch';
 
@@ -1024,6 +1025,15 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   <RefreshCw className={`w-3.5 h-3.5 ${loadingChart ? 'animate-spin' : ''}`} />
                 </button>
               </div>
+            </div>
+
+            <div className="mt-3">
+              <MultiTimeframeStrip
+                symbol={symbol}
+                marketType={marketType}
+                activeTimeframe={timeframe}
+                onSelectTimeframe={setTimeframe}
+              />
             </div>
 
             {/* Collapsible MA Ribbon Configurator */}
