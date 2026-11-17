@@ -44,6 +44,7 @@ import { FearGreedWidget } from './FearGreedWidget';
 import { MarketDominanceWidget } from './MarketDominanceWidget';
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { OrderBookPanel } from './OrderBookPanel';
+import { authFetch } from '../lib/authFetch';
 
 type MarketSection = 'chart' | 'ai' | 'depth' | 'oscillators' | 'sentiment' | 'pairs';
 type AssetQuickFilter = 'all' | 'volume' | 'volatile' | 'favorites';
@@ -454,7 +455,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
 
     setAnalyzing(true);
     try {
-      const res = await fetch('/api/analyze', {
+      const res = await authFetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

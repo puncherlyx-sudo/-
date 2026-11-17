@@ -25,6 +25,7 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { SecurityCenterView, type SecuritySection } from './components/SecurityCenterView';
 import { StandaloneWidgetView } from './components/StandaloneWidgetView';
 import { StrategiesView } from './components/StrategiesView';
+import { PricingModal } from './components/PricingModal';
 import { TwoFactorModal } from './components/TwoFactorModal';
 import { useAuthAndVault } from './hooks/useAuthAndVault';
 import { usePaperPortfolio } from './hooks/usePaperPortfolio';
@@ -37,6 +38,7 @@ import type {
   PlanTier,
   Timeframe,
 } from './types/domain';
+import { authFetch } from './lib/authFetch';
 
 interface PendingStepUpAction {
   title: string;
@@ -95,6 +97,15 @@ export default function App() {
   const [widgetsModalOpen, setWidgetsModalOpen] = useState(false);
   const [pendingStepUp, setPendingStepUp] = useState<PendingStepUpAction | null>(null);
   const [bannerError, setBannerError] = useState<string | null>(null);
+  const [pricingOpen, setPricingOpen] = useState(false);
+  const [paymentNotice, setPaymentNotice] = useState<string | null>(() => {
+    const status = new URLSearchParams(window.location.search).get('payment');
+    if (status === 'success') {
+      return 'Платёж отправлен. PRO включится автоматически после подтверждения в сети — обычно в течение нескольких минут.';
+    }
+    if (status === 'cancel') return 'Оплата отменена. Деньги не списаны.';
+    return null;
+  });
   const [pendingLoginPushUid, setPendingLoginPushUid] = useState<string | null>(null);
   const [tourOpen, setTourOpen] = useState(false);
   const [showScrollTop, setShowScrollTop] = useState(false);
@@ -199,7 +210,6 @@ export default function App() {
     loginWithGoogle,
     logout,
     consumeCreditAndSaveAnalysis,
-    updatePlan,
     updateStrategySettings,
     savePendingTotp,
     activateTotp,
@@ -341,7 +351,7 @@ export default function App() {
   }) => {
     if (!firebaseUser || !pushState.isSubscribed || !pushState.preferences.notifySignals) return;
     try {
-      await fetch('/api/push/trigger-signal', {
+      await authFetch('/api/push/trigger-signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -374,17 +384,15 @@ export default function App() {
     return action();
   };
 
+  // Тариф меняется только после оплаты (сервер проверяет платёж). Здесь лишь открываем экран оплаты.
   const handleProtectedPlanSwitch = async (target: PlanTier) => {
-    try {
-      setBannerError(null);
-      await runWith2faGuard(
-        'Подтверждение смены тарифа',
-        `Введите код аутентификатора для переключения тарифа на ${target === 'pro' ? 'PRO' : 'Бесплатный'}.`,
-        () => updatePlan(target)
-      );
-    } catch (err) {
-      setBannerError(err instanceof Error ? err.message : 'Ошибка обновления подписки');
+    setBannerError(null);
+    if (target !== 'pro') return;
+    if (!isSignedIn) {
+      void handleLoginWithPush();
+      return;
     }
+    setPricingOpen(true);
   };
 
   const handleProtectedStrategySave = async (
@@ -459,7 +467,7 @@ export default function App() {
 
   return (
     <MotionConfig reducedMotion="user">
-      <div className="min-h-screen text-slate-100 flex flex-col">
+      <div className="min-h-dvh text-slate-100 flex flex-col">
         {/* Desktop 3-Zone Top Bar Contract */}
         <header className="hidden md:block sticky top-0 z-30 border-b border-white/8 bg-[#0B0F17]/88 backdrop-blur-md">
           <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-8">
@@ -630,6 +638,22 @@ export default function App() {
           }
         />
 
+        {paymentNotice && (
+          <div className="mb-5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-xs text-emerald-200 flex items-center justify-between gap-3">
+            <span>{paymentNotice}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setPaymentNotice(null);
+                window.history.replaceState(null, '', window.location.pathname);
+              }}
+              className="text-emerald-300 hover:text-white font-medium"
+            >
+              Скрыть
+            </button>
+          </div>
+        )}
+
         {(authError || bannerError) && (
           <div className="mb-5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200 flex items-center justify-between gap-3">
             <span>{authError || bannerError}</span>
@@ -772,6 +796,8 @@ export default function App() {
           );
         })}
       </nav>
+
+      <PricingModal open={pricingOpen} onClose={() => setPricingOpen(false)} proUntil={profile?.proUntil} />
 
       {/* 2FA Step-Up Verification Dialog */}
       {pendingStepUp && firebaseUser && privateSecurity?.totpEncryptedSecret && (

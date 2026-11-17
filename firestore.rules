@@ -44,12 +44,15 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'uid', 'displayName', 'plan', 'creditsRemaining', 'weeklyQuota',
-          'nextResetAt', 'twoFactorEnabled', 'autoLockMinutes', 'createdAt', 'updatedAt'
+          'nextResetAt', 'twoFactorEnabled', 'autoLockMinutes', 'createdAt', 'updatedAt',
+          'proUntil'
         ])
+        && (!('proUntil' in data) || data.proUntil is int)
         && data.uid is string && data.uid == userId && isValidId(data.uid)
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
         && data.plan in ['free', 'pro']
         && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 100
+        && (data.plan == 'pro' || data.creditsRemaining <= 10)
         && data.weeklyQuota is int && data.weeklyQuota == 10
         && data.nextResetAt is string && data.nextResetAt.size() >= 10 && data.nextResetAt.size() <= 64
         && data.twoFactorEnabled is bool
@@ -267,8 +270,7 @@ service cloud.firestore {
           (incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
           // Action 2: Toggle 2FA or Auto-Lock Timeout
           (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
-          // Action 3: Upgrade / Switch Subscription Plan
-          (incoming().diff(existing()).affectedKeys().hasOnly(['plan', 'creditsRemaining', 'updatedAt'])) ||
+          // Action 3 УДАЛЁН: тариф (plan) и срок (proUntil) меняет только сервер после оплаты.
           // Action 4: Update Display Name
           (incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
         );

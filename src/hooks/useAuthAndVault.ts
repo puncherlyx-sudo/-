@@ -32,6 +32,7 @@ import {
   type UserProfile,
   type UserSessionRecord,
 } from '../types/domain';
+import { authFetch } from '../lib/authFetch';
 
 function nextWeekIso(): string {
   return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -640,26 +641,6 @@ export function useAuthAndVault() {
     }
   };
 
-  const updatePlan = async (targetPlan: PlanTier) => {
-    if (!firebaseUser || !profile) return;
-    const uid = firebaseUser.uid;
-    try {
-      await updateDoc(doc(db, 'users', uid), {
-        plan: targetPlan,
-        creditsRemaining: targetPlan === 'pro' ? 100 : Math.min(10, profile.creditsRemaining),
-        updatedAt: serverTimestamp(),
-      });
-      await writeAuditLog(
-        uid,
-        'PLAN_CHANGE',
-        targetPlan === 'pro' ? 'Активирована подписка PRO (безлимитный анализ и сигналы).' : 'Переход на базовый бесплатный тариф.',
-        'SUCCESS'
-      );
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-    }
-  };
-
   const updateStrategySettings = async (
     strategyId: string,
     updates: {
@@ -1006,7 +987,7 @@ export function useAuthAndVault() {
 
     const syncToServer = async () => {
       try {
-        const res = await fetch('/api/push/price-alerts/sync', {
+        const res = await authFetch('/api/push/price-alerts/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1057,7 +1038,7 @@ export function useAuthAndVault() {
       return { checkedAlerts: 0, alertsSent: 0, triggeredCount: 0 };
     }
     const uid = firebaseUser.uid;
-    const res = await fetch('/api/push/price-alerts/check', {
+    const res = await authFetch('/api/push/price-alerts/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ uid }),
@@ -1201,7 +1182,6 @@ export function useAuthAndVault() {
     loginWithGoogle,
     logout,
     consumeCreditAndSaveAnalysis,
-    updatePlan,
     updateStrategySettings,
     savePendingTotp,
     activateTotp,

@@ -115,8 +115,11 @@ export function registerPushSubscription(entry: Omit<StoredPushEntry, 'updatedAt
   });
 }
 
-export function unregisterPushSubscription(endpoint: string): void {
-  subscriptionRegistry.delete(endpoint);
+export function unregisterPushSubscription(endpoint: string, uid: string): void {
+  const existing = subscriptionRegistry.get(endpoint);
+  if (existing && existing.uid === uid) {
+    subscriptionRegistry.delete(endpoint);
+  }
 }
 
 export async function dispatchPushToEntry(

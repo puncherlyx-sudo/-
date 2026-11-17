@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { LogOut } from 'lucide-react';
+import { authFetch } from '../lib/authFetch';
 
 interface LockScreenOverlayProps {
   uid: string;
@@ -28,7 +29,7 @@ export const LockScreenOverlay: React.FC<LockScreenOverlayProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/security/totp/verify', {
+      const res = await authFetch('/api/security/totp/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
