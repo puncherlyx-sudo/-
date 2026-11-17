@@ -135,11 +135,9 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  const isOutOfCredits = Boolean(
-    isSignedIn &&
-      typeof creditsRemaining === 'number' &&
-      creditsRemaining < CREDIT_COSTS.portfolioBacktest
-  );
+  // Пересчёт бэктеста бесплатный: тот же отчёт сервер и так отдаёт при каждой смене параметров.
+  // Кредиты тратятся на платные функции (AI-анализ, сканер сетапов, разбор дневника).
+  const isOutOfCredits = false;
 
   useEffect(() => {
     if (!isPro) {
@@ -208,14 +206,6 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
     if (isOutOfCredits) {
       onUpgradePro?.();
       return;
-    }
-    if (isSignedIn && onConsumeCredits) {
-      try {
-        await onConsumeCredits(CREDIT_COSTS.portfolioBacktest, 'Ручной пересчёт бэктеста PnL');
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Недостаточно кредитов для пересчёта.');
-        return;
-      }
     }
     await fetchBacktest();
   };
@@ -373,9 +363,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
               <span className="hidden sm:inline">
-                {isSignedIn
-                  ? `Пересчитать (${CREDIT_COSTS.portfolioBacktest} кр.)`
-                  : 'Пересчитать'}
+                Пересчитать
               </span>
             </button>
           )}

@@ -50,6 +50,11 @@ export function isBillingConfigured(): boolean {
 
 let cachedDb: Firestore | null | undefined;
 
+/** Доступ к базе с правами сервера (учёт кредитов и тарифов). null — если ключ Firebase не настроен. */
+export function getAdminDb(): Firestore | null {
+  return getDb();
+}
+
 function getDb(): Firestore | null {
   if (cachedDb !== undefined) return cachedDb;
   try {
@@ -204,6 +209,8 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
       plan: 'pro',
       proUntil,
       creditsRemaining: 100,
+      // PRO получает квоту на месяц вперёд; следующее пополнение — через 30 дней (дальше по ходу подписки)
+      nextResetAt: new Date(Date.now() + 30 * DAY_MS).toISOString(),
       updatedAt: FieldValue.serverTimestamp(),
     });
     tx.update(orderRef, { status: 'paid', paidAt: FieldValue.serverTimestamp() });

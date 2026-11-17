@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { collection, deleteDoc, doc, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
 import { AnimatePresence, motion } from 'framer-motion';
-import { BookOpen, CircleCheck, Lock, Plus, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
-import { TRADING_PAIRS } from '../data/strategies';
+import { BookOpen, CircleCheck, Download, Lock, Plus, Sparkles, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
+import { CREDIT_COSTS, TRADING_PAIRS } from '../data/strategies';
+import { authFetch } from '../lib/authFetch';
 import { db } from '../lib/firebase';
+import type { JournalReview } from '../lib/journalReview';
+import { tradesToCsv } from '../lib/journalCsv';
 import {
   computeJournalStats,
   tradePnlPct,
@@ -11,7 +14,9 @@ import {
   type TradeSide,
 } from '../lib/journalStats';
 import type { MarketType, TickerOverview } from '../types/domain';
+import { JournalReviewPanel } from './JournalReviewPanel';
 import { AnimatedNumber } from './MotionExtras';
+import { UpgradeNudge } from './UpgradeNudge';
 
 interface TradeRecord {
   id: string;
@@ -31,6 +36,9 @@ interface TradeRecord {
 interface TradeJournalProps {
   uid: string | null;
   onRequireLogin: () => void;
+  isPro?: boolean;
+  creditsRemaining?: number;
+  onUpgradePro?: () => void;
 }
 
 const inputCls =
@@ -58,7 +66,13 @@ function describeError(err: unknown): string {
   return 'Не удалось выполнить действие. Проверьте соединение и повторите.';
 }
 
-export const TradeJournal: React.FC<TradeJournalProps> = ({ uid, onRequireLogin }) => {
+export const TradeJournal: React.FC<TradeJournalProps> = ({
+  uid,
+  onRequireLogin,
+  isPro = false,
+  creditsRemaining,
+  onUpgradePro,
+}) => {
   const [trades, setTrades] = useState<TradeRecord[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [prices, setPrices] = useState<Record<string, number>>({});
@@ -125,6 +139,88 @@ export const TradeJournal: React.FC<TradeJournalProps> = ({ uid, onRequireLogin 
   }, []);
 
   const stats = useMemo(() => computeJournalStats(trades), [trades]);
+
+  // Платные функции дневника: разбор (кредиты, считает сервер) и экспорт (PRO)
+  const [review, setReview] = useState<JournalReview | null>(null);
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewNote, setReviewNote] = useState<string | null>(null);
+  const [reviewError, setReviewError] = useState<{ message: string; upgrade: boolean } | null>(null);
+
+  const handleReview = async () => {
+    setReviewError(null);
+    setReviewNote(null);
+    setReviewing(true);
+    try {
+      const res = await authFetch('/api/journal/review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // от старых сделок к новым: так считаются серии убытков
+        body: JSON.stringify({
+          trades: [...trades]
+            .reverse()
+            .map((t) => ({
+              symbol: t.symbol,
+              side: t.side,
+              entryPrice: t.entryPrice,
+              stopPrice: t.stopPrice,
+              exitPrice: t.exitPrice,
+              status: t.status,
+            })),
+        }),
+      });
+      const data = (await res.json()) as {
+        report?: JournalReview;
+        charged?: number;
+        credits?: { remaining: number } | null;
+        error?: string;
+        upgrade?: boolean;
+      };
+      if (!res.ok || !data.report) {
+        setReviewError({ message: data.error || 'Не удалось сделать разбор.', upgrade: Boolean(data.upgrade) });
+        return;
+      }
+      setReview(data.report);
+      setReviewNote(
+        data.charged
+          ? `Списано ${data.charged} кр.${data.credits ? `, осталось ${data.credits.remaining}` : ''}.`
+          : 'Кредиты не списаны: закрытых сделок пока мало для надёжных выводов.'
+      );
+    } catch {
+      setReviewError({ message: 'Нет соединения с сервером. Кредиты не списаны.', upgrade: false });
+    } finally {
+      setReviewing(false);
+    }
+  };
+
+  const handleExport = () => {
+    if (!isPro) {
+      onUpgradePro?.();
+      return;
+    }
+    const csv = tradesToCsv(
+      [...trades].reverse().map((t) => ({
+        id: t.id,
+        symbol: t.symbol,
+        marketType: t.marketType,
+        side: t.side,
+        entryPrice: t.entryPrice,
+        stopPrice: t.stopPrice,
+        exitPrice: t.exitPrice,
+        status: t.status,
+        note: t.note,
+        createdAtSec: t.createdAt?.seconds,
+        closedAt: t.closedAt,
+      }))
+    );
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `aegisquant-journal-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
   const livePrice = prices[`${marketType}:${symbol}`];
 
   const handleAdd = async (e: React.FormEvent) => {
@@ -286,6 +382,51 @@ export const TradeJournal: React.FC<TradeJournalProps> = ({ uid, onRequireLogin 
           </div>
         ))}
       </section>
+
+      {/* Платные функции дневника */}
+      <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 space-y-3" aria-label="Разбор и экспорт">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => void handleReview()}
+            disabled={reviewing || stats.closedCount === 0}
+            className="cta-shimmer min-h-[46px] rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-sm font-semibold text-white inline-flex items-center justify-center gap-2"
+          >
+            <Sparkles className="w-4 h-4" />
+            {reviewing ? 'Считаю…' : `Глубокий разбор (${CREDIT_COSTS.journalReview} кр.)`}
+          </button>
+          <button
+            type="button"
+            onClick={handleExport}
+            disabled={trades.length === 0}
+            className="min-h-[46px] rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 disabled:opacity-50 text-sm font-semibold text-slate-200 inline-flex items-center justify-center gap-2"
+          >
+            <Download className="w-4 h-4" />
+            Экспорт в CSV
+            {!isPro && <span className="px-1.5 py-0.5 rounded-md bg-amber-500/20 text-amber-300 text-[10px] font-bold">PRO</span>}
+          </button>
+        </div>
+        <p className="text-[11px] text-slate-500 leading-relaxed">
+          Разбор показывает, где вы теряете деньги: направления, пары, дисциплина стопов, серии убытков.
+          {typeof creditsRemaining === 'number' && (
+            <> Кредитов: <span className="font-mono text-slate-300">{creditsRemaining}</span>.</>
+          )}
+        </p>
+        {reviewError && (
+          reviewError.upgrade && !isPro ? (
+            <UpgradeNudge
+              title="Кредитов не хватает"
+              text={`${reviewError.message} PRO даёт 100 кредитов в месяц и экспорт дневника.`}
+              onUpgrade={() => onUpgradePro?.()}
+            />
+          ) : (
+            <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">{reviewError.message}</div>
+          )
+        )}
+        {reviewNote && <p className="text-[11px] text-slate-400">{reviewNote}</p>}
+      </section>
+
+      {review && <JournalReviewPanel review={review} />}
 
       {/* Новая сделка */}
       <form

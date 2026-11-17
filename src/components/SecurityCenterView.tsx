@@ -26,6 +26,7 @@ import type {
   UserProfile,
   UserSessionRecord,
 } from '../types/domain';
+import { isProSubscriptionActive } from '../data/strategies';
 import { ActiveSessionsPanel } from './ActiveSessionsPanel';
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { PriceAlertsPanel } from './PriceAlertsPanel';
@@ -53,6 +54,7 @@ export interface PushControlState {
 }
 
 interface SecurityCenterViewProps {
+  onUpgradePro?: () => void;
   profile: UserProfile | null;
   privateSecurity: UserPrivateSecurity | null;
   auditLogs: SecurityAuditLog[];
@@ -114,6 +116,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   onTogglePriceAlert,
   onDeletePriceAlert,
   onCheckPriceAlertsNow,
+  onUpgradePro,
   onStartTour,
 }) => {
   const [section, setSection] = useState<SecuritySection>('meter');
@@ -715,6 +718,8 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
               )
             : (
               <PriceAlertsPanel
+                isPro={isProSubscriptionActive(profile)}
+                onUpgradePro={onUpgradePro}
                 alerts={priceAlerts}
                 pushSubscribed={pushState.isSubscribed}
                 onJumpToPushSettings={() => setSection('push')}

@@ -8,7 +8,114 @@ export const CREDIT_COSTS = {
   spotAnalysis: 1,
   futuresAnalysis: 2,
   portfolioBacktest: 1,
+  setupScanner: 2,
+  journalReview: 3,
 } as const;
+
+/** Сколько ценовых алертов может одновременно отслеживать сервер. */
+export const FREE_MAX_ACTIVE_ALERTS = 3;
+export const PRO_MAX_ACTIVE_ALERTS = 50;
+
+/**
+ * Что входит в тариф. Единый список для окна оплаты и подсказок в интерфейсе.
+ * access: 'credits' — доступно всем за кредиты (у PRO кредитов больше), 'pro' — только с подпиской.
+ */
+export interface PlanFeature {
+  key: string;
+  title: string;
+  description: string;
+  access: 'credits' | 'pro' | 'both';
+  /** Стоимость в кредитах (для access: 'credits'). */
+  cost?: number;
+  free: string;
+  pro: string;
+}
+
+export const PLAN_FEATURES: PlanFeature[] = [
+  {
+    key: 'credits',
+    title: 'Кредиты на AI-функции',
+    description: 'Расходуются на анализ, сканер и разбор дневника.',
+    access: 'both',
+    free: `${FREE_WEEKLY_QUOTA} в неделю`,
+    pro: `${PRO_MONTHLY_QUOTA} в месяц`,
+  },
+  {
+    key: 'analysis',
+    title: 'AI-анализ графика и новостей',
+    description: 'Сигнал с зоной входа, стопом и целями по выбранной стратегии.',
+    access: 'credits',
+    cost: CREDIT_COSTS.spotAnalysis,
+    free: `1 кр. (фьючерсы ${CREDIT_COSTS.futuresAnalysis} кр.), 1 сигнал в день на стратегию`,
+    pro: 'Без дневных лимитов',
+  },
+  {
+    key: 'scanner',
+    title: 'Сканер сетапов',
+    description: 'Ищет по всем парам самые согласованные входы на четырёх таймфреймах.',
+    access: 'credits',
+    cost: CREDIT_COSTS.setupScanner,
+    free: `${CREDIT_COSTS.setupScanner} кр. за запуск`,
+    pro: `${CREDIT_COSTS.setupScanner} кр., кредитов в разы больше`,
+  },
+  {
+    key: 'journal_review',
+    title: 'Глубокий разбор дневника',
+    description: 'Где вы теряете деньги: направления, пары, стопы, серии убытков.',
+    access: 'credits',
+    cost: CREDIT_COSTS.journalReview,
+    free: `${CREDIT_COSTS.journalReview} кр. за разбор`,
+    pro: `${CREDIT_COSTS.journalReview} кр., кредитов в разы больше`,
+  },
+  {
+    key: 'strategies',
+    title: 'PRO-стратегии',
+    description: 'Расширенные стратегии с фьючерсами и пробоями.',
+    access: 'pro',
+    free: 'Только базовые',
+    pro: 'Все стратегии',
+  },
+  {
+    key: 'leverage',
+    title: 'Кредитное плечо в анализе',
+    description: 'Расчёт сценариев с плечом.',
+    access: 'pro',
+    free: `До ${FREE_MAX_LEVERAGE}x`,
+    pro: 'До 20x',
+  },
+  {
+    key: 'orderbook_ribbon',
+    title: 'Стакан TOP-10 и MA Ribbon',
+    description: 'Глубина рынка и конструктор скользящих (EMA/SMA).',
+    access: 'pro',
+    free: 'Базовые',
+    pro: 'Полный набор',
+  },
+  {
+    key: 'backtest_4h',
+    title: 'Бэктест 4H по всем стратегиям',
+    description: 'Расширенная оценка доходности на старшем таймфрейме.',
+    access: 'pro',
+    free: 'Только 1H, активные',
+    pro: '4H и все стратегии',
+  },
+  {
+    key: 'alerts',
+    title: 'Ценовые алерты',
+    description: 'Push-уведомление при пересечении уровня, даже при закрытом приложении.',
+    access: 'pro',
+    free: `${FREE_MAX_ACTIVE_ALERTS} активных`,
+    pro: `До ${PRO_MAX_ACTIVE_ALERTS} активных`,
+  },
+  {
+    key: 'csv',
+    title: 'Экспорт дневника в CSV',
+    description: 'Выгрузка сделок для Excel и Google Таблиц.',
+    access: 'pro',
+    free: 'Недоступно',
+    pro: 'Доступно',
+  },
+];
 
 export function isProSubscriptionActive(
   profile?: Pick<UserProfile, 'plan' | 'proUntil'> | null,
@@ -325,3 +432,11 @@ export const TRADING_PAIRS: Array<{
   { symbol: 'ALGOUSDT', label: 'ALGO / USDT', name: 'Algorand', category: 'L1' },
   { symbol: 'XLMUSDT', label: 'XLM / USDT', name: 'Stellar', category: 'Payments' },
 ];
+
+/** Стоимость одного анализа в кредитах: у стратегии может быть своя, иначе по типу рынка. Единая для клиента и сервера. */
+export function getAnalysisCreditCost(strategyKey: string, marketType: 'spot' | 'futures'): number {
+  const strategy = STRATEGY_CATALOG.find((s) => s.key === strategyKey);
+  return (
+    strategy?.creditCost ?? (marketType === 'futures' ? CREDIT_COSTS.futuresAnalysis : CREDIT_COSTS.spotAnalysis)
+  );
+}

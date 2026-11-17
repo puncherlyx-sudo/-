@@ -274,49 +274,9 @@ export function useAuthAndVault() {
         const data = snap.data() as UserProfile;
         const isExistingPro = isProSubscriptionActive(data);
 
-        if (data.plan === 'free') {
-          if (data.nextResetAt && Date.now() >= new Date(data.nextResetAt).getTime()) {
-            try {
-              await updateDoc(userRef, {
-                creditsRemaining: FREE_WEEKLY_QUOTA,
-                weeklyQuota: FREE_WEEKLY_QUOTA,
-                nextResetAt: nextWeekIso(),
-                updatedAt: serverTimestamp(),
-              });
-              await writeAuditLog(
-                uid,
-                'WEEKLY_CREDIT_RESET',
-                `Еженедельное пополнение квоты: ${FREE_WEEKLY_QUOTA} кредитов.`,
-                'SUCCESS'
-              );
-            } catch (err) {
-              handleFirestoreError(err, OperationType.UPDATE, userPath);
-            }
-          } else if (data.weeklyQuota !== FREE_WEEKLY_QUOTA) {
-            const oldQuota = Number(data.weeklyQuota) || 10;
-            const bonus = Math.max(0, FREE_WEEKLY_QUOTA - oldQuota);
-            const upgradedCredits = Math.min(
-              FREE_WEEKLY_QUOTA,
-              Math.max(0, Number(data.creditsRemaining) || 0) + bonus
-            );
-            try {
-              await updateDoc(userRef, {
-                creditsRemaining: upgradedCredits,
-                weeklyQuota: FREE_WEEKLY_QUOTA,
-                nextResetAt: data.nextResetAt || nextWeekIso(),
-                updatedAt: serverTimestamp(),
-              });
-              await writeAuditLog(
-                uid,
-                'QUOTA_UPGRADED',
-                `Недельная квота Free обновлена до ${FREE_WEEKLY_QUOTA} кредитов (+${bonus}).`,
-                'SUCCESS'
-              );
-            } catch (err) {
-              handleFirestoreError(err, OperationType.UPDATE, userPath);
-            }
-          }
-        }
+        // Пополнение квоты (раз в неделю для Free, раз в месяц для PRO) выполняет сервер.
+        // Запрос заодно возвращает актуальное состояние; профиль обновится сам через подписку.
+        void authFetch('/api/entitlements').catch(() => undefined);
 
         // Backfill newly added catalog strategies for existing accounts
         try {
@@ -704,38 +664,12 @@ export function useAuthAndVault() {
     await signOut(auth);
   };
 
+  // Кредиты списывает СЕРВЕР при выполнении платной функции (анализ, сканер, разбор дневника).
+  // Приложению менять кредиты запрещено правилами базы, поэтому эта функция ничего не пишет:
+  // она оставлена, чтобы не ломать вызывающие компоненты. Остаток обновляется сам (подписка на профиль).
   const consumeCredits = useCallback(
-    async (amount: number, auditReason?: string): Promise<boolean> => {
-      if (!firebaseUser || !profile) return false;
-      const activePro = isProSubscriptionActive(profile);
-      const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
-      const cost = Math.max(1, Math.round(amount));
-
-      if (profile.creditsRemaining < cost) {
-        throw new Error(
-          activePro
-            ? `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Продлите PRO, чтобы начислить ещё ${PRO_MONTHLY_QUOTA} кредитов.`
-            : `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Перейдите на PRO (100 кр./мес.) или дождитесь сброса квоты.`
-        );
-      }
-
-      const uid = firebaseUser.uid;
-      try {
-        await updateDoc(doc(db, 'users', uid), {
-          creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
-          nextResetAt: profile.nextResetAt,
-          updatedAt: serverTimestamp(),
-        });
-        if (auditReason) {
-          await writeAuditLog(uid, 'CREDITS_SPENT', `${auditReason} (−${cost} кр.)`, 'SUCCESS');
-        }
-        return true;
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-        return false;
-      }
-    },
-    [firebaseUser, profile, writeAuditLog]
+    async (_amount: number, _auditReason?: string): Promise<boolean> => Boolean(firebaseUser && profile),
+    [firebaseUser, profile]
   );
 
   const consumeCreditAndSaveAnalysis = async (params: {
@@ -749,42 +683,7 @@ export function useAuthAndVault() {
   }) => {
     if (!firebaseUser || !profile) return;
     const uid = firebaseUser.uid;
-    const activePro = isProSubscriptionActive(profile);
-    const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
-    const cost = Math.max(
-      1,
-      Math.round(
-        params.creditCost ??
-          (params.marketType === 'futures' ? CREDIT_COSTS.futuresAnalysis : CREDIT_COSTS.spotAnalysis)
-      )
-    );
-
-    if (!activePro) {
-      const usedToday = countTodayStrategySignals(analyses, params.strategyKey);
-      if (usedToday >= FREE_DAILY_SIGNAL_LIMIT) {
-        throw new Error(
-          `Достигнут дневной лимит Free (${FREE_DAILY_SIGNAL_LIMIT}/день) для «${params.strategyName}». Перейдите на PRO для снятия дневных ограничений.`
-        );
-      }
-    }
-
-    if (profile.creditsRemaining < cost) {
-      throw new Error(
-        activePro
-          ? `Недостаточно кредитов PRO (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Продлите подписку для пополнения квоты.`
-          : `Недостаточно кредитов (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Перейдите на PRO или дождитесь сброса квоты.`
-      );
-    }
-
-    try {
-      await updateDoc(doc(db, 'users', uid), {
-        creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
-        nextResetAt: profile.nextResetAt,
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-    }
+    // Списание кредитов и дневной лимит уже применены сервером в /api/analyze; здесь только сохраняем результат.
 
     const analysisId = sanitizeId(`an_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
     const path = `users/${uid}/analyses/${analysisId}`;

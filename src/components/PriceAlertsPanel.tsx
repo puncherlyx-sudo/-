@@ -14,7 +14,9 @@ import {
   VolumeX,
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { TRADING_PAIRS } from '../data/strategies';
+import { PRO_MAX_ACTIVE_ALERTS, TRADING_PAIRS } from '../data/strategies';
+import { maxActiveAlertsFor } from '../lib/alertLimits';
+import { UpgradeNudge } from './UpgradeNudge';
 import { isAlertSoundEnabled, playAlertChime, setAlertSoundEnabled } from '../lib/alertSound';
 import type {
   MarketType,
@@ -24,6 +26,8 @@ import type {
 } from '../types/domain';
 
 interface PriceAlertsPanelProps {
+  isPro?: boolean;
+  onUpgradePro?: () => void;
   alerts: PriceAlertRecord[];
   pushSubscribed: boolean;
   onJumpToPushSettings: () => void;
@@ -63,6 +67,8 @@ function formatTriggerTime(iso: string): string {
 }
 
 export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
+  isPro = false,
+  onUpgradePro,
   alerts,
   pushSubscribed,
   onJumpToPushSettings,
@@ -130,6 +136,10 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
     setTargetPriceInput(formatPriceSmart(currentPrice * (1 + pct / 100)));
   };
 
+  const activeCount = alerts.filter((a) => a.active).length;
+  const maxActive = maxActiveAlertsFor(isPro);
+  const atLimit = activeCount >= maxActive;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -137,6 +147,14 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
     const parsed = Number(targetPriceInput.replace(',', '.'));
     if (!Number.isFinite(parsed) || parsed <= 0) {
       setError('Укажите корректную целевую цену больше 0.');
+      return;
+    }
+    if (activeCount >= maxActive) {
+      setError(
+        isPro
+          ? `Достигнут лимит ${maxActive} активных алертов. Удалите ненужные.`
+          : `На бесплатном тарифе можно держать до ${maxActive} активных алертов. PRO даёт до ${PRO_MAX_ACTIVE_ALERTS}.`
+      );
       return;
     }
 
@@ -177,6 +195,14 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
   };
 
   const handleToggle = async (alert: PriceAlertRecord) => {
+    if (!alert.active && activeCount >= maxActive) {
+      setError(
+        isPro
+          ? `Достигнут лимит ${maxActive} активных алертов.`
+          : `На бесплатном тарифе можно держать до ${maxActive} активных алертов. PRO даёт до ${PRO_MAX_ACTIVE_ALERTS}.`
+      );
+      return;
+    }
     setBusyId(alert.id);
     setError(null);
     try {
@@ -200,7 +226,6 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
     }
   };
 
-  const activeCount = alerts.filter((a) => a.active).length;
   const triggeredCount = alerts.filter((a) => !a.active && Boolean(a.triggeredAt)).length;
 
   return (
@@ -247,7 +272,7 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
             {soundOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
           </button>
           <span>
-          Активных: <span className="text-emerald-400 font-semibold">{activeCount}</span>
+          Активных: <span className={atLimit ? 'text-amber-300 font-semibold' : 'text-emerald-400 font-semibold'}>{activeCount}/{maxActive}</span>
           <span aria-hidden="true" className="mx-1.5 text-slate-600">
             ·
           </span>
@@ -255,6 +280,14 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
           </span>
         </div>
       </div>
+
+      {atLimit && !isPro && (
+        <UpgradeNudge
+          title={`Лимит бесплатного тарифа: ${maxActive} активных алерта`}
+          text={`PRO позволяет держать до ${PRO_MAX_ACTIVE_ALERTS} алертов одновременно. Сервер отслеживает только активные алерты в пределах лимита.`}
+          onUpgrade={() => onUpgradePro?.()}
+        />
+      )}
 
       {!pushSubscribed && (
         <div className="pt-3 border-t border-white/8 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">

@@ -3,6 +3,7 @@ import {
   ArrowDownUp,
   ArrowRight,
   BarChart2,
+  Crosshair,
   Download,
   Flame,
   Lock,
@@ -32,10 +33,15 @@ import { TRADING_PAIRS } from '../data/strategies';
 import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
 import type { MarketType, PortfolioHolding, TickerOverview } from '../types/domain';
 import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { SetupScanner } from './SetupScanner';
 
-export type ScreenerSection = 'table' | 'momentum' | 'portfolio';
+export type ScreenerSection = 'table' | 'momentum' | 'scanner' | 'portfolio';
 
 interface MarketScreenerViewProps {
+  isSignedIn?: boolean;
+  creditsRemaining?: number;
+  creditQuota?: number;
+  onRequireLogin?: () => void;
   isPro?: boolean;
   onUpgradePro?: () => void;
   onOpenPairOnMarket: (symbol: string, marketType: MarketType) => void;
@@ -87,6 +93,10 @@ function downloadCsvWithBom(
 }
 
 export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
+  isSignedIn = false,
+  creditsRemaining,
+  creditQuota,
+  onRequireLogin,
   isPro = false,
   onUpgradePro,
   onOpenPairOnMarket,
@@ -327,6 +337,11 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
         id: 'momentum' as const,
         label: 'Карта импульса',
         icon: <BarChart2 className="w-3.5 h-3.5 text-emerald-400" />,
+      },
+      {
+        id: 'scanner' as const,
+        label: 'Сканер сетапов',
+        icon: <Crosshair className="w-3.5 h-3.5 text-emerald-400" />,
       },
       {
         id: 'portfolio' as const,
@@ -687,6 +702,18 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
               </ResponsiveContainer>
             </div>
           </section>
+        )}
+
+        {screenerSection === 'scanner' && (
+          <SetupScanner
+            isSignedIn={isSignedIn}
+            isPro={isPro}
+            creditsRemaining={creditsRemaining}
+            creditQuota={creditQuota}
+            onRequireLogin={() => onRequireLogin?.()}
+            onUpgradePro={() => onUpgradePro?.()}
+            onOpenPair={onOpenPairOnMarket}
+          />
         )}
 
         {screenerSection === 'portfolio' && (

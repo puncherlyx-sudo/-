@@ -323,10 +323,8 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Consume or Reset Weekly Credits
-          (incoming().plan == existing().plan && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
-          // Action 1b: Migrate legacy Free weeklyQuota (10 -> 15) or weekly reset
-          (existing().plan == 'free' && incoming().plan == 'free' && incoming().weeklyQuota == 15 && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'weeklyQuota', 'nextResetAt', 'updatedAt'])) ||
+          // Actions 1 / 1b УДАЛЕНЫ: кредиты (creditsRemaining), квоту (weeklyQuota) и дату пополнения (nextResetAt)
+          // списывает, пополняет и проверяет только сервер (server/entitlements.ts). Приложению менять их нельзя.
           // Action 2: Toggle 2FA or Auto-Lock Timeout
           (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
           // Action 3 УДАЛЁН: тариф (plan) и срок (proUntil) меняет только сервер после оплаты.

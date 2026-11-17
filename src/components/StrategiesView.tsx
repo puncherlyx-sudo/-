@@ -736,7 +736,15 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
 
         {section === 'calculator' && <PositionSizeCalculator strategies={strategies} />}
 
-        {section === 'journal' && <TradeJournal uid={isSignedIn ? uid : null} onRequireLogin={onRequireLogin} />}
+        {section === 'journal' && (
+          <TradeJournal
+            uid={isSignedIn ? uid : null}
+            onRequireLogin={onRequireLogin}
+            isPro={isPro}
+            creditsRemaining={profile?.creditsRemaining}
+            onUpgradePro={() => void onSwitchPlan('pro')}
+          />
+        )}
 
         {section === 'plans' && (
           <section className="grid grid-cols-1 md:grid-cols-2 gap-4">

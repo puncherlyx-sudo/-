@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Crown, Loader2, ShieldCheck, X } from 'lucide-react';
+import { Crown, Loader2, ShieldCheck, X } from 'lucide-react';
+import { PLAN_FEATURES } from '../data/strategies';
 import { authFetch } from '../lib/authFetch';
 
 type Period = 'month' | 'year';
@@ -16,12 +17,6 @@ interface PricingModalProps {
   proUntil?: number;
 }
 
-const FEATURES = [
-  '100 кредитов в месяц для AI-анализа (Spot — 1 кр., Futures — 2 кр., бэктест — 1 кр.)',
-  'Все 9 торговых стратегий (включая BB Squeeze, Ribbon и ATR+OI)',
-  'Биржевой стакан TOP-10, конструктор MA Ribbon (EMA/SMA) и плечо до 20x',
-  'Снятие дневного лимита сигналов/день (∞ на стратегии), 4H-бэктест («Все 9») и экспорт CSV',
-];
 
 function formatDate(ms: number): string {
   return new Date(ms).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
@@ -127,14 +122,27 @@ export const PricingModal: React.FC<PricingModalProps> = ({ open, onClose, proUn
           </button>
         </div>
 
-        <ul className="mt-5 space-y-2">
-          {FEATURES.map((f) => (
-            <li key={f} className="flex items-center gap-2.5 text-sm text-slate-300">
-              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-              {f}
-            </li>
+        <div className="mt-5 space-y-2" role="table" aria-label="Сравнение тарифов">
+          <div className="grid grid-cols-[1fr_auto_auto] gap-x-3 px-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500" role="row">
+            <span role="columnheader">Возможность</span>
+            <span role="columnheader" className="w-24 text-right">Free</span>
+            <span role="columnheader" className="w-24 text-right text-amber-300">PRO</span>
+          </div>
+          {PLAN_FEATURES.map((f) => (
+            <div
+              key={f.key}
+              role="row"
+              className="grid grid-cols-[1fr_auto_auto] items-start gap-x-3 rounded-xl border border-white/8 bg-[#0B0F17] px-3 py-2.5"
+            >
+              <div role="cell" className="min-w-0">
+                <div className="text-[13px] font-medium text-slate-100 leading-snug">{f.title}</div>
+                <div className="mt-0.5 text-[11px] text-slate-500 leading-snug">{f.description}</div>
+              </div>
+              <div role="cell" className="w-24 text-right text-[11px] leading-snug text-slate-400">{f.free}</div>
+              <div role="cell" className="w-24 text-right text-[11px] leading-snug font-semibold text-emerald-300">{f.pro}</div>
+            </div>
           ))}
-        </ul>
+        </div>
 
         <div className="mt-5 grid grid-cols-2 gap-3" role="radiogroup" aria-label="Период подписки">
           {cards.map((c) => (

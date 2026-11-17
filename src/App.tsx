@@ -49,6 +49,7 @@ import type {
 import {
   countTodayStrategySignals,
   FREE_DAILY_SIGNAL_LIMIT,
+  getCreditQuotaForProfile,
   isProSubscriptionActive,
 } from './data/strategies';
 import { authFetch } from './lib/authFetch';
@@ -771,6 +772,10 @@ export default function App() {
 
             {activeTab === 'screener' && (
               <MarketScreenerView
+                isSignedIn={isSignedIn}
+                creditsRemaining={profile?.creditsRemaining}
+                creditQuota={profile ? getCreditQuotaForProfile(profile) : undefined}
+                onRequireLogin={() => void handleLoginWithPush()}
                 isPro={isProSubscriptionActive(profile)}
                 onUpgradePro={() => {
                   if (!isSignedIn) {
@@ -811,6 +816,7 @@ export default function App() {
 
             {activeTab === 'security' && (
               <SecurityCenterView
+                onUpgradePro={() => (isSignedIn ? setPricingOpen(true) : void handleLoginWithPush())}
                 profile={profile}
                 privateSecurity={privateSecurity}
                 auditLogs={auditLogs}

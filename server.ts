@@ -17,7 +17,10 @@ import {
   verifyIpnSignature,
   type BillingPeriod,
 } from './server/billing.ts';
-import { FREE_MAX_LEVERAGE, isProOnlyStrategy } from './src/data/strategies.ts';
+import { chargeCredits, refundCredits } from './server/entitlements.ts';
+import { capActiveAlerts, maxActiveAlertsFor } from './src/lib/alertLimits.ts';
+import { registerFeatureRoutes, respondChargeFailure } from './server/featureRoutes.ts';
+import { FREE_MAX_LEVERAGE, getAnalysisCreditCost, isProOnlyStrategy } from './src/data/strategies.ts';
 import {
   AiServiceError,
   askTerminalAssistant,
@@ -403,7 +406,13 @@ async function startServer() {
   });
 
   // AI Strategy + Chart + News analysis
+  // Сканер сетапов, разбор дневника, состояние тарифа (кредиты считает сервер)
+  registerFeatureRoutes(app, { requireAuth, limiter: expensiveLimiter });
+
   app.post('/api/analyze', requireAuth, expensiveLimiter, async (req, res) => {
+    // Кредиты списываются на сервере; при сбое анализа они возвращаются
+    let chargedCost = 0;
+    let chargedKey: string | undefined;
     try {
       const body = req.body as Record<string, unknown>;
       const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
@@ -429,6 +438,17 @@ async function startServer() {
       const maxAllowedLeverage = isPro ? 20 : FREE_MAX_LEVERAGE;
       const leverage = Math.min(maxAllowedLeverage, Math.max(1, Number(body.leverage || 1)));
 
+      const analysisCost = getAnalysisCreditCost(strategyKey, marketType);
+      const charge = await chargeCredits(req.user!.uid, analysisCost, { dailySignalKey: strategyKey });
+      if (!charge.ok) {
+        respondChargeFailure(res, charge);
+        return;
+      }
+      if (charge.enforced) {
+        chargedCost = analysisCost;
+        chargedKey = strategyKey;
+      }
+
       const marketData = await getMarketCandles(symbol, timeframe, marketType);
       const analysis = await runStrategyAnalysis({
         symbol: marketData.symbol,
@@ -450,8 +470,15 @@ async function startServer() {
         analysis,
         indicators: marketData.indicators,
         source: marketData.source,
+        credits: charge.enforced
+          ? { remaining: charge.creditsRemaining, quota: charge.quota, isPro: charge.isPro, charged: analysisCost }
+          : null,
       });
     } catch (err) {
+      if (chargedCost > 0) {
+        // анализ не получился — возвращаем кредиты и дневной слот
+        await refundCredits(req.user!.uid, chargedCost, { dailySignalKey: chargedKey }).catch(() => undefined);
+      }
       if (err instanceof AiServiceError) {
         res.status(err.statusCode).json({ error: err.message, code: err.code });
         return;
@@ -939,7 +966,7 @@ async function startServer() {
   });
 
   // Web Push: Sync user custom price threshold alerts for background monitoring
-  app.post('/api/push/price-alerts/sync', requireAuth, (req, res) => {
+  app.post('/api/push/price-alerts/sync', requireAuth, async (req, res) => {
     try {
       const body = req.body as {
         alerts?: Array<{
@@ -974,8 +1001,18 @@ async function startServer() {
           updatedAtMs: typeof a.updatedAtMs === 'number' ? a.updatedAtMs : undefined,
         }));
 
-      const triggered = syncUserPriceAlerts(uid, normalized);
-      res.json({ ok: true, activeCount: normalized.filter((a) => a.active).length, triggered });
+      // Free отслеживает ограниченное число алертов, PRO — больше. Лишние сервер не мониторит (в базе они остаются).
+      const isProUser = (await getUserPlanTier(uid)) === 'pro';
+      const maxActive = maxActiveAlertsFor(isProUser);
+      const capped = capActiveAlerts(normalized, maxActive);
+
+      const triggered = syncUserPriceAlerts(uid, capped.alerts);
+      res.json({
+        ok: true,
+        activeCount: capped.monitored,
+        triggered,
+        limit: { max: maxActive, overLimit: capped.overLimit, isPro: isProUser },
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка синхронизации ценовых алертов' });
     }
