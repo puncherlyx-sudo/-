@@ -53,6 +53,19 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   onSaveStrategy,
 }) => {
   const [section, setSection] = useState<StrategiesSection>('catalog');
+  const [proMonthPrice, setProMonthPrice] = useState<number | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/billing/plans')
+      .then((r) => r.json() as Promise<{ plans?: { month?: { priceUsd?: number } } }>)
+      .then((d) => {
+        if (!cancelled && typeof d.plans?.month?.priceUsd === 'number') setProMonthPrice(d.plans.month.priceUsd);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [marketFilter, setMarketFilter] = useState<'all' | MarketType>('all');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -548,7 +561,9 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                     <Crown className="w-5 h-5 text-amber-400" />
                     <span>PRO Терминал</span>
                   </h2>
-                  <span className="font-mono text-sm font-semibold text-amber-400">$29 / мес</span>
+                  <span className="font-mono text-sm font-semibold text-amber-400">
+                    {proMonthPrice !== null ? `$${proMonthPrice} / мес` : 'PRO'}
+                  </span>
                 </div>
                 <p className="mt-1.5 text-xs text-slate-400">
                   Полный институциональный анализ, новости в реальном времени и настройка дневных сигналов.
