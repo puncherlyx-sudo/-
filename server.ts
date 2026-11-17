@@ -20,7 +20,13 @@ import {
   fetchGroundedCryptoNews,
   runStrategyAnalysis,
 } from './server/aiAnalyst.ts';
-import { getFearAndGreedIndex, getMarketCandles, getMarketDepth, getMarketOverview } from './server/market.ts';
+import {
+  getFearAndGreedIndex,
+  getMarketCandles,
+  getMarketDepth,
+  getMarketOverview,
+  SUPPORTED_SYMBOLS,
+} from './server/market.ts';
 import { runStrategyPortfolioBacktest, type StrategySimulationInput } from './server/strategyBacktest.ts';
 import {
   checkPriceAlertsForUser,
@@ -343,7 +349,10 @@ async function startServer() {
   // Grounded crypto news feed
   app.get('/api/news', async (req, res) => {
     try {
-      const symbol = String(req.query.symbol || 'ALL').toUpperCase();
+      // Только известные активы: иначе произвольный текст попадал бы в запрос к ИИ и в ключ кэша
+      const requested = String(req.query.symbol || 'ALL').toUpperCase().slice(0, 12);
+      const allowedNews = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
+      const symbol = allowedNews.has(requested) ? requested : 'ALL';
       const news = await fetchGroundedCryptoNews(symbol);
       const topHigh = news.items.find((n) => n.impact === 'HIGH');
       if (topHigh) {
@@ -371,10 +380,11 @@ async function startServer() {
       const body = req.body as Record<string, unknown>;
       const symbol = String(body.symbol || 'BTCUSDT').toUpperCase();
       const marketType = body.marketType === 'futures' ? 'futures' : 'spot';
-      const timeframe = String(body.timeframe || '1h');
-      const strategyKey = String(body.strategyKey || 'trend_breakout');
-      const strategyName = String(body.strategyName || 'Пробой тренда');
-      const strategyRules = String(body.strategyRules || '');
+      const timeframe = ['15m', '1h', '4h', '1d'].includes(String(body.timeframe)) ? String(body.timeframe) : '1h';
+      // Ограничиваем длину текста, который уходит в запрос к ИИ (защита от злоупотребления квотой и подмены инструкций)
+      const strategyKey = String(body.strategyKey || 'trend_breakout').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+      const strategyName = String(body.strategyName || 'Пробой тренда').replace(/[\r\n"]/g, ' ').slice(0, 120);
+      const strategyRules = String(body.strategyRules || '').replace(/\r/g, '').slice(0, 1500);
       const depositUsdt = Math.min(10_000_000, Math.max(10, Number(body.depositUsdt || 1000)));
       const riskPerTradePct = Math.min(10, Math.max(0.25, Number(body.riskPerTradePct || 1.5)));
       const leverage = Math.min(20, Math.max(1, Number(body.leverage || 1)));
