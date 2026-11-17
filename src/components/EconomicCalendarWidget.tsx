@@ -8,33 +8,40 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { EconomicCalendarEvent } from '../types/domain';
+import { safeFetchJson } from '../utils/safeFetchJson';
 
 type CategoryFilter = 'all' | 'macro' | 'crypto' | 'derivatives';
 
 export const EconomicCalendarWidget: React.FC = () => {
   const [events, setEvents] = useState<EconomicCalendarEvent[]>([]);
   const [grounded, setGrounded] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all');
   const [highImpactOnly, setHighImpactOnly] = useState(false);
 
-  const loadCalendar = useCallback(async () => {
+  const loadCalendar = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/economic-calendar');
-      const data = (await res.json()) as {
+      const url = forceRefresh ? '/api/economic-calendar?refresh=1' : '/api/economic-calendar';
+      const result = await safeFetchJson<{
         events?: EconomicCalendarEvent[];
         grounded?: boolean;
+        notice?: string;
+        updatedAt?: string;
         error?: string;
-      };
-      if (!res.ok) {
-        throw new Error(data.error || 'Не удалось загрузить экономический календарь.');
+      }>(url, { timeoutMs: 15000, cache: 'no-store' });
+      if (!result.ok || !result.data) {
+        throw new Error(result.errorMessage || 'Не удалось загрузить экономический календарь.');
       }
-      setEvents(data.events || []);
-      setGrounded(Boolean(data.grounded));
+      setEvents(result.data.events || []);
+      setGrounded(Boolean(result.data.grounded));
+      setNotice(result.data.notice ?? null);
+      setLastUpdatedAt(result.data.updatedAt || new Date().toISOString());
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка загрузки календаря');
     } finally {
@@ -43,7 +50,22 @@ export const EconomicCalendarWidget: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    void loadCalendar();
+    void loadCalendar(false);
+    const intervalId = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadCalendar(false);
+      }
+    }, 5 * 60_000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadCalendar(false);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [loadCalendar]);
 
   const filteredEvents = useMemo(() => {
@@ -107,7 +129,18 @@ export const EconomicCalendarWidget: React.FC = () => {
             <span aria-hidden="true">·</span>
             <span>ETF, опционы и разлоки</span>
             <span aria-hidden="true">·</span>
-            <span>{grounded ? 'Живой поиск расписания' : 'Календарный график'}</span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="live-dot" aria-hidden="true" />
+              <span>{grounded ? 'Живой поиск расписания' : 'Deribit · OKX · ФРС'}</span>
+              {lastUpdatedAt && (
+                <span className="font-mono text-[11px] text-slate-500">
+                  {new Date(lastUpdatedAt).toLocaleTimeString('ru-RU', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}
+                </span>
+              )}
+            </span>
           </div>
           <h2 className="mt-1 text-lg sm:text-xl font-bold text-white flex items-center gap-2">
             <CalendarClock className="w-5 h-5 text-amber-400 shrink-0" />
@@ -159,7 +192,7 @@ export const EconomicCalendarWidget: React.FC = () => {
           <button
             type="button"
             disabled={loading}
-            onClick={() => void loadCalendar()}
+            onClick={() => void loadCalendar(true)}
             aria-label="Обновить календарь событий"
             className="min-h-[40px] px-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
           >
@@ -169,6 +202,13 @@ export const EconomicCalendarWidget: React.FC = () => {
         </div>
       </div>
 
+      {notice && events.length > 0 && (
+        <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/8 px-3.5 py-2.5 text-xs text-cyan-200 flex items-center gap-2">
+          <Info className="w-4 h-4 text-cyan-400 shrink-0" />
+          <span>{notice}</span>
+        </div>
+      )}
+
       {/* Loading State */}
       {loading && events.length === 0 ? (
         <div className="space-y-2.5">
@@ -176,12 +216,12 @@ export const EconomicCalendarWidget: React.FC = () => {
             <div key={row} className="h-14 rounded-xl bg-[#0B0F17] border border-white/8 animate-pulse" />
           ))}
         </div>
-      ) : error ? (
+      ) : error && events.length === 0 ? (
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-5 text-center space-y-3">
           <p className="text-xs text-rose-300">{error}</p>
           <button
             type="button"
-            onClick={() => void loadCalendar()}
+            onClick={() => void loadCalendar(true)}
             className="min-h-[40px] px-4 rounded-xl bg-rose-500/20 text-rose-200 text-xs font-medium"
           >
             Повторить загрузку

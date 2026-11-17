@@ -98,10 +98,11 @@ export const FearGreedWidget: React.FC = () => {
   const [hoveredZone, setHoveredZone] = useState<SentimentZone | null>(null);
   const [hoveredBarIdx, setHoveredBarIdx] = useState<number | null>(null);
 
-  const loadSentiment = useCallback(async () => {
+  const loadSentiment = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/market/fear-greed');
+      const url = forceRefresh ? '/api/market/fear-greed?refresh=1' : '/api/market/fear-greed';
+      const res = await fetch(url, { cache: 'no-store' });
       if (res.ok) {
         const json = (await res.json()) as FearAndGreedSnapshot;
         setData(json);
@@ -114,11 +115,22 @@ export const FearGreedWidget: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    void loadSentiment();
+    void loadSentiment(false);
     const timer = setInterval(() => {
-      void loadSentiment();
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadSentiment(false);
+      }
     }, 5 * 60_000);
-    return () => clearInterval(timer);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void loadSentiment(false);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [loadSentiment]);
 
   const baseHorizonValue = useMemo(() => {
@@ -195,7 +207,7 @@ export const FearGreedWidget: React.FC = () => {
         <motion.button
           type="button"
           whileTap={{ scale: 0.94 }}
-          onClick={() => void loadSentiment()}
+          onClick={() => void loadSentiment(true)}
           disabled={loading}
           aria-label="Обновить индекс страха и жадности"
           className="min-h-[38px] min-w-[38px] rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 flex items-center justify-center transition-colors shrink-0"

@@ -12,18 +12,37 @@ import {
   CandlestickChart as ChartIcon,
   ChevronDown,
   Clock,
+  Crown,
   Flame,
   Gauge,
   History,
   Layers,
+  Lock,
   PieChart as PieChartIcon,
+  PlusCircle,
   RefreshCw,
+  Search,
   ShieldAlert,
   SlidersHorizontal,
   Star,
+  X,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
-import { STRATEGY_CATALOG, TRADING_PAIRS } from '../data/strategies';
+import { AnimatePresence, LayoutGroup, motion } from 'framer-motion';
+import {
+  CREDIT_COSTS,
+  FREE_DAILY_SIGNAL_LIMIT,
+  FREE_MAX_LEVERAGE,
+  FREE_WEEKLY_QUOTA,
+  PRO_MONTHLY_QUOTA,
+  STRATEGY_CATALOG,
+  TRADING_PAIRS,
+  countTodayStrategySignals,
+  formatProUntilDate,
+  getCreditQuotaForProfile,
+  isProSubscriptionActive,
+  isProSubscriptionExpired,
+} from '../data/strategies';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import type {
   AnalysisRecord,
   AnalysisResultPayload,
@@ -34,21 +53,48 @@ import type {
   PriceAlertRecord,
   RibbonPeriods,
   RibbonType,
+  SupportTicketCategory,
+  SupportTicketRecord,
   TickerOverview,
   Timeframe,
   UserProfile,
 } from '../types/domain';
 import { CandlestickChart } from './CandlestickChart';
 import { ChartQuickAlertWidget } from './ChartQuickAlertWidget';
+import {
+  ColumnSelectorMenu,
+  DEFAULT_MARKET_COLUMNS,
+  type MarketVisibleColumns,
+} from './ColumnSelectorMenu';
 import { FearGreedWidget } from './FearGreedWidget';
 import { MarketDominanceWidget } from './MarketDominanceWidget';
-import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import {
+  AssetStripSkeleton,
+  OscillatorsSkeleton,
+  PairsListSkeleton,
+  skeletonSwapVariants,
+} from './MarketSkeletons';
+import { MiniSparkline } from './MiniSparkline';
+import {
+  FlashValue,
+  NATIVE_PILL_SPRING,
+  NATIVE_SPRING,
+  StaggerDeck,
+  WorkspaceShell,
+} from './MotionPrimitives';
 import { MultiTimeframeStrip } from './MultiTimeframeStrip';
 import { OrderBookPanel } from './OrderBookPanel';
+import { QuickAnswersCard } from './QuickAnswersCard';
+import { QuickAssetAlertModal, type QuickAlertTargetAsset } from './QuickAssetAlertModal';
+import {
+  VirtualizedAssetStrip,
+  VirtualizedPairsList,
+  type EnrichedMarketPair,
+} from './VirtualizedAssetLists';
 import { authFetch } from '../lib/authFetch';
 
 type MarketSection = 'chart' | 'ai' | 'depth' | 'oscillators' | 'sentiment' | 'pairs';
-type AssetQuickFilter = 'all' | 'volume' | 'volatile' | 'favorites';
+type AssetQuickFilter = 'all' | 'volume' | 'volatile' | 'new_listings' | 'favorites';
 type AssetSortOption =
   | 'default'
   | 'name_asc'
@@ -60,6 +106,7 @@ type AssetSortOption =
 
 const FAVORITES_STORAGE_KEY = 'aegis_market_favorite_pairs';
 const SORT_STORAGE_KEY = 'aegis_market_asset_sort';
+const COLUMNS_STORAGE_KEY = 'aegis_market_visible_columns';
 const DEFAULT_FAVORITE_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
 const VALID_SORT_OPTIONS: ReadonlySet<AssetSortOption> = new Set([
   'default',
@@ -74,13 +121,23 @@ const VALID_SORT_OPTIONS: ReadonlySet<AssetSortOption> = new Set([
 interface MarketTerminalViewProps {
   profile: UserProfile | null;
   isSignedIn: boolean;
+  userEmail?: string;
   analyses: AnalysisRecord[];
   priceAlerts: PriceAlertRecord[];
+  supportTickets: SupportTicketRecord[];
   pushSubscribed: boolean;
   externalSelection?: { symbol: string; marketType: MarketType; nonce: number } | null;
   onRequireLogin: () => void;
   onUpgradePro: () => void;
   onOpenPushSettings: () => void;
+  onOpenFullFaq?: () => void;
+  onStartTour?: () => void;
+  onCreateSupportTicket: (params: {
+    contactEmail: string;
+    category: SupportTicketCategory;
+    subject: string;
+    message: string;
+  }) => Promise<string>;
   onCreatePriceAlert: (params: {
     symbol: string;
     marketType: MarketType;
@@ -100,6 +157,7 @@ interface MarketTerminalViewProps {
     timeframe: string;
     strategyKey: string;
     strategyName: string;
+    creditCost?: number;
     result: AnalysisResultPayload;
   }) => Promise<void>;
   onSignalEmitted?: (params: {
@@ -126,6 +184,15 @@ function formatUsd(val: number): string {
   return `$${val.toFixed(4)}`;
 }
 
+function formatUsdAbbrev(val?: number): string {
+  if (!val || !Number.isFinite(val) || val <= 0) return '—';
+  if (val >= 1_000_000_000_000) return `$${(val / 1_000_000_000_000).toFixed(2)}T`;
+  if (val >= 1_000_000_000) return `$${(val / 1_000_000_000).toFixed(2)}B`;
+  if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`;
+  if (val >= 1_000) return `$${(val / 1_000).toFixed(1)}K`;
+  return `$${val.toFixed(0)}`;
+}
+
 function formatResetCountdown(iso?: string): string {
   if (!iso) return '7 дн.';
   const diff = new Date(iso).getTime() - Date.now();
@@ -145,13 +212,18 @@ function parseFirstPrice(text?: string): number | null {
 export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
   profile,
   isSignedIn,
+  userEmail,
   analyses,
   priceAlerts,
+  supportTickets,
   pushSubscribed,
   externalSelection,
   onRequireLogin,
   onUpgradePro,
   onOpenPushSettings,
+  onOpenFullFaq,
+  onStartTour,
+  onCreateSupportTicket,
   onCreatePriceAlert,
   onTogglePriceAlert,
   onDeletePriceAlert,
@@ -211,10 +283,45 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
   const [leverage, setLeverage] = useState<number>(5);
 
   const [loadingChart, setLoadingChart] = useState(true);
+  const [loadingOverview, setLoadingOverview] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [activeResult, setActiveResult] = useState<AnalysisResultPayload | null>(null);
+  const [signalAnimVersion, setSignalAnimVersion] = useState(0);
+  const [analysesAnimVersion, setAnalysesAnimVersion] = useState(0);
+  const [telemetryAnimVersion, setTelemetryAnimVersion] = useState(0);
+  const [lastMarketUpdatedAt, setLastMarketUpdatedAt] = useState<string | null>(null);
   const [draftAlertPrice, setDraftAlertPrice] = useState<number | null>(null);
+  const [notifyAsset, setNotifyAsset] = useState<QuickAlertTargetAsset | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [visibleColumns, setVisibleColumns] = useState<MarketVisibleColumns>(() => {
+    if (typeof window === 'undefined') return DEFAULT_MARKET_COLUMNS;
+    try {
+      const raw = window.localStorage.getItem(COLUMNS_STORAGE_KEY);
+      if (!raw) return DEFAULT_MARKET_COLUMNS;
+      const parsed = JSON.parse(raw) as Partial<MarketVisibleColumns>;
+      return {
+        sparkline: typeof parsed.sparkline === 'boolean' ? parsed.sparkline : DEFAULT_MARKET_COLUMNS.sparkline,
+        price: typeof parsed.price === 'boolean' ? parsed.price : DEFAULT_MARKET_COLUMNS.price,
+        change24h: typeof parsed.change24h === 'boolean' ? parsed.change24h : DEFAULT_MARKET_COLUMNS.change24h,
+        volume: typeof parsed.volume === 'boolean' ? parsed.volume : DEFAULT_MARKET_COLUMNS.volume,
+        marketCap: typeof parsed.marketCap === 'boolean' ? parsed.marketCap : DEFAULT_MARKET_COLUMNS.marketCap,
+      };
+    } catch {
+      return DEFAULT_MARKET_COLUMNS;
+    }
+  });
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const prevMarketTypeRef = useRef<MarketType | null>(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify(visibleColumns));
+    } catch {
+      // Ignore storage quota/privacy restrictions
+    }
+  }, [visibleColumns]);
 
   useEffect(() => {
     const handleTourFocus = (evt: Event) => {
@@ -242,6 +349,10 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     setDraftAlertPrice(null);
   }, [symbol, marketType]);
 
+  const isPro = isProSubscriptionActive(profile);
+  const isExpiredPro = isProSubscriptionExpired(profile);
+  const totalCreditQuota = getCreditQuotaForProfile(profile);
+
   const filteredStrategies = useMemo(
     () => STRATEGY_CATALOG.filter((s) => s.marketType === marketType),
     [marketType]
@@ -249,59 +360,135 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
 
   useEffect(() => {
     if (!filteredStrategies.some((s) => s.key === strategyKey)) {
-      const first = filteredStrategies[0];
+      const first =
+        filteredStrategies.find((s) => isPro || s.tier === 'free') ?? filteredStrategies[0];
       if (first) {
         setStrategyKey(first.key);
-        setLeverage(first.defaultLeverage);
+        setLeverage(
+          first.marketType === 'spot'
+            ? 1
+            : isPro
+              ? first.defaultLeverage
+              : Math.min(FREE_MAX_LEVERAGE, first.defaultLeverage)
+        );
         setRiskPct(first.defaultRiskPct);
       }
     }
-  }, [filteredStrategies, strategyKey]);
+  }, [filteredStrategies, strategyKey, isPro]);
+
+  useEffect(() => {
+    if (!isPro && leverage > FREE_MAX_LEVERAGE) {
+      setLeverage(FREE_MAX_LEVERAGE);
+    }
+  }, [isPro, leverage]);
 
   const activeStrategy = useMemo(
     () => filteredStrategies.find((s) => s.key === strategyKey) ?? filteredStrategies[0],
     [filteredStrategies, strategyKey]
   );
 
-  const loadMarketData = useCallback(async () => {
-    setLoadingChart(true);
-    try {
-      const [overviewRes, candlesRes] = await Promise.all([
-        fetch(`/api/market/overview?marketType=${marketType}`),
-        fetch(`/api/market/candles?symbol=${symbol}&interval=${timeframe}&marketType=${marketType}`),
-      ]);
-      if (overviewRes.ok) {
-        const ov = (await overviewRes.json()) as { tickers: TickerOverview[] };
-        setTickers(ov.tickers || []);
+  const isSelectedStrategyLocked = Boolean(!isPro && activeStrategy?.tier === 'pro');
+  const requiredCredits =
+    activeStrategy?.creditCost ??
+    (marketType === 'futures' ? CREDIT_COSTS.futuresAnalysis : CREDIT_COSTS.spotAnalysis);
+
+  const todayStrategySignalsUsed = useMemo(
+    () => (isSignedIn && activeStrategy ? countTodayStrategySignals(analyses, activeStrategy.key) : 0),
+    [isSignedIn, analyses, activeStrategy]
+  );
+  const hasReachedCreditsLimit = Boolean(
+    isSignedIn && profile && profile.creditsRemaining < requiredCredits
+  );
+  const hasReachedFreeDailyLimit = Boolean(
+    isSignedIn && profile && !isPro && todayStrategySignalsUsed >= FREE_DAILY_SIGNAL_LIMIT
+  );
+
+  const loadMarketData = useCallback(
+    async (options?: { showOverviewSkeleton?: boolean; forceRefresh?: boolean }) => {
+      setLoadingChart(true);
+      if (options?.showOverviewSkeleton) {
+        setLoadingOverview(true);
       }
-      if (candlesRes.ok) {
-        const cd = (await candlesRes.json()) as {
-          candles: CandlePoint[];
-          indicators: IndicatorSnapshot;
-          fundingRatePct?: number;
-          openInterestUsdt?: number;
-          source: 'live' | 'cached';
-        };
-        setCandles(cd.candles || []);
-        setIndicators(cd.indicators || null);
-        setFundingRatePct(cd.fundingRatePct);
-        setOpenInterestUsdt(cd.openInterestUsdt);
-        setDataSource(cd.source);
+      const refreshQuery = options?.forceRefresh ? '&refresh=1' : '';
+      try {
+        const [overviewRes, candlesRes] = await Promise.all([
+          fetch(`/api/market/overview?marketType=${marketType}${refreshQuery}`, {
+            cache: 'no-store',
+          }),
+          fetch(
+            `/api/market/candles?symbol=${symbol}&interval=${timeframe}&marketType=${marketType}${refreshQuery}`,
+            { cache: 'no-store' }
+          ),
+        ]);
+        let nextUpdatedIso: string | null = null;
+        if (overviewRes.ok) {
+          const ov = (await overviewRes.json()) as {
+            tickers: TickerOverview[];
+            updatedAt?: string;
+          };
+          setTickers(ov.tickers || []);
+          if (ov.updatedAt) nextUpdatedIso = ov.updatedAt;
+        }
+        if (candlesRes.ok) {
+          const cd = (await candlesRes.json()) as {
+            candles: CandlePoint[];
+            indicators: IndicatorSnapshot;
+            fundingRatePct?: number;
+            openInterestUsdt?: number;
+            source: 'live' | 'cached';
+            updatedAt?: string;
+          };
+          setCandles(cd.candles || []);
+          setIndicators(cd.indicators || null);
+          setFundingRatePct(cd.fundingRatePct);
+          setOpenInterestUsdt(cd.openInterestUsdt);
+          setDataSource(cd.source);
+          setTelemetryAnimVersion((v) => v + 1);
+          if (cd.updatedAt) nextUpdatedIso = cd.updatedAt;
+        }
+        setLastMarketUpdatedAt(nextUpdatedIso || new Date().toISOString());
+      } catch {
+        // Retain existing candles if temporary offline hiccup
+      } finally {
+        setLoadingChart(false);
+        setLoadingOverview(false);
       }
-    } catch {
-      // Retain existing candles if temporary offline hiccup
-    } finally {
-      setLoadingChart(false);
-    }
-  }, [marketType, symbol, timeframe]);
+    },
+    [marketType, symbol, timeframe]
+  );
 
   useEffect(() => {
-    void loadMarketData();
+    const isInitialOrMarketSwitch =
+      prevMarketTypeRef.current === null || prevMarketTypeRef.current !== marketType;
+    prevMarketTypeRef.current = marketType;
+    void loadMarketData({ showOverviewSkeleton: isInitialOrMarketSwitch });
+
     const intervalId = setInterval(() => {
-      void loadMarketData();
-    }, 30_000);
-    return () => clearInterval(intervalId);
-  }, [loadMarketData]);
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadMarketData({ showOverviewSkeleton: false });
+      }
+    }, 15_000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void loadMarketData({ showOverviewSkeleton: false });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [loadMarketData, marketType]);
+
+  const analysesSignature = useMemo(
+    () => analyses.slice(0, 10).map((a) => a.id).join('|'),
+    [analyses]
+  );
+  useEffect(() => {
+    setAnalysesAnimVersion((v) => v + 1);
+  }, [analysesSignature]);
 
   const activeTicker = useMemo(() => tickers.find((t) => t.symbol === symbol), [tickers, symbol]);
 
@@ -339,7 +526,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     );
   }, []);
 
-  const enrichedPairs = useMemo(
+  const enrichedPairs = useMemo<EnrichedMarketPair[]>(
     () =>
       TRADING_PAIRS.map((pair) => {
         const live = tickers.find((t) => t.symbol === pair.symbol);
@@ -348,18 +535,42 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
           label: pair.label,
           name: pair.name,
           baseAsset: live?.baseAsset ?? pair.symbol.replace(/USDT$/, ''),
+          category: pair.category,
+          aliases: pair.aliases,
           price: live?.price ?? null,
           change24hPct: live?.change24hPct ?? null,
           volume24hUsdt: live?.volume24hUsdt ?? 0,
+          marketCapUsdt: live?.marketCapUsdt,
           fundingRatePct: live?.fundingRatePct,
+          sparkline24h: live?.sparkline24h,
           isFavorite: favoriteSymbols.includes(pair.symbol),
+          isNewListing: pair.isNewListing,
         };
       }),
     [tickers, favoriteSymbols]
   );
 
+  const openNotifyForAsset = useCallback((asset: EnrichedMarketPair) => {
+    setNotifyAsset({
+      symbol: asset.symbol,
+      baseAsset: asset.baseAsset,
+      name: asset.name,
+      price: asset.price ?? 0,
+    });
+  }, []);
+
+  const openNotifyForActive = useCallback(() => {
+    const found = enrichedPairs.find((p) => p.symbol === symbol);
+    setNotifyAsset({
+      symbol,
+      baseAsset: found?.baseAsset ?? symbol.replace(/USDT$/, ''),
+      name: found?.name ?? symbol,
+      price: indicators?.lastPrice ?? found?.price ?? activeTicker?.price ?? 0,
+    });
+  }, [enrichedPairs, symbol, indicators?.lastPrice, activeTicker?.price]);
+
   const topVolumePairs = useMemo(
-    () => [...enrichedPairs].sort((a, b) => b.volume24hUsdt - a.volume24hUsdt).slice(0, 5),
+    () => [...enrichedPairs].sort((a, b) => b.volume24hUsdt - a.volume24hUsdt).slice(0, 10),
     [enrichedPairs]
   );
 
@@ -368,8 +579,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
       (a, b) => Math.abs(b.change24hPct ?? 0) - Math.abs(a.change24hPct ?? 0)
     );
     const strongMovers = sorted.filter((item) => Math.abs(item.change24hPct ?? 0) >= 1.5);
-    return strongMovers.length >= 3 ? strongMovers : sorted.slice(0, 5);
+    return strongMovers.length >= 5 ? strongMovers : sorted.slice(0, 10);
   }, [enrichedPairs]);
+
+  const newListingPairs = useMemo(
+    () => enrichedPairs.filter((item) => item.isNewListing),
+    [enrichedPairs]
+  );
 
   const favoritePairs = useMemo(
     () => enrichedPairs.filter((item) => item.isFavorite),
@@ -385,12 +601,66 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     }
   }, [assetSort]);
 
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+
+  const matchesSearchQuery = useCallback(
+    (item: EnrichedMarketPair, query: string): boolean => {
+      if (!query) return true;
+      return (
+        item.baseAsset.toLowerCase().includes(query) ||
+        item.symbol.toLowerCase().includes(query) ||
+        item.label.toLowerCase().includes(query) ||
+        item.name.toLowerCase().includes(query) ||
+        (item.category ? item.category.toLowerCase().includes(query) : false) ||
+        (item.aliases ? item.aliases.some((alias) => alias.toLowerCase().includes(query)) : false)
+      );
+    },
+    []
+  );
+
+  const instantSearchResults = useMemo(() => {
+    if (!normalizedSearch) return [];
+    const matched = enrichedPairs.filter((item) => matchesSearchQuery(item, normalizedSearch));
+    const rankMatch = (item: EnrichedMarketPair): number => {
+      const base = item.baseAsset.toLowerCase();
+      if (base === normalizedSearch) return 0;
+      if (item.aliases?.some((a) => a.toLowerCase() === normalizedSearch)) return 0;
+      if (base.startsWith(normalizedSearch)) return 1;
+      if (item.aliases?.some((a) => a.toLowerCase().startsWith(normalizedSearch))) return 1;
+      if (item.name.toLowerCase().startsWith(normalizedSearch)) return 2;
+      return 3;
+    };
+    matched.sort((a, b) => {
+      const diff = rankMatch(a) - rankMatch(b);
+      if (diff !== 0) return diff;
+      return b.volume24hUsdt - a.volume24hUsdt;
+    });
+    return matched;
+  }, [enrichedPairs, matchesSearchQuery, normalizedSearch]);
+
   const baseFilteredPairs = useMemo(() => {
-    if (assetFilter === 'volume') return topVolumePairs;
-    if (assetFilter === 'volatile') return volatilePairs;
-    if (assetFilter === 'favorites') return favoritePairs;
-    return enrichedPairs;
-  }, [assetFilter, enrichedPairs, topVolumePairs, volatilePairs, favoritePairs]);
+    const byTab =
+      assetFilter === 'volume'
+        ? topVolumePairs
+        : assetFilter === 'volatile'
+          ? volatilePairs
+          : assetFilter === 'new_listings'
+            ? newListingPairs
+            : assetFilter === 'favorites'
+              ? favoritePairs
+              : enrichedPairs;
+    if (!normalizedSearch) return byTab;
+    return byTab.filter((item) => matchesSearchQuery(item, normalizedSearch));
+  }, [
+    assetFilter,
+    enrichedPairs,
+    topVolumePairs,
+    volatilePairs,
+    newListingPairs,
+    favoritePairs,
+    normalizedSearch,
+    matchesSearchQuery,
+  ]);
 
   const filteredPairs = useMemo(() => {
     if (assetSort === 'default') return baseFilteredPairs;
@@ -426,15 +696,21 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
       },
       {
         id: 'volume' as const,
-        label: 'Топ-объем',
+        label: 'По объёмам',
         count: topVolumePairs.length,
         icon: <BarChart3 className="w-3.5 h-3.5" />,
       },
       {
         id: 'volatile' as const,
-        label: 'Волатильные',
+        label: 'Волатильность',
         count: volatilePairs.length,
         icon: <Flame className="w-3.5 h-3.5" />,
+      },
+      {
+        id: 'new_listings' as const,
+        label: 'Новые листинги',
+        count: newListingPairs.length,
+        icon: <PlusCircle className="w-3.5 h-3.5" />,
       },
       {
         id: 'favorites' as const,
@@ -443,7 +719,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
         icon: <Star className="w-3.5 h-3.5" />,
       },
     ],
-    [enrichedPairs.length, topVolumePairs.length, volatilePairs.length, favoritePairs.length]
+    [
+      enrichedPairs.length,
+      topVolumePairs.length,
+      volatilePairs.length,
+      newListingPairs.length,
+      favoritePairs.length,
+    ]
   );
 
   const activePairAlertsCount = useMemo(
@@ -466,10 +748,27 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
       onRequireLogin();
       return;
     }
-    if (profile.plan === 'free' && profile.creditsRemaining <= 0) {
-      setAnalysisError('Еженедельные бесплатные кредиты (10/10) израсходованы. Оформите PRO или дождитесь сброса квоты.');
+    if (isSelectedStrategyLocked) {
+      onUpgradePro();
       return;
     }
+    if (profile.creditsRemaining < requiredCredits) {
+      setAnalysisError(
+        isPro
+          ? `Месячная квота кредитов PRO исчерпана (${profile.creditsRemaining}/${PRO_MONTHLY_QUOTA}). Продлите PRO, чтобы пополнить ещё ${PRO_MONTHLY_QUOTA} кредитов.`
+          : `Недостаточно кредитов (нужно ${requiredCredits}, доступно ${profile.creditsRemaining}/${totalCreditQuota}). Перейдите на PRO (100 кр./мес.) или дождитесь сброса квоты.`
+      );
+      return;
+    }
+    if (!isPro && todayStrategySignalsUsed >= FREE_DAILY_SIGNAL_LIMIT) {
+      setAnalysisError(
+        `Достигнут дневной лимит Free (${FREE_DAILY_SIGNAL_LIMIT}/день) для выбранной стратегии. Подписка PRO снимает ограничения на количество сигналов в день.`
+      );
+      return;
+    }
+
+    const effectiveLeverage =
+      marketType === 'spot' ? 1 : isPro ? leverage : Math.min(FREE_MAX_LEVERAGE, leverage);
 
     setAnalyzing(true);
     try {
@@ -485,21 +784,26 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
           strategyRules: activeStrategy.rulesSummary,
           depositUsdt,
           riskPerTradePct: riskPct,
-          leverage: marketType === 'spot' ? 1 : leverage,
-          isPro: profile.plan === 'pro',
+          leverage: effectiveLeverage,
+          isPro,
         }),
       });
-      const data = (await res.json()) as {
+      const parsed = await parseJsonResponse<{
         analysis?: AnalysisResultPayload;
         indicators?: IndicatorSnapshot;
         error?: string;
-      };
-      if (!res.ok || !data.analysis) {
-        throw new Error(data.error || 'Не удалось выполнить анализ графика.');
+      }>(res);
+      if (!parsed.ok || !parsed.data?.analysis) {
+        throw new Error(parsed.errorMessage || 'Не удалось выполнить анализ графика.');
       }
 
-      setActiveResult(data.analysis);
-      if (data.indicators) setIndicators(data.indicators);
+      const analysis = parsed.data.analysis;
+      setActiveResult(analysis);
+      setSignalAnimVersion((v) => v + 1);
+      if (parsed.data.indicators) {
+        setIndicators(parsed.data.indicators);
+        setTelemetryAnimVersion((v) => v + 1);
+      }
 
       await onConsumeAndSave({
         symbol,
@@ -507,17 +811,18 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
         timeframe,
         strategyKey: activeStrategy.key,
         strategyName: activeStrategy.name,
-        result: data.analysis,
+        creditCost: requiredCredits,
+        result: analysis,
       });
 
-      if (data.analysis.direction === 'LONG' || data.analysis.direction === 'SHORT') {
+      if (analysis.direction === 'LONG' || analysis.direction === 'SHORT') {
         void onSignalEmitted?.({
           symbol,
           marketType,
-          direction: data.analysis.direction,
-          confidence: data.analysis.confidence,
+          direction: analysis.direction,
+          confidence: analysis.confidence,
           strategyName: activeStrategy.name,
-          entryZone: data.analysis.entryZone,
+          entryZone: analysis.entryZone,
         });
       }
     } catch (err) {
@@ -547,7 +852,16 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     () => [
       { id: 'chart' as const, label: 'График цены', icon: <ChartIcon className="w-3.5 h-3.5 text-emerald-400" /> },
       { id: 'ai' as const, label: 'AI-анализ и риск', icon: <Bot className="w-3.5 h-3.5 text-cyan-400" /> },
-      { id: 'depth' as const, label: 'Стакан ордеров', icon: <BookOpen className="w-3.5 h-3.5 text-amber-400" /> },
+      {
+        id: 'depth' as const,
+        label: 'Стакан ордеров',
+        icon: isPro ? (
+          <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+        ) : (
+          <Lock className="w-3.5 h-3.5 text-amber-400" />
+        ),
+        meta: !isPro ? 'PRO' : undefined,
+      },
       { id: 'oscillators' as const, label: 'Осцилляторы', icon: <Gauge className="w-3.5 h-3.5 text-emerald-400" /> },
       { id: 'sentiment' as const, label: 'Страх и BTC%', icon: <PieChartIcon className="w-3.5 h-3.5 text-cyan-400" /> },
       {
@@ -557,7 +871,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
         meta: analyses.length > 0 ? analyses.length : tickers.length || undefined,
       },
     ],
-    [analyses.length, tickers.length]
+    [analyses.length, tickers.length, isPro]
   );
 
   const sidebarControls = (
@@ -639,6 +953,19 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
               className={`w-3.5 h-3.5 ${favoriteSymbols.includes(symbol) ? 'fill-amber-400 text-amber-300' : ''}`}
             />
           </button>
+          <button
+            type="button"
+            onClick={openNotifyForActive}
+            aria-label={`Уведомить по ${symbol}`}
+            title="Поставить ценовой алерт"
+            className={`min-h-[38px] min-w-[38px] rounded-xl border flex items-center justify-center shrink-0 transition-colors ${
+              activePairAlertsCount > 0
+                ? 'border-cyan-500/45 bg-cyan-500/15 text-cyan-200'
+                : 'border-white/10 bg-[#0B0F17] text-slate-400 hover:text-cyan-200 hover:border-cyan-500/35'
+            }`}
+          >
+            <BellPlus className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         <div className="grid grid-cols-4 p-0.5 rounded-xl bg-[#0B0F17] border border-white/8 shrink-0">
@@ -662,90 +989,343 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
   const sidebarBottom = (
     <div className="text-xs space-y-2">
       {profile ? (
-        <div className="flex items-center justify-between gap-2 text-slate-300">
-          {profile.plan === 'pro' ? (
-            <span className="text-amber-400 font-semibold">Тариф PRO · Безлимит</span>
-          ) : (
+        <>
+          <div className="flex items-center justify-between gap-2 text-slate-300">
             <span className="font-mono tabular-nums">
-              Кредиты: <strong className="text-emerald-400">{profile.creditsRemaining}</strong>/{profile.weeklyQuota}
+              Кредиты:{' '}
+              <strong className={profile.creditsRemaining > 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                {profile.creditsRemaining}
+              </strong>
+              /{totalCreditQuota}
             </span>
+            {isPro ? (
+              <button
+                type="button"
+                onClick={onUpgradePro}
+                className="text-amber-300 hover:text-amber-200 font-semibold whitespace-nowrap"
+              >
+                {profile.creditsRemaining <= 0 ? 'Пополнить →' : 'PRO'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onUpgradePro}
+                className="text-amber-300 hover:text-amber-200 font-semibold whitespace-nowrap"
+              >
+                {isExpiredPro ? 'Продлить PRO →' : 'PRO →'}
+              </button>
+            )}
+          </div>
+          {isPro ? (
+            <div className="space-y-0.5 text-[11px] text-slate-400">
+              <div className="text-amber-300/90 font-medium">
+                PRO активен · до {formatProUntilDate(profile.proUntil)}
+              </div>
+              <div>Спот = 1 кр. · Фьючерсы = 2 кр. · Сигналы: ∞/день</div>
+            </div>
+          ) : (
+            <div className="space-y-0.5 text-[11px] text-slate-500">
+              {isExpiredPro && (
+                <div className="text-amber-400 font-medium">
+                  Срок PRO истёк ({formatProUntilDate(profile.proUntil)})
+                </div>
+              )}
+              <div>Спот = 1 кр. · Фьючерсы = 2 кр. · {FREE_DAILY_SIGNAL_LIMIT} сигн./день</div>
+              <div>Сброс квоты через {formatResetCountdown(profile.nextResetAt)}</div>
+            </div>
           )}
-          {profile.plan === 'free' && (
-            <button
-              type="button"
-              onClick={onUpgradePro}
-              className="text-amber-300 hover:text-amber-200 font-semibold"
-            >
-              PRO →
-            </button>
-          )}
-        </div>
+        </>
       ) : (
         <button
           type="button"
           onClick={onRequireLogin}
           className="w-full min-h-[36px] rounded-lg bg-emerald-600/20 border border-emerald-500/35 text-emerald-300 font-medium"
         >
-          Войти (10 кредитов)
+          Войти ({FREE_WEEKLY_QUOTA} кредитов)
         </button>
-      )}
-      {profile && profile.plan === 'free' && (
-        <div className="text-[11px] text-slate-500">Сброс квоты через {formatResetCountdown(profile.nextResetAt)}</div>
       )}
     </div>
   );
 
   return (
     <StaggerDeck>
-      {/* Horizontal Quick Asset Filter Bar (no page scroll needed to filter & switch pairs) */}
-      <div className="mb-3 rounded-2xl border border-white/8 bg-[#111827] card-surface-glow px-3 py-2.5 space-y-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div
-            role="tablist"
-            aria-label="Быстрые фильтры активов"
-            className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full"
-          >
-            {filterMeta.map((item) => {
-              const isActive = assetFilter === item.id;
-              return (
+      {/* Horizontal Quick Search + Asset Filter Bar (no page scroll needed to search, filter & switch pairs) */}
+      <motion.div
+        layout="position"
+        transition={NATIVE_SPRING}
+        className="mb-3 rounded-2xl border border-white/8 bg-[#111827] card-surface-glow px-3 py-2.5 space-y-2.5"
+      >
+        {/* Instant Quick Search Bar */}
+        <div className="space-y-2">
+          <div className="relative flex items-center">
+            <Search className="w-4 h-4 text-slate-400 pointer-events-none absolute left-3" />
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  setSearchQuery('');
+                  searchInputRef.current?.blur();
+                } else if (e.key === 'Enter' && instantSearchResults.length > 0) {
+                  const first = instantSearchResults[0];
+                  setSymbol(first.symbol);
+                  setActiveResult(null);
+                }
+              }}
+              aria-label="Быстрый поиск монеты или категории"
+              placeholder="Быстрый поиск: BTC, SOL, ADA, DOT, LINK, UNI, MATIC, DeFi, L2..."
+              className="w-full min-h-[40px] rounded-xl border border-white/10 bg-[#0B0F17] pl-9 pr-28 text-xs sm:text-sm text-white placeholder:text-slate-500 focus:border-emerald-500/60 focus:outline-none transition-colors"
+            />
+            <div className="absolute right-2 flex items-center gap-1.5">
+              <span className="hidden sm:inline font-mono tabular-nums text-[11px] text-slate-500 pr-1">
+                {normalizedSearch
+                  ? `${instantSearchResults.length} / ${enrichedPairs.length}`
+                  : `${enrichedPairs.length} пар`}
+              </span>
+              {searchQuery && (
                 <button
-                  key={item.id}
                   type="button"
-                  role="tab"
-                  aria-selected={isActive}
-                  onClick={() => setAssetFilter(item.id)}
-                  className={`relative min-h-[36px] px-3 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
-                    isActive
-                      ? 'text-white'
-                      : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
-                  }`}
+                  onClick={() => {
+                    setSearchQuery('');
+                    searchInputRef.current?.focus();
+                  }}
+                  aria-label="Очистить поиск"
+                  className="min-h-[30px] min-w-[30px] rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white inline-flex items-center justify-center transition-colors"
                 >
-                  {isActive && (
-                    <motion.span
-                      layoutId="market-quick-filter-pill"
-                      transition={{ type: 'spring', stiffness: 460, damping: 34 }}
-                      className="absolute inset-0 rounded-xl border border-emerald-400/40 bg-emerald-500/15"
-                    />
-                  )}
-                  <span
-                    className={`relative z-10 inline-flex shrink-0 ${
-                      item.id === 'favorites' && isActive
-                        ? 'text-amber-300'
-                        : item.id === 'volatile' && isActive
-                          ? 'text-cyan-300'
-                          : ''
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Instant Live Results as You Type */}
+          <AnimatePresence initial={false}>
+            {normalizedSearch.length > 0 && (
+              <motion.div
+                key="market-instant-search-tray"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                className="rounded-xl border border-emerald-500/25 bg-[#0B0F17] overflow-hidden"
+              >
+                <div className="px-3 py-1.5 border-b border-white/8 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                  <span>
+                    Мгновенные результаты ·{' '}
+                    <strong className="font-mono text-slate-200">{instantSearchResults.length}</strong>
+                  </span>
+                  <span className="hidden sm:inline text-slate-500">
+                    Enter — открыть первую пару · Esc — сброс
+                  </span>
+                </div>
+
+                {instantSearchResults.length === 0 ? (
+                  <div className="px-3 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                    <span>По запросу «{searchQuery.trim()}» подходящие монеты не найдены.</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSearchQuery('');
+                        searchInputRef.current?.focus();
+                      }}
+                      className="text-emerald-300 hover:text-emerald-200 font-medium whitespace-nowrap"
+                    >
+                      Сбросить поиск
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    role="list"
+                    aria-label="Мгновенные результаты поиска"
+                    className="max-h-[248px] overflow-y-auto divide-y divide-white/6"
+                  >
+                    {instantSearchResults.map((item) => {
+                      const isSelected = item.symbol === symbol;
+                      const alertsCount = priceAlerts.filter(
+                        (a) => a.symbol === item.symbol && a.marketType === marketType && a.active
+                      ).length;
+                      return (
+                        <div
+                          key={item.symbol}
+                          role="listitem"
+                          className={`px-2.5 sm:px-3 py-1.5 flex items-center justify-between gap-2 transition-colors ${
+                            isSelected ? 'bg-emerald-500/12' : 'hover:bg-white/[0.03]'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                            <button
+                              type="button"
+                              onClick={() => toggleFavoriteSymbol(item.symbol)}
+                              aria-label={
+                                item.isFavorite
+                                  ? `Убрать ${item.baseAsset} из любимых`
+                                  : `Добавить ${item.baseAsset} в любимые`
+                              }
+                              className="min-h-[34px] min-w-[34px] rounded-lg hover:bg-white/8 text-slate-400 hover:text-amber-300 flex items-center justify-center shrink-0 transition-colors"
+                            >
+                              <Star
+                                className={`w-3.5 h-3.5 ${
+                                  item.isFavorite ? 'fill-amber-400 text-amber-300' : ''
+                                }`}
+                              />
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSymbol(item.symbol);
+                                setActiveResult(null);
+                              }}
+                              className="min-h-[38px] flex-1 min-w-0 text-left flex items-center justify-between gap-3"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="text-xs sm:text-sm font-semibold text-white truncate">
+                                  {item.baseAsset}
+                                  <span className="text-slate-500 font-normal"> / USDT</span>
+                                  {isSelected && (
+                                    <span className="ml-2 text-[11px] font-normal text-emerald-400">
+                                      Открыт
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-500 truncate">
+                                  <span>{item.name}</span>
+                                  {item.category && (
+                                    <>
+                                      <span aria-hidden="true"> · </span>
+                                      <span className="text-slate-400">{item.category}</span>
+                                    </>
+                                  )}
+                                  {item.isNewListing && (
+                                    <>
+                                      <span aria-hidden="true"> · </span>
+                                      <span className="text-cyan-400">Листинг</span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+
+                              {visibleColumns.sparkline && (
+                                <div className="shrink-0 flex items-center px-1">
+                                  <MiniSparkline
+                                    data={item.sparkline24h}
+                                    changePct={item.change24hPct}
+                                    width={60}
+                                    height={22}
+                                    showArea
+                                  />
+                                </div>
+                              )}
+
+                              {(visibleColumns.price || visibleColumns.change24h || visibleColumns.volume || visibleColumns.marketCap) && (
+                                <div className="text-right font-mono tabular-nums shrink-0">
+                                  {visibleColumns.price && (
+                                    <div className="text-xs sm:text-sm text-slate-100 font-semibold">
+                                      {item.price !== null ? formatUsd(item.price) : '—'}
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-end gap-1.5 text-[11px]">
+                                    {visibleColumns.change24h && (
+                                      <span
+                                        className={`font-semibold ${
+                                          (item.change24hPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                                        }`}
+                                      >
+                                        {item.change24hPct !== null
+                                          ? `${item.change24hPct >= 0 ? '+' : ''}${item.change24hPct}%`
+                                          : '—'}
+                                      </span>
+                                    )}
+                                    {visibleColumns.volume && item.volume24hUsdt > 0 && (
+                                      <span className="hidden sm:inline text-slate-400">
+                                        V:{formatUsdAbbrev(item.volume24hUsdt)}
+                                      </span>
+                                    )}
+                                    {visibleColumns.marketCap && item.marketCapUsdt && (
+                                      <span className="hidden md:inline text-cyan-300/80">
+                                        MC:{formatUsdAbbrev(item.marketCapUsdt)}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </button>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => openNotifyForAsset(item)}
+                            className={`min-h-[32px] px-2.5 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors ${
+                              alertsCount > 0
+                                ? 'border-cyan-500/45 bg-cyan-500/15 text-cyan-200 hover:bg-cyan-500/22'
+                                : 'border-white/12 bg-[#111827] text-slate-200 hover:border-cyan-500/40 hover:text-cyan-200'
+                            }`}
+                          >
+                            <BellPlus className="w-3 h-3 text-cyan-400 shrink-0" />
+                            <span>Уведомить{alertsCount > 0 ? ` (${alertsCount})` : ''}</span>
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <LayoutGroup id="market-quick-filter-group">
+            <div
+              role="tablist"
+              aria-label="Быстрые фильтры активов"
+              className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full"
+            >
+              {filterMeta.map((item) => {
+                const isActive = assetFilter === item.id;
+                return (
+                  <motion.button
+                    key={item.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isActive}
+                    whileTap={{ scale: 0.96 }}
+                    onClick={() => setAssetFilter(item.id)}
+                    className={`relative min-h-[36px] px-3 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                      isActive
+                        ? 'text-white'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
                     }`}
                   >
-                    {item.icon}
-                  </span>
-                  <span className="relative z-10">{item.label}</span>
-                  <span className="relative z-10 font-mono tabular-nums text-[11px] text-slate-400">
-                    {item.count}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+                    {isActive && (
+                      <motion.span
+                        layoutId="market-quick-filter-pill"
+                        transition={NATIVE_PILL_SPRING}
+                        className="absolute inset-0 rounded-xl border border-emerald-400/40 bg-emerald-500/15"
+                      />
+                    )}
+                    <span
+                      className={`relative z-10 inline-flex shrink-0 ${
+                        item.id === 'favorites' && isActive
+                          ? 'text-amber-300'
+                          : (item.id === 'volatile' || item.id === 'new_listings') && isActive
+                            ? 'text-cyan-300'
+                            : ''
+                      }`}
+                    >
+                      {item.icon}
+                    </span>
+                    <span className="relative z-10">{item.label}</span>
+                    <span className="relative z-10 font-mono tabular-nums text-[11px] text-slate-400">
+                      {item.count}
+                    </span>
+                  </motion.button>
+                );
+              })}
+            </div>
+          </LayoutGroup>
 
           <div className="flex flex-wrap items-center gap-2">
             {/* Sort Dropdown */}
@@ -810,82 +1390,90 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   : `В любимые`}
               </span>
             </button>
+
+            <ColumnSelectorMenu columns={visibleColumns} onChange={setVisibleColumns} />
+
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.94 }}
+              onClick={() => void loadMarketData({ showOverviewSkeleton: true, forceRefresh: true })}
+              disabled={loadingOverview || loadingChart}
+              aria-label="Обновить список активов"
+              title="Обновить котировки списка"
+              className="min-h-[34px] min-w-[34px] rounded-xl border border-white/10 bg-[#0B0F17] text-slate-300 hover:text-white hover:border-white/20 flex items-center justify-center shrink-0 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingOverview ? 'animate-spin' : ''}`} />
+            </motion.button>
           </div>
         </div>
 
-        {/* Instant Filtered Asset Chips Strip */}
-        {filteredPairs.length > 0 ? (
-          <div
-            aria-label="Отфильтрованные активы"
-            className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5"
-          >
-            {filteredPairs.map((pair) => {
-              const isSelected = pair.symbol === symbol;
-              return (
-                <div
-                  key={pair.symbol}
-                  className={`inline-flex items-center rounded-xl border shrink-0 transition-colors ${
-                    isSelected
-                      ? 'border-emerald-500/45 bg-emerald-500/12 text-white'
-                      : 'border-white/8 bg-[#0B0F17] text-slate-300 hover:border-white/20 hover:text-white'
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSymbol(pair.symbol);
-                      setActiveResult(null);
-                    }}
-                    className="min-h-[34px] pl-2.5 pr-1.5 inline-flex items-center gap-2 text-xs font-mono tabular-nums whitespace-nowrap"
-                  >
-                    <span className="font-sans font-semibold">{pair.baseAsset}</span>
-                    {pair.price !== null && (
-                      <FlashValue value={pair.price} className="text-slate-200">{formatUsd(pair.price)}</FlashValue>
-                    )}
-                    {pair.change24hPct !== null && (
-                      <span
-                        className={`text-[11px] font-semibold ${
-                          pair.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                        }`}
-                      >
-                        {pair.change24hPct >= 0 ? '+' : ''}
-                        {pair.change24hPct}%
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => toggleFavoriteSymbol(pair.symbol)}
-                    aria-label={
-                      pair.isFavorite
-                        ? `Убрать ${pair.baseAsset} из любимых`
-                        : `Добавить ${pair.baseAsset} в любимые`
-                    }
-                    className="min-h-[34px] pr-2 pl-1 inline-flex items-center justify-center text-slate-500 hover:text-amber-300 transition-colors"
-                  >
-                    <Star
-                      className={`w-3 h-3 ${
-                        pair.isFavorite ? 'fill-amber-400 text-amber-300' : ''
-                      }`}
-                    />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-[#0B0F17] px-3 py-2 text-xs text-slate-400">
-            <span>Список «Любимые» пуст — отметьте звёздочкой нужные активы.</span>
-            <button
-              type="button"
-              onClick={() => setAssetFilter('all')}
-              className="text-emerald-300 hover:text-emerald-200 font-medium whitespace-nowrap"
+        {/* Virtualized Horizontal Filtered Asset Strip with Framer Motion Skeleton */}
+        <AnimatePresence mode="wait">
+          {loadingOverview ? (
+            <motion.div
+              key="asset-strip-skeleton"
+              variants={skeletonSwapVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
             >
-              Показать все →
-            </button>
-          </div>
-        )}
-      </div>
+              <AssetStripSkeleton />
+            </motion.div>
+          ) : filteredPairs.length > 0 ? (
+            <motion.div
+              key={`asset-strip-content-${assetFilter}-${assetSort}-${normalizedSearch}`}
+              variants={skeletonSwapVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+            >
+              <VirtualizedAssetStrip
+                items={filteredPairs}
+                selectedSymbol={symbol}
+                marketType={marketType}
+                priceAlerts={priceAlerts}
+                visibleColumns={visibleColumns}
+                onSelectSymbol={(nextSymbol) => {
+                  setSymbol(nextSymbol);
+                  setActiveResult(null);
+                }}
+                onToggleFavorite={toggleFavoriteSymbol}
+                onNotifyAsset={openNotifyForAsset}
+              />
+            </motion.div>
+          ) : (
+            <motion.div
+              key="asset-strip-empty"
+              variants={skeletonSwapVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-[#0B0F17] px-3 py-2 text-xs text-slate-400"
+            >
+              <span>
+                {normalizedSearch
+                  ? `В текущей вкладке фильтра по запросу «${searchQuery.trim()}» совпадений нет.`
+                  : 'Список «Любимые» пуст — отметьте звёздочкой нужные активы.'}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (normalizedSearch && assetFilter !== 'all') {
+                    setAssetFilter('all');
+                  } else if (normalizedSearch) {
+                    setSearchQuery('');
+                  } else {
+                    setAssetFilter('all');
+                  }
+                }}
+                className="text-emerald-300 hover:text-emerald-200 font-medium whitespace-nowrap"
+              >
+                {normalizedSearch && assetFilter === 'all' ? 'Сбросить поиск →' : 'Показать все →'}
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.div>
 
       <WorkspaceShell
         title="Рынок и терминал"
@@ -911,21 +1499,28 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
             {/* Asset Header */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/8">
               <div>
-                <div className="flex items-center gap-2 text-xs text-slate-400">
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
                   <span>{marketType === 'futures' ? 'Фьючерсы USDT-M' : 'Спот'}</span>
                   <span aria-hidden="true">·</span>
                   <span className="inline-flex items-center gap-1.5">
                     {dataSource === 'live' && <span className="live-dot" aria-hidden="true" />}
                     {dataSource === 'live' ? 'Живой поток' : 'Резерв'}
+                    {lastMarketUpdatedAt && (
+                      <span className="font-mono text-[11px] text-slate-500">
+                        {new Date(lastMarketUpdatedAt).toLocaleTimeString('ru-RU', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        })}
+                      </span>
+                    )}
                   </span>
                   <span aria-hidden="true">·</span>
                   <span className="font-mono">{timeframe.toUpperCase()}</span>
                 </div>
                 <div className="mt-0.5 flex items-baseline gap-2.5">
                   <h2 className="text-xl sm:text-2xl font-bold text-white font-mono tabular-nums">
-                    <FlashValue value={indicators?.lastPrice ?? activeTicker?.price}>
-                      {indicators ? formatUsd(indicators.lastPrice) : activeTicker ? formatUsd(activeTicker.price) : '—'}
-                    </FlashValue>
+                    {indicators ? formatUsd(indicators.lastPrice) : activeTicker ? formatUsd(activeTicker.price) : '—'}
                   </h2>
                   {activeTicker && (
                     <span
@@ -1017,7 +1612,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => void loadMarketData()}
+                  onClick={() => void loadMarketData({ showOverviewSkeleton: true, forceRefresh: true })}
                   disabled={loadingChart}
                   className="min-h-[34px] min-w-[34px] px-2 rounded-lg border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 flex items-center justify-center transition-colors"
                   aria-label="Обновить график"
@@ -1047,18 +1642,43 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   className="overflow-hidden"
                 >
                   <div className="mt-3 rounded-xl border border-cyan-500/20 bg-[#0B0F17]/90 p-3 space-y-2.5">
+                    {!isPro && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs">
+                        <span className="text-amber-200 inline-flex items-center gap-1.5">
+                          <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          <span>
+                            На тарифе Free активна стандартная лента EMA 8·13·21·55. Кастомные периоды и SMA — в PRO.
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={onUpgradePro}
+                          className="text-amber-300 hover:text-amber-200 font-semibold whitespace-nowrap inline-flex items-center gap-1"
+                        >
+                          <Crown className="w-3.5 h-3.5" />
+                          <span>Открыть PRO</span>
+                        </button>
+                      </div>
+                    )}
+
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="inline-flex p-0.5 rounded-lg bg-[#111827] border border-white/8 text-xs">
                         {(['EMA', 'SMA'] as RibbonType[]).map((typeOption) => (
                           <button
                             key={typeOption}
                             type="button"
-                            onClick={() => setRibbonType(typeOption)}
+                            onClick={() => {
+                              if (!isPro) {
+                                onUpgradePro();
+                                return;
+                              }
+                              setRibbonType(typeOption);
+                            }}
                             className={`min-h-[28px] px-3 rounded-md font-mono font-semibold transition-colors ${
                               ribbonType === typeOption
                                 ? 'bg-cyan-500 text-slate-950'
                                 : 'text-slate-400 hover:text-slate-200'
-                            }`}
+                            } ${!isPro && typeOption !== ribbonType ? 'opacity-60' : ''}`}
                           >
                             {typeOption}
                           </button>
@@ -1075,6 +1695,10 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                               key={preset.id}
                               type="button"
                               onClick={() => {
+                                if (!isPro) {
+                                  onUpgradePro();
+                                  return;
+                                }
                                 setRibbonType(preset.type);
                                 setRibbonPeriods(preset.periods);
                               }}
@@ -1082,7 +1706,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                                 isSame
                                   ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
                                   : 'border-white/8 bg-white/5 text-slate-300 hover:bg-white/10'
-                              }`}
+                              } ${!isPro && !isSame ? 'opacity-65' : ''}`}
                             >
                               {preset.label}
                             </button>
@@ -1108,10 +1732,11 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                             type="number"
                             min={2}
                             max={200}
+                            disabled={!isPro}
                             aria-label={`Период ${ribbonType} ${idx + 1}`}
                             value={ribbonPeriods[idx]}
                             onChange={(e) => handleUpdateRibbonPeriod(idx, Number(e.target.value))}
-                            className="w-14 rounded-md border border-white/10 bg-[#0B0F17] px-1.5 py-0.5 text-right font-mono text-xs text-white focus:border-cyan-400 focus:outline-none"
+                            className="w-14 rounded-md border border-white/10 bg-[#0B0F17] px-1.5 py-0.5 text-right font-mono text-xs text-white focus:border-cyan-400 focus:outline-none disabled:opacity-55"
                           />
                         </label>
                       ))}
@@ -1176,7 +1801,11 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
             {/* Quantitative Telemetry Strip */}
             {indicators && (
               <div className="mt-3 pt-3 border-t border-white/8 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                <div>
+                <div
+                  key={`tel-trend-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                  style={{ '--stagger-idx': 0 } as React.CSSProperties}
+                  className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17]/70 border border-white/6 px-3 py-2"
+                >
                   <div className="text-slate-400">Тренд</div>
                   <div
                     className={`mt-0.5 font-semibold font-mono ${
@@ -1194,19 +1823,31 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                         : 'Боковик'}
                   </div>
                 </div>
-                <div>
+                <div
+                  key={`tel-rsi-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                  style={{ '--stagger-idx': 1 } as React.CSSProperties}
+                  className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17]/70 border border-white/6 px-3 py-2"
+                >
                   <div className="text-slate-400">RSI (14) / ATR%</div>
                   <div className="mt-0.5 font-mono tabular-nums text-white font-semibold">
                     {indicators.rsi14.toFixed(1)} · {indicators.volatilityPct}%
                   </div>
                 </div>
-                <div>
+                <div
+                  key={`tel-sr-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                  style={{ '--stagger-idx': 2 } as React.CSSProperties}
+                  className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17]/70 border border-white/6 px-3 py-2"
+                >
                   <div className="text-slate-400">Поддержка / Сопр.</div>
                   <div className="mt-0.5 font-mono tabular-nums text-slate-200">
                     {formatUsd(indicators.supportLevel)} / {formatUsd(indicators.resistanceLevel)}
                   </div>
                 </div>
-                <div>
+                <div
+                  key={`tel-fund-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                  style={{ '--stagger-idx': 3 } as React.CSSProperties}
+                  className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17]/70 border border-white/6 px-3 py-2"
+                >
                   <div className="text-slate-400">
                     {marketType === 'futures' ? 'Funding / OI' : 'MACD'}
                   </div>
@@ -1248,9 +1889,16 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
               {/* Left Form */}
               <div className="lg:col-span-6 space-y-4">
                 <div className="space-y-1.5">
-                  <label htmlFor="strategy-select" className="block text-xs font-medium text-slate-300">
-                    Стратегия
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label htmlFor="strategy-select" className="block text-xs font-medium text-slate-300">
+                      Стратегия
+                    </label>
+                    <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                      {isPro
+                        ? `PRO (${profile?.creditsRemaining ?? 0}/${PRO_MONTHLY_QUOTA} кр.) · ${requiredCredits} кр./анализ`
+                        : `Стоимость: ${requiredCredits} ${requiredCredits === 1 ? 'кредит' : 'кредита'} · Сигналов сегодня: ${todayStrategySignalsUsed}/${FREE_DAILY_SIGNAL_LIMIT}`}
+                    </span>
+                  </div>
                   <select
                     id="strategy-select"
                     value={activeStrategy?.key || ''}
@@ -1258,7 +1906,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                       const found = filteredStrategies.find((s) => s.key === e.target.value);
                       if (found) {
                         setStrategyKey(found.key);
-                        setLeverage(found.defaultLeverage);
+                        setLeverage(
+                          found.marketType === 'spot'
+                            ? 1
+                            : isPro
+                              ? found.defaultLeverage
+                              : Math.min(FREE_MAX_LEVERAGE, found.defaultLeverage)
+                        );
                         setRiskPct(found.defaultRiskPct);
                       }
                     }}
@@ -1266,12 +1920,45 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   >
                     {filteredStrategies.map((s) => (
                       <option key={s.key} value={s.key}>
+                        {s.tier === 'pro' && !isPro ? '[PRO] ' : ''}
                         {s.name} ({s.riskProfile})
                       </option>
                     ))}
                   </select>
                   {activeStrategy && (
-                    <p className="text-xs text-slate-400 leading-relaxed">{activeStrategy.rulesSummary}</p>
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      {activeStrategy.rulesSummary}{' '}
+                      <span className="text-slate-500">· Горизонт: {activeStrategy.expectedHorizon}.</span>
+                    </p>
+                  )}
+                  {isExpiredPro && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      <span>
+                        Срок подписки PRO истёк ({formatProUntilDate(profile?.proUntil)}). Активны ограничения Free.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={onUpgradePro}
+                        className="font-semibold text-amber-300 hover:underline whitespace-nowrap"
+                      >
+                        Продлить PRO →
+                      </button>
+                    </div>
+                  )}
+                  {isSelectedStrategyLocked && (
+                    <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        <span>Алгоритм «{activeStrategy?.name}» доступен только в PRO-подписке.</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={onUpgradePro}
+                        className="font-semibold text-amber-300 hover:underline whitespace-nowrap"
+                      >
+                        Открыть PRO →
+                      </button>
+                    </div>
                   )}
                 </div>
 
@@ -1308,55 +1995,130 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                 </div>
 
                 {marketType === 'futures' && (
-                  <div>
-                    <div className="flex items-center justify-between text-xs mb-1">
-                      <span className="text-slate-400">Кредитное плечо (Futures)</span>
-                      <span className="font-mono font-semibold text-amber-400">{leverage}x</span>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">
+                        Кредитное плечо (Futures){!isPro ? ` · Free до ${FREE_MAX_LEVERAGE}x` : ''}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-semibold text-amber-400">{leverage}x</span>
+                        {!isPro && (
+                          <button
+                            type="button"
+                            onClick={onUpgradePro}
+                            className="text-[11px] font-medium text-amber-300 hover:underline"
+                          >
+                            PRO до 20x
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <input
                       type="range"
                       min={1}
-                      max={20}
-                      value={leverage}
+                      max={isPro ? 20 : FREE_MAX_LEVERAGE}
+                      value={Math.min(isPro ? 20 : FREE_MAX_LEVERAGE, leverage)}
                       onChange={(e) => setLeverage(Number(e.target.value))}
                       className="w-full accent-amber-500"
                     />
                   </div>
                 )}
 
-                {analysisError && (
+                {analysisError && !hasReachedCreditsLimit && !hasReachedFreeDailyLimit && (
                   <div className="flex items-start gap-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">
                     <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                     <span>{analysisError}</span>
                   </div>
                 )}
 
-                <motion.button
-                  type="button"
-                  whileTap={{ scale: 0.98 }}
-                  onClick={() => void handleRunAnalysis()}
-                  disabled={analyzing}
-                  className="w-full min-h-[46px] rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:via-teal-500 hover:to-cyan-500 disabled:opacity-60 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-950/50"
-                >
-                  <Activity className={`w-4 h-4 ${analyzing ? 'animate-spin' : ''}`} />
-                  <span>
-                    {analyzing
-                      ? 'Анализируем график и новости...'
-                      : profile?.plan === 'pro'
-                        ? 'Запустить полный PRO-анализ'
-                        : 'Проверить рынок (1 кредит)'}
-                  </span>
-                </motion.button>
+                {isSelectedStrategyLocked ? (
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.98 }}
+                    onClick={onUpgradePro}
+                    className="cta-shimmer w-full min-h-[46px] rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold flex items-center justify-center gap-2 transition-colors shadow-md"
+                  >
+                    <Crown className="w-4 h-4" />
+                    <span>Открыть стратегию в PRO</span>
+                  </motion.button>
+                ) : hasReachedCreditsLimit ? (
+                  <div className="space-y-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3.5">
+                    <div className="flex items-start gap-2.5 text-xs text-amber-100 leading-relaxed">
+                      <Crown className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <div className="font-semibold text-amber-200">
+                          {isPro
+                            ? `Месячный пакет кредитов PRO исчерпан (${profile?.creditsRemaining ?? 0}/${PRO_MONTHLY_QUOTA})`
+                            : `Лимит бесплатных кредитов достигнут (${profile?.creditsRemaining ?? 0}/${totalCreditQuota})`}
+                        </div>
+                        <p className="text-amber-200/80">
+                          {isPro
+                            ? `Для запуска анализа требуется ${requiredCredits} кр. Продлите подписку PRO, чтобы сразу пополнить +${PRO_MONTHLY_QUOTA} кредитов.`
+                            : `Для этой операции нужно ${requiredCredits} кр. Перейдите на PRO: получите ${PRO_MONTHLY_QUOTA} кредитов в месяц, все ${STRATEGY_CATALOG.length} стратегий и снятие ограничений на количество сигналов в день.`}
+                        </p>
+                      </div>
+                    </div>
+                    <motion.button
+                      type="button"
+                      whileTap={{ scale: 0.98 }}
+                      onClick={onUpgradePro}
+                      className="cta-shimmer w-full min-h-[46px] rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold flex items-center justify-center gap-2 transition-colors shadow-md"
+                    >
+                      <Crown className="w-4 h-4" />
+                      <span>
+                        {isPro ? `Продлить PRO (+${PRO_MONTHLY_QUOTA} кр.)` : `Перейти на PRO (${PRO_MONTHLY_QUOTA} кр./мес.)`}
+                      </span>
+                    </motion.button>
+                  </div>
+                ) : hasReachedFreeDailyLimit ? (
+                  <div className="space-y-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3.5">
+                    <div className="flex items-start gap-2.5 text-xs text-amber-100 leading-relaxed">
+                      <Crown className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <div className="font-semibold text-amber-200">
+                          Дневной лимит Free исчерпан ({todayStrategySignalsUsed}/{FREE_DAILY_SIGNAL_LIMIT} сегодня)
+                        </div>
+                        <p className="text-amber-200/80">
+                          На бесплатном тарифе доступен 1 сигнал в сутки по каждой стратегии. Оформите PRO, чтобы снять дневной лимит сигналов и получить {PRO_MONTHLY_QUOTA} кредитов/мес.
+                        </p>
+                      </div>
+                    </div>
+                    <motion.button
+                      type="button"
+                      whileTap={{ scale: 0.98 }}
+                      onClick={onUpgradePro}
+                      className="cta-shimmer w-full min-h-[46px] rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-semibold flex items-center justify-center gap-2 transition-colors shadow-md"
+                    >
+                      <Crown className="w-4 h-4" />
+                      <span>Перейти на PRO · Снять дневной лимит</span>
+                    </motion.button>
+                  </div>
+                ) : (
+                  <motion.button
+                    type="button"
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => void handleRunAnalysis()}
+                    disabled={analyzing}
+                    className="w-full min-h-[46px] rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:via-teal-500 hover:to-cyan-500 disabled:opacity-60 text-white text-sm font-semibold flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-950/50"
+                  >
+                    <Activity className={`w-4 h-4 ${analyzing ? 'animate-spin' : ''}`} />
+                    <span>
+                      {analyzing
+                        ? 'Анализируем график и новости...'
+                        : isPro
+                          ? `Запустить PRO-анализ (${requiredCredits} кр.)`
+                          : `Проверить рынок (${requiredCredits} ${requiredCredits === 1 ? 'кредит' : 'кредита'})`}
+                    </span>
+                  </motion.button>
+                )}
               </div>
 
               {/* Right Verdict */}
               <div className="lg:col-span-6">
                 {activeResult ? (
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
-                    className="rounded-xl bg-[#0B0F17] border border-white/10 p-4 space-y-3.5"
+                  <div
+                    key={`verdict-${symbol}-${signalAnimVersion}`}
+                    className="signal-card-enter rounded-xl bg-[#0B0F17] border border-white/10 p-4 space-y-3.5"
                   >
                     <div className="flex items-center justify-between">
                       <div>
@@ -1384,27 +2146,42 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                     </div>
 
                     <div className="grid grid-cols-2 gap-2.5 text-xs font-mono tabular-nums">
-                      <div className="rounded-xl bg-[#111827] border border-white/8 p-2.5">
+                      <div
+                        style={{ '--stagger-idx': 0 } as React.CSSProperties}
+                        className="signal-card-enter signal-card-stagger rounded-xl bg-[#111827] border border-white/8 p-2.5"
+                      >
                         <div className="font-sans text-slate-400">Зона входа</div>
                         <div className="mt-1 text-white font-semibold">{activeResult.entryZone}</div>
                       </div>
-                      <div className="rounded-xl bg-[#111827] border border-white/8 p-2.5">
+                      <div
+                        style={{ '--stagger-idx': 1 } as React.CSSProperties}
+                        className="signal-card-enter signal-card-stagger rounded-xl bg-[#111827] border border-white/8 p-2.5"
+                      >
                         <div className="font-sans text-slate-400">Stop-Loss</div>
                         <div className="mt-1 text-rose-400 font-semibold">{activeResult.stopLoss}</div>
                       </div>
-                      <div className="rounded-xl bg-[#111827] border border-white/8 p-2.5">
+                      <div
+                        style={{ '--stagger-idx': 2 } as React.CSSProperties}
+                        className="signal-card-enter signal-card-stagger rounded-xl bg-[#111827] border border-white/8 p-2.5"
+                      >
                         <div className="font-sans text-slate-400">Цели Take-Profit</div>
                         <div className="mt-1 text-emerald-400 font-semibold">
                           {activeResult.takeProfits.join(' / ')}
                         </div>
                       </div>
-                      <div className="rounded-xl bg-[#111827] border border-white/8 p-2.5">
+                      <div
+                        style={{ '--stagger-idx': 3 } as React.CSSProperties}
+                        className="signal-card-enter signal-card-stagger rounded-xl bg-[#111827] border border-white/8 p-2.5"
+                      >
                         <div className="font-sans text-slate-400">Риск / Прибыль</div>
                         <div className="mt-1 text-amber-300 font-semibold">{activeResult.riskReward}</div>
                       </div>
                     </div>
 
-                    <div className="rounded-xl bg-[#111827] border border-white/8 p-3 text-xs space-y-1">
+                    <div
+                      style={{ '--stagger-idx': 4 } as React.CSSProperties}
+                      className="signal-card-enter signal-card-stagger rounded-xl bg-[#111827] border border-white/8 p-3 text-xs space-y-1"
+                    >
                       <div className="flex items-center justify-between text-slate-300">
                         <span>Объем позиции:</span>
                         <strong className="font-mono text-white">${activeResult.riskMetrics.positionSizeUsdt} USDT</strong>
@@ -1429,7 +2206,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                       <strong className="text-slate-200">Условие отмены: </strong>
                       {activeResult.invalidationRule}
                     </div>
-                  </motion.div>
+                  </div>
                 ) : (
                   <div className="rounded-xl bg-[#0B0F17] border border-white/8 p-6 text-center space-y-2">
                     <Bot className="w-8 h-8 text-cyan-400 mx-auto" />
@@ -1444,103 +2221,137 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
           </div>
         )}
 
-        {marketSection === 'depth' && <OrderBookPanel symbol={symbol} marketType={marketType} />}
+        {marketSection === 'depth' && (
+          <OrderBookPanel
+            symbol={symbol}
+            marketType={marketType}
+            isPro={isPro}
+            onUpgradePro={onUpgradePro}
+          />
+        )}
 
         {marketSection === 'oscillators' && (
-          indicators ? (
-            <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                  <Gauge className="w-4 h-4 text-emerald-400" />
-                  <span>Матрица осцилляторов и ключевых уровней ({symbol})</span>
-                </h3>
-                <span className="text-xs text-slate-400 font-mono">{timeframe.toUpperCase()}</span>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-                <div className="rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Индекс RSI (14)</span>
-                    <span
-                      className={`font-mono font-bold ${
-                        indicators.rsi14 >= 70
-                          ? 'text-rose-400'
-                          : indicators.rsi14 <= 30
-                            ? 'text-emerald-400'
-                            : 'text-cyan-300'
-                      }`}
-                    >
-                      {indicators.rsi14.toFixed(1)}
-                    </span>
-                  </div>
-                  <div className="h-2 rounded-full bg-white/8 overflow-hidden relative">
-                    <motion.div
-                      initial={false}
-                      animate={{ width: `${Math.min(100, Math.max(4, indicators.rsi14))}%` }}
-                      transition={{ duration: 0.35 }}
-                      className={`h-full rounded-full ${
-                        indicators.rsi14 >= 70
-                          ? 'bg-rose-500'
-                          : indicators.rsi14 <= 30
-                            ? 'bg-emerald-500'
-                            : 'bg-gradient-to-r from-emerald-400 via-cyan-400 to-amber-400'
-                      }`}
-                    />
-                  </div>
-                  <div className="text-[11px] text-slate-500">
-                    {indicators.rsi14 >= 70
-                      ? 'Зона перекупленности (риск коррекции)'
-                      : indicators.rsi14 <= 30
-                        ? 'Зона перепроданности (поиск отскока)'
-                        : 'Нейтральный импульс (30–70)'}
-                  </div>
+          <AnimatePresence mode="wait">
+            {!indicators || loadingChart ? (
+              <motion.div
+                key="osc-skeleton"
+                variants={skeletonSwapVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+              >
+                <OscillatorsSkeleton />
+              </motion.div>
+            ) : (
+              <motion.div
+                key={`osc-content-${symbol}-${timeframe}`}
+                variants={skeletonSwapVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+                className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4"
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                    <Gauge className="w-4 h-4 text-emerald-400" />
+                    <span>Матрица осцилляторов и ключевых уровней ({symbol})</span>
+                  </h3>
+                  <span className="text-xs text-slate-400 font-mono">{timeframe.toUpperCase()}</span>
                 </div>
 
-                <div className="rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Позиция в Bollinger %B</span>
-                    <span className="font-mono font-bold text-slate-100">{bbPercentB}%</span>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                  <div
+                    key={`osc-rsi-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                    style={{ '--stagger-idx': 0 } as React.CSSProperties}
+                    className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Индекс RSI (14)</span>
+                      <span
+                        className={`font-mono font-bold ${
+                          indicators.rsi14 >= 70
+                            ? 'text-rose-400'
+                            : indicators.rsi14 <= 30
+                              ? 'text-emerald-400'
+                              : 'text-cyan-300'
+                        }`}
+                      >
+                        {indicators.rsi14.toFixed(1)}
+                      </span>
+                    </div>
+                    <div className="h-2 rounded-full bg-white/8 overflow-hidden relative">
+                      <motion.div
+                        initial={false}
+                        animate={{ width: `${Math.min(100, Math.max(4, indicators.rsi14))}%` }}
+                        transition={{ duration: 0.35 }}
+                        className={`h-full rounded-full ${
+                          indicators.rsi14 >= 70
+                            ? 'bg-rose-500'
+                            : indicators.rsi14 <= 30
+                              ? 'bg-emerald-500'
+                              : 'bg-gradient-to-r from-emerald-400 via-cyan-400 to-amber-400'
+                        }`}
+                      />
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {indicators.rsi14 >= 70
+                        ? 'Зона перекупленности (риск коррекции)'
+                        : indicators.rsi14 <= 30
+                          ? 'Зона перепроданности (поиск отскока)'
+                          : 'Нейтральный импульс (30–70)'}
+                    </div>
                   </div>
-                  <div className="h-2 rounded-full bg-white/8 overflow-hidden">
-                    <motion.div
-                      initial={false}
-                      animate={{ width: `${Math.max(4, bbPercentB)}%` }}
-                      transition={{ duration: 0.35 }}
-                      className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-400"
-                    />
-                  </div>
-                  <div className="flex items-center justify-between text-[11px] font-mono text-slate-500">
-                    <span>Ниж. {formatUsd(indicators.bbLower)}</span>
-                    <span>Верх. {formatUsd(indicators.bbUpper)}</span>
-                  </div>
-                </div>
 
-                <div className="rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Дистанция до EMA(200)</span>
-                    <span
-                      className={`font-mono font-bold ${
-                        ema200DeltaPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                      }`}
-                    >
-                      {ema200DeltaPct >= 0 ? '+' : ''}
-                      {ema200DeltaPct}%
-                    </span>
+                  <div
+                    key={`osc-bb-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                    style={{ '--stagger-idx': 1 } as React.CSSProperties}
+                    className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Позиция в Bollinger %B</span>
+                      <span className="font-mono font-bold text-slate-100">{bbPercentB}%</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-white/8 overflow-hidden">
+                      <motion.div
+                        initial={false}
+                        animate={{ width: `${Math.max(4, bbPercentB)}%` }}
+                        transition={{ duration: 0.35 }}
+                        className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-400"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-500">
+                      <span>Ниж. {formatUsd(indicators.bbLower)}</span>
+                      <span>Верх. {formatUsd(indicators.bbUpper)}</span>
+                    </div>
                   </div>
-                  <div className="text-xs font-mono text-slate-200">EMA 200: {formatUsd(indicators.ema200)}</div>
-                  <div className="text-[11px] text-slate-500">
-                    {ema200DeltaPct >= 0
-                      ? 'Цена выше долгосрочного тренда EMA 200'
-                      : 'Цена под давлением долгосрочной EMA 200'}
+
+                  <div
+                    key={`osc-ema-${symbol}-${timeframe}-${telemetryAnimVersion}`}
+                    style={{ '--stagger-idx': 2 } as React.CSSProperties}
+                    className="signal-card-enter signal-card-stagger rounded-xl bg-[#0B0F17] border border-white/8 p-4 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">Дистанция до EMA(200)</span>
+                      <span
+                        className={`font-mono font-bold ${
+                          ema200DeltaPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {ema200DeltaPct >= 0 ? '+' : ''}
+                        {ema200DeltaPct}%
+                      </span>
+                    </div>
+                    <div className="text-xs font-mono text-slate-200">EMA 200: {formatUsd(indicators.ema200)}</div>
+                    <div className="text-[11px] text-slate-500">
+                      {ema200DeltaPct >= 0
+                        ? 'Цена выше долгосрочного тренда EMA 200'
+                        : 'Цена под давлением долгосрочной EMA 200'}
+                    </div>
                   </div>
                 </div>
-              </div>
-            </div>
-          ) : (
-            <div className="rounded-2xl border border-white/8 bg-[#111827] p-6 text-xs text-slate-400">
-              Загружаем осцилляторы для {symbol}...
-            </div>
-          )
+              </motion.div>
+            )}
+          </AnimatePresence>
         )}
 
         {marketSection === 'sentiment' && (
@@ -1594,7 +2405,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   pairsSub === 'list' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Обзор 10 пар
+                Обзор пар ({filteredPairs.length})
               </button>
               <button
                 type="button"
@@ -1609,110 +2420,147 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
 
             {pairsSub === 'list' ? (
               <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow overflow-hidden">
-                <div className="px-5 py-3.5 border-b border-white/8 flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="text-sm font-semibold text-white">
-                    {filterMeta.find((f) => f.id === assetFilter)?.label ?? 'Ликвидные пары'} ·{' '}
-                    {marketType === 'futures' ? 'Фьючерсы' : 'Спот'} ({filteredPairs.length})
-                  </h3>
-                  <span className="text-xs text-slate-400">Клик откроет график</span>
-                </div>
-                {filteredPairs.length === 0 ? (
-                  <div className="p-6 text-center space-y-2">
-                    <p className="text-xs text-slate-400">
-                      В категории «Любимые» пока нет выбранных активов.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => setAssetFilter('all')}
-                      className="min-h-[36px] px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition-colors"
-                    >
-                      Показать все пары
-                    </button>
+                <div className="px-4 sm:px-5 py-3 border-b border-white/8 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold text-white">
+                      {filterMeta.find((f) => f.id === assetFilter)?.label ?? 'Ликвидные пары'} ·{' '}
+                      {marketType === 'futures' ? 'Фьючерсы' : 'Спот'} ({filteredPairs.length})
+                    </h3>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-slate-400 hidden sm:inline">Клик откроет график</span>
+                      <ColumnSelectorMenu columns={visibleColumns} onChange={setVisibleColumns} />
+                      <motion.button
+                        type="button"
+                        whileTap={{ scale: 0.94 }}
+                        onClick={() => void loadMarketData({ showOverviewSkeleton: true, forceRefresh: true })}
+                        disabled={loadingOverview}
+                        aria-label="Обновить таблицу пар"
+                        className="min-h-[34px] px-2.5 rounded-xl border border-white/10 bg-[#0B0F17] text-xs text-slate-300 hover:text-white inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3 h-3 ${loadingOverview ? 'animate-spin' : ''}`} />
+                        <span>Обновить</span>
+                      </motion.button>
+                    </div>
                   </div>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="border-b border-white/8 text-slate-400">
-                          <th className="py-2.5 px-3 font-medium w-10 text-center">Избр.</th>
-                          <th className="py-2.5 px-3 font-medium">Пара</th>
-                          <th className="py-2.5 px-3 font-medium text-right">Цена</th>
-                          <th className="py-2.5 px-3 font-medium text-right">24ч %</th>
-                          <th className="py-2.5 px-3 font-medium text-right hidden sm:table-cell">Объем 24ч</th>
-                          {marketType === 'futures' && (
-                            <th className="py-2.5 px-4 font-medium text-right">Funding</th>
-                          )}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-white/6 font-mono tabular-nums">
-                        {filteredPairs.map((t) => {
-                          const isSelected = t.symbol === symbol;
-                          return (
-                            <tr
-                              key={t.symbol}
-                              onClick={() => {
-                                setSymbol(t.symbol);
-                                setActiveResult(null);
-                                setMarketSection('chart');
-                              }}
-                              className={`cursor-pointer transition-colors ${
-                                isSelected ? 'bg-emerald-500/10' : 'hover:bg-white/[0.03]'
+
+                  {/* Quick Filters Bar directly above the pairs list */}
+                  <LayoutGroup id="market-pairs-quick-filter-group">
+                    <div
+                      role="tablist"
+                      aria-label="Быстрые фильтры списка пар"
+                      className="flex items-center gap-1 overflow-x-auto no-scrollbar"
+                    >
+                      {filterMeta.map((item) => {
+                        const isActive = assetFilter === item.id;
+                        return (
+                          <motion.button
+                            key={item.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={isActive}
+                            whileTap={{ scale: 0.96 }}
+                            onClick={() => setAssetFilter(item.id)}
+                            className={`relative min-h-[34px] px-2.5 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                              isActive
+                                ? 'text-white'
+                                : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
+                            }`}
+                          >
+                            {isActive && (
+                              <motion.span
+                                layoutId="market-pairs-quick-filter-pill"
+                                transition={NATIVE_PILL_SPRING}
+                                className="absolute inset-0 rounded-xl border border-emerald-400/40 bg-emerald-500/15"
+                              />
+                            )}
+                            <span
+                              className={`relative z-10 inline-flex shrink-0 ${
+                                item.id === 'favorites' && isActive
+                                  ? 'text-amber-300'
+                                  : item.id === 'volatile' || item.id === 'new_listings'
+                                    ? isActive
+                                      ? 'text-cyan-300'
+                                      : ''
+                                    : ''
                               }`}
                             >
-                              <td className="py-2.5 px-3 text-center">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    toggleFavoriteSymbol(t.symbol);
-                                  }}
-                                  aria-label={
-                                    t.isFavorite
-                                      ? `Убрать ${t.baseAsset} из любимых`
-                                      : `Добавить ${t.baseAsset} в любимые`
-                                  }
-                                  className="inline-flex items-center justify-center w-7 h-7 rounded-lg hover:bg-white/8 text-slate-400 hover:text-amber-300 transition-colors"
-                                >
-                                  <Star
-                                    className={`w-3.5 h-3.5 ${
-                                      t.isFavorite ? 'fill-amber-400 text-amber-300' : ''
-                                    }`}
-                                  />
-                                </button>
-                              </td>
-                              <td className="py-2.5 px-3 font-sans">
-                                <span className="font-semibold text-white">{t.baseAsset}</span>
-                                <span className="text-slate-500"> / USDT</span>
-                              </td>
-                              <td className="py-2.5 px-3 text-right text-slate-100">
-                                {t.price !== null ? formatUsd(t.price) : '—'}
-                              </td>
-                              <td
-                                className={`py-2.5 px-3 text-right font-medium ${
-                                  (t.change24hPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                                }`}
-                              >
-                                {t.change24hPct !== null
-                                  ? `${t.change24hPct >= 0 ? '+' : ''}${t.change24hPct}%`
-                                  : '—'}
-                              </td>
-                              <td className="py-2.5 px-3 text-right text-slate-400 hidden sm:table-cell">
-                                {t.volume24hUsdt > 0
-                                  ? `$${(t.volume24hUsdt / 1_000_000).toFixed(1)}M`
-                                  : '—'}
-                              </td>
-                              {marketType === 'futures' && (
-                                <td className="py-2.5 px-4 text-right text-amber-300">
-                                  {(t.fundingRatePct ?? 0.01).toFixed(4)}%
-                                </td>
-                              )}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                              {item.icon}
+                            </span>
+                            <span className="relative z-10">{item.label}</span>
+                            <span className="relative z-10 font-mono tabular-nums text-[11px] text-slate-400">
+                              {item.count}
+                            </span>
+                          </motion.button>
+                        );
+                      })}
+                    </div>
+                  </LayoutGroup>
+                </div>
+
+                <AnimatePresence mode="wait">
+                  {loadingOverview ? (
+                    <motion.div
+                      key="pairs-list-skeleton"
+                      variants={skeletonSwapVariants}
+                      initial="initial"
+                      animate="animate"
+                      exit="exit"
+                    >
+                      <PairsListSkeleton />
+                    </motion.div>
+                  ) : filteredPairs.length === 0 ? (
+                    <motion.div
+                      key="pairs-list-empty"
+                      variants={skeletonSwapVariants}
+                      initial="initial"
+                      animate="animate"
+                      exit="exit"
+                      className="p-6 text-center space-y-2"
+                    >
+                      <p className="text-xs text-slate-400">
+                        {normalizedSearch
+                          ? `По запросу «${searchQuery.trim()}» в этой категории активы не найдены.`
+                          : 'В категории «Любимые» пока нет выбранных активов.'}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (normalizedSearch && assetFilter === 'all') {
+                            setSearchQuery('');
+                          } else {
+                            setAssetFilter('all');
+                          }
+                        }}
+                        className="min-h-[36px] px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition-colors"
+                      >
+                        {normalizedSearch && assetFilter === 'all' ? 'Сбросить поиск' : 'Показать все пары'}
+                      </button>
+                    </motion.div>
+                  ) : (
+                    <motion.div
+                      key={`pairs-list-content-${assetFilter}-${assetSort}-${marketType}-${normalizedSearch}`}
+                      variants={skeletonSwapVariants}
+                      initial="initial"
+                      animate="animate"
+                      exit="exit"
+                    >
+                      <VirtualizedPairsList
+                        items={filteredPairs}
+                        selectedSymbol={symbol}
+                        marketType={marketType}
+                        priceAlerts={priceAlerts}
+                        visibleColumns={visibleColumns}
+                        onOpenChart={(nextSymbol) => {
+                          setSymbol(nextSymbol);
+                          setActiveResult(null);
+                          setMarketSection('chart');
+                        }}
+                        onToggleFavorite={toggleFavoriteSymbol}
+                        onNotifyAsset={openNotifyForAsset}
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             ) : (
               <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5">
@@ -1729,11 +2577,12 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                     Запустите первый анализ графика и новостей в разделе «AI-анализ и риск» — сохранённые сигналы появятся здесь.
                   </p>
                 ) : (
-                  <div className="divide-y divide-white/8">
-                    {analyses.slice(0, 10).map((item) => (
+                  <div className="space-y-2">
+                    {analyses.slice(0, 10).map((item, idx) => (
                       <button
-                        key={item.id}
+                        key={`${item.id}-${analysesAnimVersion}`}
                         type="button"
+                        style={{ '--stagger-idx': idx } as React.CSSProperties}
                         onClick={() => {
                           setSymbol(item.symbol);
                           setMarketType(item.marketType);
@@ -1760,9 +2609,10 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                               estimatedLiquidationPrice: null,
                             },
                           });
+                          setSignalAnimVersion((v) => v + 1);
                           setMarketSection('ai');
                         }}
-                        className="w-full py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.02] transition-colors"
+                        className="signal-card-enter signal-card-stagger w-full rounded-xl border border-white/8 bg-[#0B0F17]/75 hover:bg-white/[0.04] hover:border-white/15 px-3.5 py-3 text-left flex items-center justify-between gap-3 transition-colors"
                       >
                         <div>
                           <div className="text-xs font-semibold text-white flex items-center gap-2">
@@ -1800,6 +2650,34 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
           </div>
         )}
       </WorkspaceShell>
+
+      <QuickAnswersCard
+        isSignedIn={isSignedIn}
+        userEmail={userEmail}
+        supportTickets={supportTickets}
+        onRequireLogin={onRequireLogin}
+        onCreateSupportTicket={onCreateSupportTicket}
+        onOpenPushSettings={onOpenPushSettings}
+        onOpenAiSection={() => setMarketSection('ai')}
+        onUpgradePro={onUpgradePro}
+        onOpenFullFaq={onOpenFullFaq}
+        onStartTour={onStartTour}
+      />
+
+      <QuickAssetAlertModal
+        open={Boolean(notifyAsset)}
+        target={notifyAsset}
+        marketType={marketType}
+        alerts={priceAlerts}
+        isSignedIn={isSignedIn}
+        pushSubscribed={pushSubscribed}
+        onClose={() => setNotifyAsset(null)}
+        onRequireLogin={onRequireLogin}
+        onOpenPushSettings={onOpenPushSettings}
+        onCreateAlert={onCreatePriceAlert}
+        onToggleAlert={onTogglePriceAlert}
+        onDeleteAlert={onDeletePriceAlert}
+      />
     </StaggerDeck>
   );
 };

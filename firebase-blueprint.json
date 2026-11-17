@@ -8,8 +8,9 @@
         "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
         "plan": { "type": "string", "enum": ["free", "pro"] },
-        "creditsRemaining": { "type": "integer" },
-        "weeklyQuota": { "type": "integer" },
+        "proUntil": { "type": "integer", "description": "PRO subscription expiration timestamp in Unix ms (set by billing server)." },
+        "creditsRemaining": { "type": "integer", "description": "Remaining analysis/backtest credits (Free max 15/week, PRO max 100/month)." },
+        "weeklyQuota": { "type": "integer", "description": "Weekly Free credit allowance (15 credits every 7 days)." },
         "nextResetAt": { "type": "string", "minLength": 10, "maxLength": 64 },
         "twoFactorEnabled": { "type": "boolean" },
         "autoLockMinutes": { "type": "integer" },
@@ -35,7 +36,7 @@
     },
     "StrategyConfig": {
       "title": "StrategyConfig",
-      "description": "User-configured Spot or Futures trading strategy parameters and PRO daily signal limit.",
+      "description": "User-configured Spot or Futures trading strategy parameters; dailySignalLimit=0 means unlimited for active PRO, Free is fixed at 1/day.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -44,7 +45,7 @@
         "strategyKey": { "type": "string", "minLength": 2, "maxLength": 64 },
         "name": { "type": "string", "minLength": 2, "maxLength": 120 },
         "enabled": { "type": "boolean" },
-        "dailySignalLimit": { "type": "integer" },
+        "dailySignalLimit": { "type": "integer", "description": "0 = unlimited (PRO only), 1 = Free daily limit, 1..100 = optional PRO threshold." },
         "minConfidence": { "type": "integer" },
         "riskPerTradePct": { "type": "number" },
         "leverage": { "type": "integer" },
@@ -106,6 +107,8 @@
         "auth": { "type": "string", "minLength": 10, "maxLength": 128 },
         "notifySignals": { "type": "boolean" },
         "notifyMarketMoves": { "type": "boolean" },
+        "notifyVolatilitySpikes": { "type": "boolean" },
+        "volatilityThresholdPct": { "type": "number" },
         "notifyNews": { "type": "boolean" },
         "notifyAuthLogins": { "type": "boolean" },
         "notifyStrategyChanges": { "type": "boolean" },
@@ -160,6 +163,23 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "symbol", "marketType", "condition", "targetPrice", "active", "triggeredAt", "triggeredPrice", "createdAt", "updatedAt"]
+    },
+    "SupportTicketRecord": {
+      "title": "SupportTicketRecord",
+      "description": "User-submitted support or feedback ticket persisted under the owner account.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "contactEmail": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "category": { "type": "string", "enum": ["alerts", "chart", "billing", "security", "other"] },
+        "subject": { "type": "string", "minLength": 3, "maxLength": 140 },
+        "message": { "type": "string", "minLength": 10, "maxLength": 2000 },
+        "status": { "type": "string", "enum": ["open", "resolved"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "contactEmail", "category", "subject", "message", "status", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -194,6 +214,10 @@
     "/users/{userId}/priceAlerts/{alertId}": {
       "schema": { "$ref": "#/entities/PriceAlertRecord" },
       "description": "User-defined pair price threshold alerts for background Web Push delivery."
+    },
+    "/users/{userId}/supportTickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicketRecord" },
+      "description": "User-submitted support and feedback tickets created from the terminal FAQ."
     }
   }
 }

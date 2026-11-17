@@ -19,6 +19,8 @@ export interface StoredPushEntry {
   subscription: PushSubscription;
   notifySignals: boolean;
   notifyMarketMoves: boolean;
+  notifyVolatilitySpikes: boolean;
+  volatilityThresholdPct: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
@@ -36,6 +38,7 @@ export interface PushNotificationPayload {
   category:
     | 'signal'
     | 'market'
+    | 'volatility_spike'
     | 'news'
     | 'auth_login'
     | 'strategy_change'
@@ -149,6 +152,7 @@ export async function dispatchPushToUser(
     if (item.uid !== uid || !item.enabled) return false;
     if (payload.category === 'signal') return item.notifySignals;
     if (payload.category === 'market') return item.notifyMarketMoves;
+    if (payload.category === 'volatility_spike') return item.notifyVolatilitySpikes;
     if (payload.category === 'news') return item.notifyNews;
     if (payload.category === 'auth_login') return item.notifyAuthLogins;
     if (payload.category === 'strategy_change') return item.notifyStrategyChanges;
@@ -171,17 +175,56 @@ export async function scanMarketAndNotify(): Promise<{
   summary: string;
 }> {
   const tickers = await getMarketOverview('futures');
-  const activeSubs = Array.from(subscriptionRegistry.values()).filter(
+  const activeMarketSubs = Array.from(subscriptionRegistry.values()).filter(
     (s) => s.enabled && s.notifyMarketMoves
+  );
+  const activeVolatilitySubs = Array.from(subscriptionRegistry.values()).filter(
+    (s) => s.enabled && s.notifyVolatilitySpikes
   );
   let alertsSent = 0;
   const triggeredSymbols: string[] = [];
+  const volatilitySymbols: string[] = [];
 
   for (const t of tickers) {
     const prevPrice = lastPriceSnapshot.get(t.symbol);
     lastPriceSnapshot.set(t.symbol, t.price);
 
     const deltaFromPrevPct = prevPrice ? ((t.price - prevPrice) / prevPrice) * 100 : 0;
+    const spark = t.sparkline24h;
+    const prevHourPrice = spark && spark.length >= 2 ? spark[spark.length - 2] : undefined;
+    const hourlyChangePct =
+      prevHourPrice && prevHourPrice > 0
+        ? ((t.price - prevHourPrice) / prevHourPrice) * 100
+        : deltaFromPrevPct;
+
+    // 1. Dedicated hourly volatility spike alerts (> threshold % per hour, default 5%)
+    for (const sub of activeVolatilitySubs) {
+      const threshold = Math.max(1, Math.min(25, sub.volatilityThresholdPct || 5));
+      const spikePct =
+        Math.abs(hourlyChangePct) >= Math.abs(deltaFromPrevPct) ? hourlyChangePct : deltaFromPrevPct;
+      if (Math.abs(spikePct) >= threshold) {
+        const volCooldownKey = `vol:${sub.uid}:${t.symbol}`;
+        const lastVolAlert = alertCooldowns.get(volCooldownKey) ?? 0;
+        if (Date.now() - lastVolAlert >= 30 * 60_000) {
+          alertCooldowns.set(volCooldownKey, Date.now());
+          const shortSym = t.symbol.replace('USDT', '');
+          if (!volatilitySymbols.includes(shortSym)) volatilitySymbols.push(shortSym);
+
+          const payload: PushNotificationPayload = {
+            title: `AegisQuant · Скачок волатильности ${t.baseAsset}/USDT (${spikePct >= 0 ? '+' : ''}${spikePct.toFixed(1)}% за 1ч)`,
+            body: `Аномальное движение ${t.baseAsset} ($${t.price.toLocaleString('en-US')}) превысило порог ±${threshold}% за час. Проверьте уровни и риски.`,
+            tag: `volatility-${t.symbol}`,
+            url: '/?tab=market',
+            impact: 'HIGH',
+            category: 'volatility_spike',
+          };
+          const ok = await dispatchPushToEntry(sub, payload);
+          if (ok) alertsSent += 1;
+        }
+      }
+    }
+
+    // 2. General market moves & Funding Rate alerts
     const isVolatilitySpike = Math.abs(deltaFromPrevPct) >= 1.1;
     const isStrong24hMove = Math.abs(t.change24hPct) >= 4.5;
     const isExtremeFunding =
@@ -208,19 +251,27 @@ export async function scanMarketAndNotify(): Promise<{
         category: 'market',
       };
 
-      for (const sub of activeSubs) {
+      for (const sub of activeMarketSubs) {
         const ok = await dispatchPushToEntry(sub, payload);
         if (ok) alertsSent += 1;
       }
     }
   }
 
+  const summaryParts: string[] = [];
+  if (volatilitySymbols.length > 0) {
+    summaryParts.push(`Скачки волатильности за 1ч: ${volatilitySymbols.join(', ')}`);
+  }
+  if (triggeredSymbols.length > 0) {
+    summaryParts.push(`Импульсы/Funding: ${triggeredSymbols.join(', ')}`);
+  }
+
   return {
     checkedPairs: tickers.length,
     alertsSent,
     summary:
-      triggeredSymbols.length > 0
-        ? `Обнаружены события по активам: ${triggeredSymbols.join(', ')}`
+      summaryParts.length > 0
+        ? summaryParts.join(' · ')
         : 'Резких аномалий на рынке не зафиксировано (рынок в норме).',
   };
 }

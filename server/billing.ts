@@ -210,6 +210,24 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
   });
 }
 
+// ---------- Чтение тарифа пользователя ----------
+
+export async function getUserPlanTier(uid: string): Promise<'free' | 'pro' | null> {
+  const db = getDb();
+  if (!db) return null;
+  try {
+    const snap = await db.collection('users').doc(uid).get();
+    if (!snap.exists) return null;
+    const data = snap.data() as { plan?: unknown; proUntil?: unknown };
+    if (data.plan === 'pro' && Number(data.proUntil || 0) > Date.now()) {
+      return 'pro';
+    }
+    return 'free';
+  } catch {
+    return null;
+  }
+}
+
 // ---------- Истечение подписки ----------
 
 /**
@@ -229,7 +247,7 @@ export async function downgradeExpiredPro(): Promise<number> {
       const credits = Number((docSnap.data() as { creditsRemaining?: unknown }).creditsRemaining) || 0;
       batch.update(docSnap.ref, {
         plan: 'free',
-        creditsRemaining: Math.min(10, credits),
+        creditsRemaining: Math.min(15, credits),
         updatedAt: FieldValue.serverTimestamp(),
       });
     }

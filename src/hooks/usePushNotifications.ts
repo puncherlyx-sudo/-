@@ -5,6 +5,8 @@ import { authFetch } from '../lib/authFetch';
 export interface PushPreferences {
   notifySignals: boolean;
   notifyMarketMoves: boolean;
+  notifyVolatilitySpikes: boolean;
+  volatilityThresholdPct: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
@@ -21,6 +23,8 @@ interface UsePushNotificationsParams {
     auth: string;
     notifySignals: boolean;
     notifyMarketMoves: boolean;
+    notifyVolatilitySpikes: boolean;
+    volatilityThresholdPct: number;
     notifyNews: boolean;
     notifyAuthLogins: boolean;
     notifyStrategyChanges: boolean;
@@ -75,6 +79,8 @@ export function usePushNotifications({
   const [preferences, setPreferences] = useState<PushPreferences>({
     notifySignals: true,
     notifyMarketMoves: true,
+    notifyVolatilitySpikes: true,
+    volatilityThresholdPct: 5,
     notifyNews: true,
     notifyAuthLogins: true,
     notifyStrategyChanges: true,
@@ -89,6 +95,11 @@ export function usePushNotifications({
       setPreferences({
         notifySignals: matched.notifySignals !== false,
         notifyMarketMoves: matched.notifyMarketMoves !== false,
+        notifyVolatilitySpikes: matched.notifyVolatilitySpikes !== false,
+        volatilityThresholdPct:
+          typeof matched.volatilityThresholdPct === 'number' && matched.volatilityThresholdPct >= 1
+            ? matched.volatilityThresholdPct
+            : 5,
         notifyNews: matched.notifyNews !== false,
         notifyAuthLogins: matched.notifyAuthLogins !== false,
         notifyStrategyChanges: matched.notifyStrategyChanges !== false,
@@ -127,6 +138,11 @@ export function usePushNotifications({
             ? {
                 notifySignals: saved.notifySignals !== false,
                 notifyMarketMoves: saved.notifyMarketMoves !== false,
+                notifyVolatilitySpikes: saved.notifyVolatilitySpikes !== false,
+                volatilityThresholdPct:
+                  typeof saved.volatilityThresholdPct === 'number' && saved.volatilityThresholdPct >= 1
+                    ? saved.volatilityThresholdPct
+                    : 5,
                 notifyNews: saved.notifyNews !== false,
                 notifyAuthLogins: saved.notifyAuthLogins !== false,
                 notifyStrategyChanges: saved.notifyStrategyChanges !== false,

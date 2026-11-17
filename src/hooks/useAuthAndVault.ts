@@ -5,6 +5,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocs,
   limit,
   onSnapshot,
   query,
@@ -14,7 +15,17 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { STRATEGY_CATALOG } from '../data/strategies';
+import {
+  CREDIT_COSTS,
+  FREE_DAILY_SIGNAL_LIMIT,
+  FREE_MAX_LEVERAGE,
+  FREE_WEEKLY_QUOTA,
+  PRO_MONTHLY_QUOTA,
+  STRATEGY_CATALOG,
+  countTodayStrategySignals,
+  isProOnlyStrategy,
+  isProSubscriptionActive,
+} from '../data/strategies';
 import { auth, db, googleProvider, handleFirestoreError } from '../lib/firebase';
 import {
   OperationType,
@@ -28,12 +39,15 @@ import {
   type SecurityAuditLog,
   type SessionDeviceType,
   type StrategyConfig,
+  type SupportTicketCategory,
+  type SupportTicketRecord,
   type UserPrivateSecurity,
   type UserProfile,
   type UserSessionRecord,
 } from '../types/domain';
 import { playAlertChime } from '../lib/alertSound';
 import { authFetch } from '../lib/authFetch';
+import { safeFetchJson } from '../utils/safeFetchJson';
 
 function nextWeekIso(): string {
   return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -141,6 +155,7 @@ export function useAuthAndVault() {
   const [pushSubscriptions, setPushSubscriptions] = useState<PushSubscriptionRecord[]>([]);
   const [sessions, setSessions] = useState<UserSessionRecord[]>([]);
   const [priceAlerts, setPriceAlerts] = useState<PriceAlertRecord[]>([]);
+  const [supportTickets, setSupportTickets] = useState<SupportTicketRecord[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>(() => getOrCreateLocalSessionId());
 
   const [isLocked, setIsLocked] = useState(false);
@@ -195,8 +210,8 @@ export function useAuthAndVault() {
             uid,
             displayName,
             plan: 'free',
-            creditsRemaining: 10,
-            weeklyQuota: 10,
+            creditsRemaining: FREE_WEEKLY_QUOTA,
+            weeklyQuota: FREE_WEEKLY_QUOTA,
             nextResetAt: nextWeekIso(),
             twoFactorEnabled: false,
             autoLockMinutes: 15,
@@ -222,10 +237,12 @@ export function useAuthAndVault() {
           handleFirestoreError(err, OperationType.CREATE, privPath);
         }
 
-        // Seed default Spot & Futures strategies
+        // Seed default Spot & Futures strategies (Free plan starts with leverage capped at FREE_MAX_LEVERAGE)
         for (const tpl of STRATEGY_CATALOG) {
           const stratId = sanitizeId(`strat_${tpl.key}`);
           const stratPath = `users/${uid}/strategies/${stratId}`;
+          const initialLeverage =
+            tpl.marketType === 'spot' ? 1 : Math.min(FREE_MAX_LEVERAGE, tpl.defaultLeverage);
           try {
             await setDoc(doc(db, 'users', uid, 'strategies', stratId), {
               id: stratId,
@@ -237,7 +254,7 @@ export function useAuthAndVault() {
               dailySignalLimit: 1,
               minConfidence: 70,
               riskPerTradePct: tpl.defaultRiskPct,
-              leverage: tpl.defaultLeverage,
+              leverage: initialLeverage,
               pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
@@ -247,20 +264,96 @@ export function useAuthAndVault() {
           }
         }
 
-        await writeAuditLog(uid, 'ACCOUNT_INIT', 'Создан профиль и начислены 10 еженедельных кредитов.', 'SUCCESS');
+        await writeAuditLog(
+          uid,
+          'ACCOUNT_INIT',
+          `Создан профиль и начислены ${FREE_WEEKLY_QUOTA} еженедельных кредитов.`,
+          'SUCCESS'
+        );
       } else {
         const data = snap.data() as UserProfile;
-        if (data.plan === 'free' && data.nextResetAt && Date.now() >= new Date(data.nextResetAt).getTime()) {
-          try {
-            await updateDoc(userRef, {
-              creditsRemaining: 10,
-              nextResetAt: nextWeekIso(),
+        const isExistingPro = isProSubscriptionActive(data);
+
+        if (data.plan === 'free') {
+          if (data.nextResetAt && Date.now() >= new Date(data.nextResetAt).getTime()) {
+            try {
+              await updateDoc(userRef, {
+                creditsRemaining: FREE_WEEKLY_QUOTA,
+                weeklyQuota: FREE_WEEKLY_QUOTA,
+                nextResetAt: nextWeekIso(),
+                updatedAt: serverTimestamp(),
+              });
+              await writeAuditLog(
+                uid,
+                'WEEKLY_CREDIT_RESET',
+                `Еженедельное пополнение квоты: ${FREE_WEEKLY_QUOTA} кредитов.`,
+                'SUCCESS'
+              );
+            } catch (err) {
+              handleFirestoreError(err, OperationType.UPDATE, userPath);
+            }
+          } else if (data.weeklyQuota !== FREE_WEEKLY_QUOTA) {
+            const oldQuota = Number(data.weeklyQuota) || 10;
+            const bonus = Math.max(0, FREE_WEEKLY_QUOTA - oldQuota);
+            const upgradedCredits = Math.min(
+              FREE_WEEKLY_QUOTA,
+              Math.max(0, Number(data.creditsRemaining) || 0) + bonus
+            );
+            try {
+              await updateDoc(userRef, {
+                creditsRemaining: upgradedCredits,
+                weeklyQuota: FREE_WEEKLY_QUOTA,
+                nextResetAt: data.nextResetAt || nextWeekIso(),
+                updatedAt: serverTimestamp(),
+              });
+              await writeAuditLog(
+                uid,
+                'QUOTA_UPGRADED',
+                `Недельная квота Free обновлена до ${FREE_WEEKLY_QUOTA} кредитов (+${bonus}).`,
+                'SUCCESS'
+              );
+            } catch (err) {
+              handleFirestoreError(err, OperationType.UPDATE, userPath);
+            }
+          }
+        }
+
+        // Backfill newly added catalog strategies for existing accounts
+        try {
+          const existingStratsSnap = await getDocs(
+            query(collection(db, 'users', uid, 'strategies'), where('userId', '==', uid))
+          );
+          const existingKeys = new Set(
+            existingStratsSnap.docs.map((d) => (d.data() as StrategyConfig).strategyKey)
+          );
+          for (const tpl of STRATEGY_CATALOG) {
+            if (existingKeys.has(tpl.key)) continue;
+            const stratId = sanitizeId(`strat_${tpl.key}`);
+            const stratPath = `users/${uid}/strategies/${stratId}`;
+            const initialLeverage =
+              tpl.marketType === 'spot'
+                ? 1
+                : isExistingPro
+                  ? tpl.defaultLeverage
+                  : Math.min(FREE_MAX_LEVERAGE, tpl.defaultLeverage);
+            await setDoc(doc(db, 'users', uid, 'strategies', stratId), {
+              id: stratId,
+              userId: uid,
+              marketType: tpl.marketType,
+              strategyKey: tpl.key,
+              name: tpl.name.slice(0, 120),
+              enabled: false,
+              dailySignalLimit: 1,
+              minConfidence: 70,
+              riskPerTradePct: tpl.defaultRiskPct,
+              leverage: initialLeverage,
+              pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+              createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
             });
-            await writeAuditLog(uid, 'WEEKLY_CREDIT_RESET', 'Еженедельное пополнение квоты: 10 кредитов.', 'SUCCESS');
-          } catch (err) {
-            handleFirestoreError(err, OperationType.UPDATE, userPath);
           }
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, `users/${uid}/strategies`);
         }
       }
 
@@ -367,6 +460,7 @@ export function useAuthAndVault() {
         setPushSubscriptions([]);
         setSessions([]);
         setPriceAlerts([]);
+        setSupportTickets([]);
         setIsLocked(false);
         selfSignOutRef.current = false;
       } else {
@@ -512,6 +606,25 @@ export function useAuthAndVault() {
       (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/priceAlerts`)
     );
 
+    const supportQuery = query(
+      collection(db, 'users', uid, 'supportTickets'),
+      where('userId', '==', uid),
+      limit(20)
+    );
+    const unsubSupport = onSnapshot(
+      supportQuery,
+      (snap) => {
+        const docs = snap.docs.map((d) => d.data() as SupportTicketRecord);
+        docs.sort((a, b) => {
+          const tsA = (a.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          const tsB = (b.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          return tsB - tsA;
+        });
+        setSupportTickets(docs);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/supportTickets`)
+    );
+
     return () => {
       unsubProfile();
       unsubPrivate();
@@ -521,6 +634,7 @@ export function useAuthAndVault() {
       unsubPush();
       unsubSessions();
       unsubPriceAlerts();
+      unsubSupport();
     };
   }, [authReady, firebaseUser]);
 
@@ -590,29 +704,86 @@ export function useAuthAndVault() {
     await signOut(auth);
   };
 
+  const consumeCredits = useCallback(
+    async (amount: number, auditReason?: string): Promise<boolean> => {
+      if (!firebaseUser || !profile) return false;
+      const activePro = isProSubscriptionActive(profile);
+      const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
+      const cost = Math.max(1, Math.round(amount));
+
+      if (profile.creditsRemaining < cost) {
+        throw new Error(
+          activePro
+            ? `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Продлите PRO, чтобы начислить ещё ${PRO_MONTHLY_QUOTA} кредитов.`
+            : `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Перейдите на PRO (100 кр./мес.) или дождитесь сброса квоты.`
+        );
+      }
+
+      const uid = firebaseUser.uid;
+      try {
+        await updateDoc(doc(db, 'users', uid), {
+          creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
+          nextResetAt: profile.nextResetAt,
+          updatedAt: serverTimestamp(),
+        });
+        if (auditReason) {
+          await writeAuditLog(uid, 'CREDITS_SPENT', `${auditReason} (−${cost} кр.)`, 'SUCCESS');
+        }
+        return true;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+        return false;
+      }
+    },
+    [firebaseUser, profile, writeAuditLog]
+  );
+
   const consumeCreditAndSaveAnalysis = async (params: {
     symbol: string;
     marketType: MarketType;
     timeframe: string;
     strategyKey: string;
     strategyName: string;
+    creditCost?: number;
     result: AnalysisResultPayload;
   }) => {
     if (!firebaseUser || !profile) return;
     const uid = firebaseUser.uid;
-    if (profile.plan === 'free') {
-      if (profile.creditsRemaining <= 0) {
-        throw new Error('Еженедельные кредиты исчерпаны. Перейдите на PRO или дождитесь сброса квоты.');
+    const activePro = isProSubscriptionActive(profile);
+    const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
+    const cost = Math.max(
+      1,
+      Math.round(
+        params.creditCost ??
+          (params.marketType === 'futures' ? CREDIT_COSTS.futuresAnalysis : CREDIT_COSTS.spotAnalysis)
+      )
+    );
+
+    if (!activePro) {
+      const usedToday = countTodayStrategySignals(analyses, params.strategyKey);
+      if (usedToday >= FREE_DAILY_SIGNAL_LIMIT) {
+        throw new Error(
+          `Достигнут дневной лимит Free (${FREE_DAILY_SIGNAL_LIMIT}/день) для «${params.strategyName}». Перейдите на PRO для снятия дневных ограничений.`
+        );
       }
-      try {
-        await updateDoc(doc(db, 'users', uid), {
-          creditsRemaining: Math.max(0, profile.creditsRemaining - 1),
-          nextResetAt: profile.nextResetAt,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-      }
+    }
+
+    if (profile.creditsRemaining < cost) {
+      throw new Error(
+        activePro
+          ? `Недостаточно кредитов PRO (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Продлите подписку для пополнения квоты.`
+          : `Недостаточно кредитов (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Перейдите на PRO или дождитесь сброса квоты.`
+      );
+    }
+
+    try {
+      await updateDoc(doc(db, 'users', uid), {
+        creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
+        nextResetAt: profile.nextResetAt,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
     }
 
     const analysisId = sanitizeId(`an_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
@@ -655,7 +826,18 @@ export function useAuthAndVault() {
   ) => {
     if (!firebaseUser || !profile) return;
     const uid = firebaseUser.uid;
-    const cappedLimit = profile.plan === 'pro' ? Math.min(20, Math.max(1, updates.dailySignalLimit)) : 1;
+    const activePro = isProSubscriptionActive(profile);
+    const matched = strategies.find((s) => s.id === strategyId);
+    const strategyKey = matched?.strategyKey || strategyId.replace(/^strat_/, '');
+    if (!activePro && isProOnlyStrategy(strategyKey)) {
+      throw new Error('Эта стратегия открывается только в активной подписке PRO.');
+    }
+
+    const cappedLimit = activePro
+      ? Math.min(100, Math.max(0, Math.round(updates.dailySignalLimit)))
+      : FREE_DAILY_SIGNAL_LIMIT;
+    const maxLev = activePro ? 20 : FREE_MAX_LEVERAGE;
+    const cappedLeverage = Math.min(maxLev, Math.max(1, Math.round(updates.leverage)));
     const path = `users/${uid}/strategies/${strategyId}`;
     try {
       await updateDoc(doc(db, 'users', uid, 'strategies', strategyId), {
@@ -663,14 +845,16 @@ export function useAuthAndVault() {
         dailySignalLimit: cappedLimit,
         minConfidence: Math.min(95, Math.max(50, Math.round(updates.minConfidence))),
         riskPerTradePct: Math.min(10, Math.max(0.25, Number(updates.riskPerTradePct))),
-        leverage: Math.min(20, Math.max(1, Math.round(updates.leverage))),
+        leverage: cappedLeverage,
         pairs: updates.pairs.slice(0, 10),
         updatedAt: serverTimestamp(),
       });
       await writeAuditLog(
         uid,
         'STRATEGY_UPDATED',
-        `Обновлена стратегия ${strategyId}: лимит ${cappedLimit} сигн./день, риск ${updates.riskPerTradePct}%.`,
+        `Обновлена стратегия ${strategyId}: ${
+          cappedLimit === 0 ? 'без лимита сигналов/день (PRO)' : `лимит ${cappedLimit} сигн./день`
+        }, плечо ${cappedLeverage}x, риск ${updates.riskPerTradePct}%.`,
         'SUCCESS'
       );
     } catch (err) {
@@ -790,6 +974,8 @@ export function useAuthAndVault() {
       auth: string;
       notifySignals: boolean;
       notifyMarketMoves: boolean;
+      notifyVolatilitySpikes: boolean;
+      volatilityThresholdPct: number;
       notifyNews: boolean;
       notifyAuthLogins: boolean;
       notifyStrategyChanges: boolean;
@@ -808,6 +994,8 @@ export function useAuthAndVault() {
         auth: params.auth.slice(0, 128),
         notifySignals: params.notifySignals,
         notifyMarketMoves: params.notifyMarketMoves,
+        notifyVolatilitySpikes: params.notifyVolatilitySpikes,
+        volatilityThresholdPct: Math.max(1, Math.min(25, Number(params.volatilityThresholdPct) || 5)),
         notifyNews: params.notifyNews,
         notifyAuthLogins: params.notifyAuthLogins,
         notifyStrategyChanges: params.notifyStrategyChanges,
@@ -1166,6 +1354,73 @@ export function useAuthAndVault() {
     [firebaseUser, writeAuditLog]
   );
 
+  const createSupportTicket = useCallback(
+    async (params: {
+      contactEmail: string;
+      category: SupportTicketCategory;
+      subject: string;
+      message: string;
+    }): Promise<string> => {
+      const cleanEmail = params.contactEmail.trim().slice(0, 200);
+      const cleanSubject = params.subject.trim().slice(0, 140);
+      const cleanMessage = params.message.trim().slice(0, 2000);
+      if (cleanEmail.length < 3 || !cleanEmail.includes('@')) {
+        throw new Error('Укажите корректный email для обратной связи.');
+      }
+      if (cleanSubject.length < 3) {
+        throw new Error('Укажите тему обращения (минимум 3 символа).');
+      }
+      if (cleanMessage.length < 10) {
+        throw new Error('Опишите вопрос подробнее (минимум 10 символов).');
+      }
+
+      if (firebaseUser) {
+        const uid = firebaseUser.uid;
+        const ticketId = sanitizeId(`sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+        const path = `users/${uid}/supportTickets/${ticketId}`;
+        try {
+          await setDoc(doc(db, 'users', uid, 'supportTickets', ticketId), {
+            id: ticketId,
+            userId: uid,
+            contactEmail: cleanEmail,
+            category: params.category,
+            subject: cleanSubject,
+            message: cleanMessage,
+            status: 'open',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          await writeAuditLog(
+            uid,
+            'SUPPORT_TICKET_CREATED',
+            `Создано обращение в поддержку (${ticketId}): ${cleanSubject.slice(0, 80)}.`,
+            'SUCCESS'
+          );
+          return ticketId;
+        } catch (err) {
+          handleFirestoreError(err, OperationType.CREATE, path);
+        }
+      }
+
+      const result = await safeFetchJson<{ ticketId?: string; error?: string }>('/api/support', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contactEmail: cleanEmail,
+          category: params.category,
+          subject: cleanSubject,
+          message: cleanMessage,
+        }),
+        timeoutMs: 12000,
+      });
+      if (!result.ok || !result.data?.ticketId) {
+        throw new Error(result.errorMessage || 'Не удалось отправить обращение в поддержку.');
+      }
+      return result.data.ticketId;
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
   return {
     firebaseUser,
     authReady,
@@ -1178,11 +1433,13 @@ export function useAuthAndVault() {
     pushSubscriptions,
     sessions,
     priceAlerts,
+    supportTickets,
     currentSessionId,
     isLocked,
     setIsLocked,
     loginWithGoogle,
     logout,
+    consumeCredits,
     consumeCreditAndSaveAnalysis,
     updateStrategySettings,
     savePendingTotp,
@@ -1199,6 +1456,7 @@ export function useAuthAndVault() {
     togglePriceAlert,
     deletePriceAlert,
     checkPriceAlertsNow,
+    createSupportTicket,
     writeAuditLog,
   };
 }
