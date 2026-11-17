@@ -443,6 +443,12 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                             <FlashValue value={t.price}>{formatUsd(t.price)}</FlashValue>
                           </td>
                           <td
+                            style={{
+                              // «тепловая карта»: чем сильнее движение, тем насыщеннее подсветка ячейки
+                              backgroundColor: `${
+                                t.change24hPct >= 0 ? 'rgba(16,185,129,' : 'rgba(244,63,94,'
+                              }${Math.min(0.26, 0.03 + (Math.abs(t.change24hPct) / 10) * 0.23).toFixed(3)})`,
+                            }}
                             className={`py-2.5 px-3 text-right font-semibold ${
                               t.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
                             }`}

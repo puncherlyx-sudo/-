@@ -26,6 +26,8 @@ import { SecurityCenterView, type SecuritySection } from './components/SecurityC
 import { StandaloneWidgetView } from './components/StandaloneWidgetView';
 import { StrategiesView } from './components/StrategiesView';
 import { SplashIntro } from './components/MotionExtras';
+import { TickerTape } from './components/TickerTape';
+import { hapticTap } from './lib/haptics';
 import { PricingModal } from './components/PricingModal';
 import { TwoFactorModal } from './components/TwoFactorModal';
 import { useAuthAndVault } from './hooks/useAuthAndVault';
@@ -157,6 +159,7 @@ export default function App() {
       }
       return tab;
     });
+    hapticTap();
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
@@ -601,6 +604,8 @@ export default function App() {
         </header>
 
       {/* Main Content Container */}
+      <TickerTape />
+
       <main className="flex-1 w-full max-w-7xl mx-auto px-3 sm:px-6 py-3 sm:py-4 pb-24 md:pb-8 overflow-x-hidden">
         {/* Compact Single-Row Top Bar: Mini Portfolio + Widgets + Tour + PWA */}
         <MiniPortfolioWidget

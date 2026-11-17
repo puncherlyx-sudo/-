@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -303,6 +303,23 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
   }, [loadMarketData]);
 
   const activeTicker = useMemo(() => tickers.find((t) => t.symbol === symbol), [tickers, symbol]);
+
+  // Живая цена прямо во вкладке браузера и в переключателе окон: «BTC $91,450.00 ▲ · AegisQuant»
+  const tabTitlePrice = indicators?.lastPrice ?? activeTicker?.price;
+  const tabTitleBase = activeTicker?.baseAsset;
+  const tabTitleUp = (activeTicker?.change24hPct ?? 0) >= 0;
+  const originalTitleRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (originalTitleRef.current === null) originalTitleRef.current = document.title;
+    return () => {
+      if (originalTitleRef.current !== null) document.title = originalTitleRef.current;
+    };
+  }, []);
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof tabTitlePrice !== 'number' || !tabTitleBase) return;
+    document.title = `${tabTitleBase} ${formatUsd(tabTitlePrice)} ${tabTitleUp ? '▲' : '▼'} · AegisQuant`;
+  }, [tabTitlePrice, tabTitleBase, tabTitleUp]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -896,7 +913,10 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                 <div className="flex items-center gap-2 text-xs text-slate-400">
                   <span>{marketType === 'futures' ? 'Фьючерсы USDT-M' : 'Спот'}</span>
                   <span aria-hidden="true">·</span>
-                  <span>{dataSource === 'live' ? 'Живой поток' : 'Резерв'}</span>
+                  <span className="inline-flex items-center gap-1.5">
+                    {dataSource === 'live' && <span className="live-dot" aria-hidden="true" />}
+                    {dataSource === 'live' ? 'Живой поток' : 'Резерв'}
+                  </span>
                   <span aria-hidden="true">·</span>
                   <span className="font-mono">{timeframe.toUpperCase()}</span>
                 </div>
