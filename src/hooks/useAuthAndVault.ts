@@ -32,6 +32,7 @@ import {
   type UserProfile,
   type UserSessionRecord,
 } from '../types/domain';
+import { playAlertChime } from '../lib/alertSound';
 import { authFetch } from '../lib/authFetch';
 
 function nextWeekIso(): string {
@@ -957,6 +958,7 @@ export function useAuthAndVault() {
       }>
     ) => {
       if (!triggered || triggered.length === 0) return;
+      playAlertChime();
       for (const item of triggered) {
         try {
           await updateDoc(doc(db, 'users', uid, 'priceAlerts', item.id), {

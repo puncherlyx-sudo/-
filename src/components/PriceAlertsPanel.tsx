@@ -10,9 +10,12 @@ import {
   Trash2,
   TrendingDown,
   TrendingUp,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { TRADING_PAIRS } from '../data/strategies';
+import { isAlertSoundEnabled, playAlertChime, setAlertSoundEnabled } from '../lib/alertSound';
 import type {
   MarketType,
   PriceAlertCondition,
@@ -68,6 +71,7 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
   onDeleteAlert,
   onCheckNow,
 }) => {
+  const [soundOn, setSoundOn] = useState<boolean>(() => isAlertSoundEnabled());
   const [symbol, setSymbol] = useState<string>('BTCUSDT');
   const [marketType, setMarketType] = useState<MarketType>('spot');
   const [condition, setCondition] = useState<PriceAlertCondition>('above');
@@ -221,12 +225,34 @@ export const PriceAlertsPanel: React.FC<PriceAlertsPanelProps> = ({
           </p>
         </div>
 
-        <div className="text-xs font-mono tabular-nums text-slate-400 shrink-0">
+        <div className="text-xs font-mono tabular-nums text-slate-400 shrink-0 flex items-center gap-3">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={soundOn}
+            aria-label={soundOn ? 'Выключить звук алертов' : 'Включить звук алертов'}
+            title={soundOn ? 'Звук алертов включён' : 'Звук алертов выключен'}
+            onClick={() => {
+              const next = !soundOn;
+              setSoundOn(next);
+              setAlertSoundEnabled(next);
+              if (next) playAlertChime(true);
+            }}
+            className={`min-h-[36px] min-w-[36px] inline-flex items-center justify-center rounded-lg border transition-colors ${
+              soundOn
+                ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                : 'border-white/10 bg-white/5 text-slate-500'
+            }`}
+          >
+            {soundOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+          </button>
+          <span>
           Активных: <span className="text-emerald-400 font-semibold">{activeCount}</span>
           <span aria-hidden="true" className="mx-1.5 text-slate-600">
             ·
           </span>
           Сработало: <span className="text-amber-300 font-semibold">{triggeredCount}</span>
+          </span>
         </div>
       </div>
 
