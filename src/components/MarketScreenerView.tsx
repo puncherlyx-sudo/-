@@ -29,7 +29,7 @@ import {
 import { TRADING_PAIRS } from '../data/strategies';
 import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
 import type { MarketType, PortfolioHolding, TickerOverview } from '../types/domain';
-import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 
 export type ScreenerSection = 'table' | 'momentum' | 'portfolio';
 
@@ -439,7 +439,9 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                               </div>
                             </div>
                           </td>
-                          <td className="py-2.5 px-3 text-right text-slate-100">{formatUsd(t.price)}</td>
+                          <td className="py-2.5 px-3 text-right text-slate-100">
+                            <FlashValue value={t.price}>{formatUsd(t.price)}</FlashValue>
+                          </td>
                           <td
                             className={`py-2.5 px-3 text-right font-semibold ${
                               t.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'

@@ -172,7 +172,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({ open, onClose, proUn
           type="button"
           onClick={() => void handlePay()}
           disabled={loading || !data?.enabled}
-          className="mt-5 min-h-[48px] w-full rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
+          className="cta-shimmer mt-5 min-h-[48px] w-full rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 disabled:cursor-not-allowed text-slate-950 text-sm font-semibold transition-colors flex items-center justify-center gap-2"
         >
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
           {loading ? 'Создаём счёт…' : 'Оплатить криптовалютой'}

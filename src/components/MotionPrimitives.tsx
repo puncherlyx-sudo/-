@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, type Variants } from 'motion/react';
 
 export const TERMINAL_EASE = [0.16, 1, 0.3, 1] as const;
@@ -309,3 +309,31 @@ export function WorkspaceShell<T extends string>({
     </div>
   );
 }
+
+/**
+ * Подсвечивает значение зелёной/красной вспышкой, когда число растёт или падает.
+ * Анимацию запускает смена key, поэтому повторные изменения подряд тоже заметны.
+ */
+export const FlashValue: React.FC<{
+  value: number | null | undefined;
+  className?: string;
+  children: React.ReactNode;
+}> = ({ value, className = '', children }) => {
+  const previous = useRef(value);
+  const [flash, setFlash] = useState<{ dir: 'up' | 'down'; n: number } | null>(null);
+
+  useEffect(() => {
+    const before = previous.current;
+    previous.current = value;
+    if (typeof value === 'number' && typeof before === 'number' && value !== before) {
+      const dir = value > before ? 'up' : 'down';
+      setFlash((prev) => ({ dir, n: (prev?.n ?? 0) + 1 }));
+    }
+  }, [value]);
+
+  return (
+    <span key={flash?.n ?? 0} className={`${className} ${flash ? `flash-${flash.dir}` : ''}`.trim()}>
+      {children}
+    </span>
+  );
+};

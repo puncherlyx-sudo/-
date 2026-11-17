@@ -10,6 +10,7 @@ import {
 import { AnimatePresence, motion } from 'motion/react';
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
 import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
+import { AnimatedNumber } from './MotionExtras';
 
 interface MiniPortfolioWidgetProps {
   holdingsCount: number;
@@ -100,7 +101,10 @@ export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = ({
             className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-left hover:opacity-90 transition-opacity"
           >
             <span className="text-xs font-bold font-mono tabular-nums text-white">
-              ${report.totalValue.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}
+              <AnimatedNumber
+                value={report.totalValue}
+                format={(n) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`}
+              />
             </span>
             <span
               className={`text-[11px] font-mono font-semibold tabular-nums ${
