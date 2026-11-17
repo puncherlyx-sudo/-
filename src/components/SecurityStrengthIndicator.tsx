@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import { ArrowUpRight, CheckCircle2, Shield, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { motion } from 'motion/react';
 import type { PushPreferences } from '../hooks/usePushNotifications';
+import { AnimatedNumber } from './MotionExtras';
 import type { UserPrivateSecurity, UserProfile } from '../types/domain';
 
 interface SecurityStrengthIndicatorProps {
@@ -217,7 +218,7 @@ export const SecurityStrengthIndicator: React.FC<SecurityStrengthIndicatorProps>
 
         <div className="flex items-baseline gap-2 shrink-0 self-start lg:self-auto">
           <span className={`text-3xl font-bold font-mono tabular-nums ${tier.textClass}`}>
-            {score}%
+            <AnimatedNumber value={score} fromZero format={(n) => `${Math.round(n)}%`} />
           </span>
           <span className="text-xs text-slate-500 font-mono tabular-nums">/ 100%</span>
         </div>

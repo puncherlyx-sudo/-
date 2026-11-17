@@ -822,7 +822,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   >
                     <span className="font-sans font-semibold">{pair.baseAsset}</span>
                     {pair.price !== null && (
-                      <span className="text-slate-200">{formatUsd(pair.price)}</span>
+                      <FlashValue value={pair.price} className="text-slate-200">{formatUsd(pair.price)}</FlashValue>
                     )}
                     {pair.change24hPct !== null && (
                       <span
