@@ -1086,6 +1086,64 @@ async function startServer() {
 
   const httpServer = http.createServer(app);
 
+  // Виджет TradingView (Advanced Real-Time Chart) на ОТДЕЛЬНОЙ странице.
+  // Приложение показывает её в <iframe sandbox> без allow-same-origin, поэтому скрипт TradingView
+  // не получает доступа ни к вашему аккаунту, ни к данным приложения. У страницы своя строгая CSP.
+  const TV_INTERVALS = new Set(['15', '60', '240', 'D']);
+  app.get('/embed/tradingview', generalApiLimiter, (req, res) => {
+    const requested = String(req.query.symbol || 'BTCUSDT').toUpperCase();
+    const symbol = (SUPPORTED_SYMBOLS as readonly string[]).includes(requested) ? requested : 'BTCUSDT';
+    const futures = req.query.marketType === 'futures';
+    const interval = TV_INTERVALS.has(String(req.query.interval)) ? String(req.query.interval) : '60';
+    const tvSymbol = `BINANCE:${symbol}${futures ? '.P' : ''}`; // только [A-Z0-9:.] — безопасно для HTML
+    const config = {
+      autosize: true,
+      symbol: tvSymbol,
+      interval,
+      timezone: 'Etc/UTC',
+      theme: 'dark',
+      style: '1',
+      locale: 'ru',
+      backgroundColor: 'rgba(11, 15, 23, 1)',
+      withdateranges: true,
+      hide_side_toolbar: false,
+      allow_symbol_change: true,
+      save_image: false,
+      calendar: false,
+      support_host: 'https://www.tradingview.com',
+    };
+    const json = JSON.stringify(config).replace(/</g, '\\u003c');
+    const page = `<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TradingView</title>
+<style>html,body{margin:0;height:100%;background:#0B0F17;overflow:hidden}
+.tradingview-widget-container{height:100%;width:100%}
+.tradingview-widget-container__widget{height:calc(100% - 28px);width:100%}
+.tradingview-widget-copyright{font:12px/28px system-ui,sans-serif;text-align:center;height:28px;color:#94a3b8}
+.tradingview-widget-copyright a{color:#60a5fa;text-decoration:none}</style></head>
+<body><div class="tradingview-widget-container"><div class="tradingview-widget-container__widget"></div>
+<div class="tradingview-widget-copyright"><a href="https://www.tradingview.com/symbols/${tvSymbol.replace(':', '-')}/" rel="noopener nofollow" target="_blank">${symbol} chart</a> by TradingView</div>
+<script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>${json}</script>
+</div></body></html>`;
+    res.set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'public, max-age=300',
+      'Content-Security-Policy': [
+        "default-src 'none'",
+        "script-src https://s3.tradingview.com",
+        "style-src 'unsafe-inline' https:",
+        'img-src https: data: blob:',
+        'font-src https: data:',
+        'connect-src https: wss:',
+        'frame-src https:',
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'self' https://aistudio.google.com https://*.google.com",
+      ].join('; '),
+    });
+    res.send(page);
+  });
+
   if (!isProd) {
     const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
