@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vernier">
+  <defs>
+    <linearGradient id="vn-mask-accent" gradientUnits="userSpaceOnUse" x1="120" y1="382" x2="392" y2="150">
+      <stop offset="0" stop-color="#34D399"/>
+      <stop offset="0.52" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <radialGradient id="vn-mask-glow" cx="0.24" cy="0.16" r="0.88">
+      <stop offset="0" stop-color="#10B981" stop-opacity="0.24"/>
+      <stop offset="0.55" stop-color="#10B981" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#10B981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Full-bleed background for Android maskable & Apple touch icon -->
+  <rect width="512" height="512" fill="#0B0F17"/>
+  <rect width="512" height="512" fill="url(#vn-mask-glow)"/>
+
+  <!-- Scaled slightly to 94% around (256, 266) for extra safe-zone margin inside Android 80% circle -->
+  <g transform="translate(256 266) scale(0.94) translate(-256 -266)">
+    <!-- Left Arm Inner Ticks: Main Scale (4 intervals) -->
+    <rect x="170" y="189" width="32" height="7.5" rx="3.75" fill="#94A3B8"/>
+    <rect x="197" y="236" width="29" height="7.5" rx="3.75" fill="#94A3B8"/>
+    <rect x="224" y="283" width="21" height="7.5" rx="3.75" fill="#94A3B8"/>
+
+    <!-- Right Arm Inner Ticks: Vernier Scale (5 intervals, step 0.8) -->
+    <rect x="314" y="179.6" width="34" height="7.5" rx="3.75" fill="#94A3B8"/>
+    <rect x="293" y="217.2" width="33" height="7.5" rx="3.75" fill="#94A3B8"/>
+    <rect x="275" y="254.8" width="29" height="7.5" rx="3.75" fill="#94A3B8"/>
+    <rect x="263" y="292.4" width="19" height="7.5" rx="3.75" fill="#94A3B8"/>
+
+    <!-- Coincident Top Caliper Jaws -->
+    <rect x="138" y="146" width="48" height="12" rx="4" fill="url(#vn-mask-accent)"/>
+    <rect x="326" y="146" width="48" height="12" rx="4" fill="url(#vn-mask-accent)"/>
+
+    <!-- Primary Architectural V Caliper Silhouette -->
+    <path
+      d="M 116 146 L 146 146 L 256 334 L 366 146 L 396 146 L 260 382 Q 256 388 252 382 Z"
+      fill="#E2E8F0"
+    />
+
+    <!-- Coincident Zero-Point Vertex Prism -->
+    <path
+      d="M 237 356 L 256 334 L 275 356 L 260 382 Q 256 388 252 382 Z"
+      fill="url(#vn-mask-accent)"
+    />
+  </g>
+</svg>

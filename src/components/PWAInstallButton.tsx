@@ -42,7 +42,7 @@ export const PWAInstallButton: React.FC<{
         >
           <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#111827] p-6 shadow-2xl">
             <div className="flex items-center justify-between gap-4">
-              <h3 className="text-lg font-semibold text-white">Установка AegisQuant на смартфон</h3>
+              <h3 className="text-lg font-semibold text-white">Установка Vernier на смартфон</h3>
               <button
                 type="button"
                 onClick={() => setShowGuide(false)}

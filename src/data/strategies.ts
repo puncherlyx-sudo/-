@@ -1,29 +1,60 @@
-import type { AnalysisRecord, StrategyTemplate, UserProfile } from '../types/domain';
+import type { AnalysisRecord, PlanTier, StrategyTemplate, UserProfile } from '../types/domain';
 
-export const FREE_WEEKLY_QUOTA = 15;
+export const FREE_WEEKLY_QUOTA = 25;
 export const PRO_MONTHLY_QUOTA = 100;
-export const FREE_MAX_LEVERAGE = 5;
+export const MAX_X10_MONTHLY_QUOTA = 1000;
+export const MAX_X20_MONTHLY_QUOTA = 2000;
+export const MAX_MONTHLY_QUOTA = MAX_X10_MONTHLY_QUOTA;
+export const FREE_MAX_LEVERAGE = 3;
 export const FREE_DAILY_SIGNAL_LIMIT = 1;
 export const CREDIT_COSTS = {
   spotAnalysis: 1,
   futuresAnalysis: 2,
   portfolioBacktest: 1,
+  sentimentForecast: 1,
+  liveScanner: 0,
 } as const;
+
+export function getActivePlanTier(
+  profile?: Pick<UserProfile, 'plan' | 'proUntil'> | null,
+  nowMs: number = Date.now()
+): PlanTier {
+  if (!profile) return 'free';
+  const isPaidPlan = profile.plan === 'pro' || profile.plan === 'max';
+  if (!isPaidPlan) return 'free';
+  const hasValidExpiry =
+    typeof profile.proUntil === 'number' && Number.isFinite(profile.proUntil) && profile.proUntil > nowMs;
+  if (!hasValidExpiry) return 'free';
+  return profile.plan === 'max' ? 'max' : 'pro';
+}
+
+export function isMaxSubscriptionActive(
+  profile?: Pick<UserProfile, 'plan' | 'proUntil'> | null,
+  nowMs: number = Date.now()
+): boolean {
+  return getActivePlanTier(profile, nowMs) === 'max';
+}
 
 export function isProSubscriptionActive(
   profile?: Pick<UserProfile, 'plan' | 'proUntil'> | null,
   nowMs: number = Date.now()
 ): boolean {
-  if (!profile || profile.plan !== 'pro') return false;
-  return typeof profile.proUntil === 'number' && Number.isFinite(profile.proUntil) && profile.proUntil > nowMs;
+  const tier = getActivePlanTier(profile, nowMs);
+  return tier === 'pro' || tier === 'max';
 }
 
 export function isProSubscriptionExpired(
   profile?: Pick<UserProfile, 'plan' | 'proUntil'> | null,
   nowMs: number = Date.now()
 ): boolean {
-  if (!profile || profile.plan !== 'pro') return false;
+  if (!profile || (profile.plan !== 'pro' && profile.plan !== 'max')) return false;
   return !isProSubscriptionActive(profile, nowMs);
+}
+
+export function getTierDisplayName(tier: PlanTier): string {
+  if (tier === 'max') return 'MAX';
+  if (tier === 'pro') return 'PRO';
+  return 'Free';
 }
 
 export function formatProUntilDate(proUntil?: number): string {
@@ -64,10 +95,17 @@ export function countTodayStrategySignals(
 }
 
 export function getCreditQuotaForProfile(
-  profile?: Pick<UserProfile, 'plan' | 'proUntil' | 'weeklyQuota'> | null,
+  profile?: Pick<UserProfile, 'plan' | 'proUntil' | 'weeklyQuota' | 'maxMultiplier' | 'creditsRemaining'> | null,
   nowMs: number = Date.now()
 ): number {
-  if (isProSubscriptionActive(profile, nowMs)) return PRO_MONTHLY_QUOTA;
+  const tier = getActivePlanTier(profile, nowMs);
+  if (tier === 'max') {
+    if (profile?.maxMultiplier === 20 || (profile?.creditsRemaining ?? 0) > MAX_X10_MONTHLY_QUOTA) {
+      return MAX_X20_MONTHLY_QUOTA;
+    }
+    return MAX_X10_MONTHLY_QUOTA;
+  }
+  if (tier === 'pro') return PRO_MONTHLY_QUOTA;
   return profile?.weeklyQuota || FREE_WEEKLY_QUOTA;
 }
 
@@ -111,9 +149,47 @@ export const STRATEGY_CATALOG: StrategyTemplate[] = [
     defaultRiskPct: 1.5,
   },
   {
-    key: 'spot_mean_reversion',
+    key: 'spot_golden_cross_swing',
     marketType: 'spot',
     tier: 'free',
+    creditCost: 1,
+    marketCondition: 'Устойчивый свинг-тренд',
+    expectedHorizon: '2–6 дней',
+    name: 'Золотой крест EMA20/50 + Тренд-свинг',
+    shortTag: 'Спот · Свинг',
+    timeframeDefault: '4h',
+    riskProfile: 'Консервативная',
+    description:
+      'Классическая спотовая стратегия по тренду без плеча: фиксирует закрепление EMA20 выше EMA50 на здоровом импульсе RSI без перекупленности.',
+    rulesSummary:
+      'EMA20 >= EMA50, восходящий наклон обеих средних, закрытие выше EMA20 и RSI(14) в комфортной зоне 46–68.',
+    indicatorsUsed: ['EMA 20 / 50 Cross', 'RSI (14)', 'Тренд-фильтр'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.75,
+  },
+  {
+    key: 'spot_support_bounce_rsi',
+    marketType: 'spot',
+    tier: 'free',
+    creditCost: 1,
+    marketCondition: 'Отскок от поддержки',
+    expectedHorizon: '8–36 часов',
+    name: 'Отскок от локальной поддержки + RSI',
+    shortTag: 'Спот · Отскок',
+    timeframeDefault: '1h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Спотовая ловля отскоков у локальных уровней спроса за 10 свечей при развороте свечи вверх и снятии перепроданности по RSI.',
+    rulesSummary:
+      'Тест минимума 10 свечей с бычьим закрытием выше открытия, RSI(14) < 48 и подтверждение тенью снизу.',
+    indicatorsUsed: ['Support 10-Bar', 'RSI (14)', 'Свечной откуп'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_mean_reversion',
+    marketType: 'spot',
+    tier: 'pro',
     creditCost: 1,
     marketCondition: 'Флэт / Диапазон',
     expectedHorizon: '4–24 часа',
@@ -128,6 +204,25 @@ export const STRATEGY_CATALOG: StrategyTemplate[] = [
     indicatorsUsed: ['Bollinger Bands (20,2)', 'RSI (14)', 'ATR (14)'],
     defaultLeverage: 1,
     defaultRiskPct: 1.25,
+  },
+  {
+    key: 'spot_advanced_market_sentiment',
+    marketType: 'spot',
+    tier: 'pro',
+    creditCost: 1,
+    marketCondition: 'Синхронизация тренда и сентимента',
+    expectedHorizon: '12–72 часа',
+    name: 'Advanced Market Sentiment (Настроения + Импульс)',
+    shortTag: 'Спот · Sentiment PRO',
+    timeframeDefault: '4h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Эксклюзивная PRO/MAX-стратегия: фильтрует только подтверждённые развороты бычьего сентимента при поддержке объёма, ширины рынка и наклона EMA20/EMA50.',
+    rulesSummary:
+      'Закрытие в верхней зоне свечи выше EMA20 при восходящем уклоне EMA20/EMA50, RSI(14) 46–67, объём ≥ 0.95× среднего и позитивный сдвиг индекса настроений.',
+    indicatorsUsed: ['Fear & Greed Shift', 'Market Breadth', 'EMA 20 / 50 + Volume'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.75,
   },
   {
     key: 'spot_ema_ribbon_pullback',
@@ -187,6 +282,82 @@ export const STRATEGY_CATALOG: StrategyTemplate[] = [
     defaultRiskPct: 1.0,
   },
   {
+    key: 'spot_vwap_trend_reclaim',
+    marketType: 'spot',
+    tier: 'pro',
+    creditCost: 1,
+    marketCondition: 'Возврат в тренд',
+    expectedHorizon: '8–36 часов',
+    name: 'Возврат над EMA20 после снятия стопов',
+    shortTag: 'Спот · Reclaim',
+    timeframeDefault: '1h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Захват продолжения тренда после неглубокого сбора ликвидности: цена возвращается выше EMA20 и локального открытия на повышенном объёме.',
+    rulesSummary:
+      'Закрытие выше EMA20 и предыдущего максимума тела после прокола поддержки, EMA20 >= EMA50×0.992, RSI 45–68.',
+    indicatorsUsed: ['EMA 20 / 50', 'Volume Reclaim', 'RSI (14)'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_rsi_bull_divergence',
+    marketType: 'spot',
+    tier: 'pro',
+    creditCost: 1,
+    marketCondition: 'Разворот импульса',
+    expectedHorizon: '1–5 дней',
+    name: 'Бычья дивергенция RSI + Объемное подтверждение',
+    shortTag: 'Спот · Дивергенция',
+    timeframeDefault: '4h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Поиск разворота на истощении продавца: цена обновляет или тестирует локальный минимум, тогда как RSI формирует более высокий минимум.',
+    rulesSummary:
+      'RSI(14) выше локального минимума 5 свечей назад при снижении цены, бычья свеча закрытия выше BB Lower и приток объёма.',
+    indicatorsUsed: ['RSI Divergence', 'Bollinger Lower', 'Volume Flow'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.75,
+  },
+  {
+    key: 'spot_donchian_channel_breakout',
+    marketType: 'spot',
+    tier: 'pro',
+    creditCost: 1,
+    marketCondition: 'Пробой диапазона 12 свечей',
+    expectedHorizon: '1–5 дней',
+    name: 'Пробой канала Дончиана + Объём (Spot)',
+    shortTag: 'Спот · Дончиан',
+    timeframeDefault: '4h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Систематическая трендовая стратегия на споте: вход при выходе цены за верхнюю границу 12-свечного канала Дончиана на повышенном торговом объёме.',
+    rulesSummary:
+      'Закрытие выше 12-свечного максимума, цена выше EMA50, объём ≥ 1.1× среднего и RSI(14) ≤ 74.',
+    indicatorsUsed: ['Donchian (12)', 'Volume Spike', 'EMA 50 Filter'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_atr_pullback_continuation',
+    marketType: 'spot',
+    tier: 'pro',
+    creditCost: 1,
+    marketCondition: 'Волатильный откат в тренде',
+    expectedHorizon: '6–30 часов',
+    name: 'Откат по ATR в восходящем тренде (Spot)',
+    shortTag: 'Спот · ATR Откат',
+    timeframeDefault: '1h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Точечный набор спотовой позиции на контролируемой коррекции 0.8×ATR внутри бычьего тренда при возврате цены выше середины предыдущей свечи.',
+    rulesSummary:
+      'EMA20 > EMA50, коррекция в зону EMA20 ± 0.8×ATR с бычьей свечой возврата и RSI(14) 42–64.',
+    indicatorsUsed: ['ATR Pullback', 'EMA 20 / 50', 'RSI (14)'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
     key: 'futures_liquidity_sweep',
     marketType: 'futures',
     tier: 'pro',
@@ -243,14 +414,240 @@ export const STRATEGY_CATALOG: StrategyTemplate[] = [
     defaultLeverage: 6,
     defaultRiskPct: 0.9,
   },
+  {
+    key: 'futures_trend_pyramid',
+    marketType: 'futures',
+    tier: 'pro',
+    creditCost: 2,
+    marketCondition: 'Направленный свинг',
+    expectedHorizon: '12–72 часа',
+    name: 'Свинг-продолжение EMA20/50 + Пробой диапазона',
+    shortTag: 'Фьючерсы · Свинг',
+    timeframeDefault: '4h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Систематическая торговля в сторону устоявшегося тренда при пробое локальной базы с контролем волатильности по ATR.',
+    rulesSummary:
+      'Устойчивый наклон EMA20 над/под EMA50, уверенное тело свечи закрытия за 4-свечным диапазоном и отсутствие перекупленности.',
+    indicatorsUsed: ['EMA 20 / 50 Slope', 'Range Breakout', 'ATR Filter'],
+    defaultLeverage: 5,
+    defaultRiskPct: 1.25,
+  },
+  {
+    key: 'futures_squeeze_expansion',
+    marketType: 'futures',
+    tier: 'pro',
+    creditCost: 2,
+    marketCondition: 'Выход из сжатия',
+    expectedHorizon: '2–24 часа',
+    name: 'Экспансия сжатия BB + Volume Impulse (Long/Short)',
+    shortTag: 'Фьючерсы · Squeeze',
+    timeframeDefault: '1h',
+    riskProfile: 'Агрессивная',
+    description:
+      'Двусторонний захват выхода фьючерсной пары из узкого ценового сжатия Боллинджера с подтверждением всплеска торгового объёма.',
+    rulesSummary:
+      'Ширина полос Боллинджера < 6%, прорыв верхней или нижней границы на объёме ≥1.15× среднего и подтверждение RSI.',
+    indicatorsUsed: ['BB Squeeze', 'Volume Impulse', 'ATR (14)'],
+    defaultLeverage: 7,
+    defaultRiskPct: 1.0,
+  },
+  // ==================== MAX-EXCLUSIVE STRATEGIES (55%+ WR EXECUTION PROFILE) ====================
+  {
+    key: 'spot_max_smc_orderblock_mitigation',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Митигация зоны спроса (SMC)',
+    expectedHorizon: '12–72 часа',
+    name: 'Smart Money: Митигация Order Block (MAX)',
+    shortTag: 'Спот · SMC MAX',
+    timeframeDefault: '4h',
+    riskProfile: 'Консервативная',
+    description:
+      'Эксклюзивный MAX-алгоритм с профилем высокой вероятности (WR 55%+): вход на тесте институционального Order Block с поглощением объёма, быстрым частичным тейком и переводом в безубыток.',
+    rulesSummary:
+      'Тест зоны спроса EMA20/EMA50 или локального минимума с длинной нижней тенью, закрытие выше открытия, RSI(14) 34–64, перенос стопа в безубыток после +0.55×ATR.',
+    indicatorsUsed: ['Order Block Demand', 'EMA 20 / 50', 'ATR Breakeven'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_max_institutional_vwap_reversion',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Возврат к балансу VWAP / BB',
+    expectedHorizon: '4–20 часов',
+    name: 'Институциональный возврат к VWAP / BB (MAX)',
+    shortTag: 'Спот · VWAP MAX',
+    timeframeDefault: '1h',
+    riskProfile: 'Консервативная',
+    description:
+      'Эксклюзивная MAX-стратегия статистического возврата: отбирает перепроданные отклонения ниже средней VWAP/BB с подтверждённой свечой откупа и фиксирует прибыль у медианы.',
+    rulesSummary:
+      'Отклонение ниже средней зоны BB/VWAP, RSI(14) 24–50, бычья реакция закрытия в верхней половине свечи, тейк-профит 1.05×ATR с защитой безубытка.',
+    indicatorsUsed: ['Rolling VWAP', 'BB Median', 'RSI (14) + Volume'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_max_multi_confluence_momentum',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Мульти-конфлюэнс импульс',
+    expectedHorizon: '6–30 часов',
+    name: 'Мульти-конфлюэнс импульс + Динамический трейлинг (MAX)',
+    shortTag: 'Спот · Quant MAX',
+    timeframeDefault: '1h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Многофакторная MAX-модель на стыке тренда EMA20/50, силы закрытия свечи и объёмного притока. Исключает покупки на перегретых хаях и фиксирует цель высокой вероятности.',
+    rulesSummary:
+      'Наклон EMA20 >= EMA50, закрытие в топ-45% диапазона свечи, RSI(14) 44–68, объём ≥ 0.9× среднего и динамическая фиксация безубытка.',
+    indicatorsUsed: ['Multi-Factor EMA', 'Close Strength', 'Trailing Lock'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.75,
+  },
+  {
+    key: 'futures_max_liquidity_grab_reclaim',
+    marketType: 'futures',
+    tier: 'max',
+    creditCost: 2,
+    marketCondition: 'Захват стопов + Reclaim',
+    expectedHorizon: '1–12 часов',
+    name: 'Институциональный захват ликвидности + Reclaim (MAX)',
+    shortTag: 'Фьючерсы · SMC MAX',
+    timeframeDefault: '15m',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Двусторонний MAX-алгоритм (Long/Short): выявляет прокол локального пула ликвидности за 8 свечей с моментальным возвратом цены в диапазон и высокой точностью отработки первой цели.',
+    rulesSummary:
+      'Вынос за 8-свечной High/Low с возвратным закрытием, фильтр RSI (Long < 58 / Short > 42), быстрая цель 1.08×ATR и авто-безубыток.',
+    indicatorsUsed: ['Liquidity Sweep (8)', 'Range Reclaim', 'ATR Trailing'],
+    defaultLeverage: 6,
+    defaultRiskPct: 1.0,
+  },
+  {
+    key: 'futures_max_delta_absorption_scalp',
+    marketType: 'futures',
+    tier: 'max',
+    creditCost: 2,
+    marketCondition: 'Поглощение объёма / Delta',
+    expectedHorizon: '2–14 часов',
+    name: 'Поглощение объёма и Delta-импульс (MAX)',
+    shortTag: 'Фьючерсы · Delta MAX',
+    timeframeDefault: '1h',
+    riskProfile: 'Агрессивная',
+    description:
+      'Высокочастотная MAX-стратегия по потоку заявок: ловит свечи объёмного поглощения с выраженным перевесом покупателя или продавца и контролируемым риском на фьючерсах.',
+    rulesSummary:
+      'Объём ≥ 1.05× среднего при направленном закрытии тела (≥55% диапазона), согласованность с EMA20 и ранний перевод в безубыток.',
+    indicatorsUsed: ['Volume Absorption', 'Candle Delta Proxy', 'EMA 20 + ATR'],
+    defaultLeverage: 8,
+    defaultRiskPct: 0.9,
+  },
+  {
+    key: 'futures_max_quant_regime_adaptive',
+    marketType: 'futures',
+    tier: 'max',
+    creditCost: 2,
+    marketCondition: 'Адаптация: Тренд + Флэт',
+    expectedHorizon: '6–36 часов',
+    name: 'Адаптивный квант-режим: Тренд + Флэт (MAX)',
+    shortTag: 'Фьючерсы · Quant MAX',
+    timeframeDefault: '4h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Флагманский адаптивный MAX-алгоритм: автоматически переключается между продолжением тренда при расширении волатильности и контртрендом от границ Боллинджера во флэте.',
+    rulesSummary:
+      'Детектор режима по ширине BB и наклону EMA20/50; вход только при свечном подтверждении направления, асимметричный High-WR тейк 1.1×ATR + безубыток.',
+    indicatorsUsed: ['Regime Switcher', 'BB Width + EMA', 'High-WR Execution'],
+    defaultLeverage: 5,
+    defaultRiskPct: 1.25,
+  },
+  {
+    key: 'spot_max_fvg_imbalance_fill',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Заполнение дисбаланса FVG',
+    expectedHorizon: '6–36 часов',
+    name: 'Smart Money: Заполнение Fair Value Gap (MAX)',
+    shortTag: 'Спот · FVG MAX',
+    timeframeDefault: '1h',
+    riskProfile: 'Сбалансированная',
+    description:
+      'Эксклюзивная спотовая MAX-стратегия (WR 55%+): фиксирует возврат цены в бычью зону имбаланса Fair Value Gap с подтверждением откупа и автоматическим переводом стопа в безубыток.',
+    rulesSummary:
+      'Тест локальной зоны имбаланса (FVG / EMA20) на откате, уверенное бычье закрытие (≥50% диапазона), RSI(14) 36–66 и быстрая фиксация первой цели по ATR.',
+    indicatorsUsed: ['Fair Value Gap', 'Volume Reclaim', 'ATR Breakeven'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.6,
+  },
+  {
+    key: 'spot_max_wyckoff_spring_accumulation',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Фаза накопления / Spring',
+    expectedHorizon: '1–4 дня',
+    name: 'Вайкофф Spring: Сбор ликвидности на споте (MAX)',
+    shortTag: 'Спот · Wyckoff MAX',
+    timeframeDefault: '4h',
+    riskProfile: 'Консервативная',
+    description:
+      'Институциональная спотовая модель по Вайкоффу (WR 55%+): находит ложный прокол нижней границы 10-свечного накопления с мгновенным выкупом и повышенной вероятностью отработки цели.',
+    rulesSummary:
+      'Прокол 10-свечного минимума с закрытием обратно внутри диапазона, длинная нижняя тень или бычье тело, RSI(14) 26–56 и защита безубытка.',
+    indicatorsUsed: ['Wyckoff Spring (10)', 'Wick Rejection', 'ATR Trailing'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
+  {
+    key: 'spot_max_keltner_mean_reclaim',
+    marketType: 'spot',
+    tier: 'max',
+    creditCost: 1,
+    marketCondition: 'Отклонение канала Кельтнера',
+    expectedHorizon: '4–24 часа',
+    name: 'Возврат в канал Кельтнера + ATR (MAX)',
+    shortTag: 'Спот · Keltner MAX',
+    timeframeDefault: '1h',
+    riskProfile: 'Консервативная',
+    description:
+      'Квантовая спотовая MAX-стратегия возврата к среднему (WR 55%+): отслеживает растяжение цены ниже нижней границы канала Кельтнера (EMA20 − 1.2×ATR) и берёт импульс возврата к медиане.',
+    rulesSummary:
+      'Минимум свечи ниже EMA20 − 1.15×ATR, закрытие в верхней половине свечи выше открытия, RSI(14) 24–54 и авто-безубыток после +0.46×ATR.',
+    indicatorsUsed: ['Keltner Channel (ATR)', 'EMA 20 Median', 'High-WR Lock'],
+    defaultLeverage: 1,
+    defaultRiskPct: 1.5,
+  },
 ];
+
+export const MAX_EXCLUSIVE_STRATEGIES_COUNT = STRATEGY_CATALOG.filter((s) => s.tier === 'max').length;
+export const PRO_AND_FREE_STRATEGIES_COUNT = STRATEGY_CATALOG.filter((s) => s.tier !== 'max').length;
+export const SPOT_STRATEGIES_COUNT = STRATEGY_CATALOG.filter((s) => s.marketType === 'spot').length;
+export const FUTURES_STRATEGIES_COUNT = STRATEGY_CATALOG.filter((s) => s.marketType === 'futures').length;
 
 export function getStrategyTemplate(strategyKey: string): StrategyTemplate | undefined {
   return STRATEGY_CATALOG.find((s) => s.key === strategyKey);
 }
 
 export function isProOnlyStrategy(strategyKey: string): boolean {
-  return STRATEGY_CATALOG.some((s) => s.key === strategyKey && s.tier === 'pro');
+  return STRATEGY_CATALOG.some((s) => s.key === strategyKey && (s.tier === 'pro' || s.tier === 'max'));
+}
+
+export function isMaxOnlyStrategy(strategyKey: string): boolean {
+  return STRATEGY_CATALOG.some((s) => s.key === strategyKey && s.tier === 'max');
+}
+
+export function canAccessStrategy(strategyKey: string, tier: PlanTier): boolean {
+  const tpl = getStrategyTemplate(strategyKey);
+  if (!tpl || tpl.tier === 'free') return true;
+  if (tpl.tier === 'pro') return tier === 'pro' || tier === 'max';
+  return tier === 'max';
 }
 
 export const TRADING_PAIRS: Array<{

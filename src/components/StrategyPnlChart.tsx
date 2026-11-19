@@ -13,8 +13,19 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { ArrowDownRight, ArrowUpRight, Crown, Lock, RefreshCw, TrendingUp } from 'lucide-react';
-import { CREDIT_COSTS, FREE_MAX_LEVERAGE, PRO_MONTHLY_QUOTA, STRATEGY_CATALOG } from '../data/strategies';
+import { ArrowDownRight, ArrowUpRight, Crown, Lock, RefreshCw, Sparkles, TrendingUp } from 'lucide-react';
+import {
+  CREDIT_COSTS,
+  FREE_MAX_LEVERAGE,
+  FREE_WEEKLY_QUOTA,
+  MAX_X10_MONTHLY_QUOTA,
+  MAX_X20_MONTHLY_QUOTA,
+  PRO_MONTHLY_QUOTA,
+  STRATEGY_CATALOG,
+  canAccessStrategy,
+  getStrategyTemplate,
+} from '../data/strategies';
+import { authFetch } from '../lib/authFetch';
 import type {
   EquityCurvePoint,
   StrategyBreakdownResult,
@@ -25,10 +36,12 @@ import type {
 interface StrategyPnlChartProps {
   strategies: StrategyConfig[];
   isPro: boolean;
+  isMax?: boolean;
   isSignedIn?: boolean;
   creditsRemaining?: number;
   creditQuota?: number;
   onUpgradePro?: () => void;
+  onUpgradeMax?: () => void;
   onConsumeCredits?: (amount: number, auditReason?: string) => Promise<boolean>;
 }
 
@@ -120,13 +133,15 @@ const StrategyBarTooltip: React.FC<CustomBarTooltipProps> = ({ active, payload }
 export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
   strategies,
   isPro,
+  isMax = false,
   isSignedIn = false,
   creditsRemaining,
-  creditQuota = 15,
+  creditQuota = FREE_WEEKLY_QUOTA,
   onUpgradePro,
+  onUpgradeMax,
   onConsumeCredits,
 }) => {
-  const [interval, setInterval] = useState<'1h' | '4h'>('1h');
+  const [interval, setInterval] = useState<'1h' | '4h' | '1d'>('1h');
   const [scope, setScope] = useState<'active' | 'all'>('active');
   const [unitMode, setUnitMode] = useState<'pct' | 'usdt'>('pct');
   const [depositUsdt, setDepositUsdt] = useState<number>(2500);
@@ -137,6 +152,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
 
   const isOutOfCredits = Boolean(
     isSignedIn &&
+      !isMax &&
       typeof creditsRemaining === 'number' &&
       creditsRemaining < CREDIT_COSTS.portfolioBacktest
   );
@@ -145,13 +161,16 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
     if (!isPro) {
       if (interval !== '1h') setInterval('1h');
       if (scope !== 'active') setScope('active');
+    } else if (!isMax && interval === '1d') {
+      setInterval('4h');
     }
-  }, [isPro, interval, scope]);
+  }, [isPro, isMax, interval, scope]);
 
   const simulationPayload = useMemo(() => {
+    const activeTier = isMax ? 'max' : isPro ? 'pro' : 'free';
     return STRATEGY_CATALOG.map((tpl) => {
       const cfg = strategies.find((s) => s.strategyKey === tpl.key);
-      const isAllowed = isPro || tpl.tier === 'free';
+      const isAllowed = canAccessStrategy(tpl.key, activeTier);
       const defaultEnabled = tpl.key === 'spot_trend_breakout' || tpl.key === 'futures_momentum_atr';
       return {
         strategyKey: tpl.key,
@@ -170,7 +189,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
         pairs: cfg?.pairs?.length ? cfg.pairs : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
       };
     });
-  }, [strategies, isPro]);
+  }, [strategies, isPro, isMax]);
 
   const activeSelectedCount = useMemo(
     () => simulationPayload.filter((s) => s.enabled).length,
@@ -181,7 +200,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/strategies/pnl', {
+      const res = await authFetch('/api/strategies/pnl', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -209,7 +228,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
       onUpgradePro?.();
       return;
     }
-    if (isSignedIn && onConsumeCredits) {
+    if (isSignedIn && !isMax && onConsumeCredits) {
       try {
         await onConsumeCredits(CREDIT_COSTS.portfolioBacktest, 'Ручной пересчёт бэктеста PnL');
       } catch (err) {
@@ -315,6 +334,29 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
               {!isPro && <Lock className="w-3 h-3 text-amber-400 shrink-0" />}
               <span>4H · ~15д</span>
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (!isMax) {
+                  (onUpgradeMax ?? onUpgradePro)?.();
+                  return;
+                }
+                setInterval('1d');
+              }}
+              className={`min-h-[36px] px-3 rounded-lg text-xs font-mono font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                interval === '1d'
+                  ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/40'
+                  : 'text-slate-400 hover:text-cyan-200'
+              }`}
+              title="Глубокий 3-месячный бэктест доступен в MAX"
+            >
+              {!isMax ? (
+                <Lock className="w-3 h-3 text-cyan-400 shrink-0" />
+              ) : (
+                <Sparkles className="w-3 h-3 text-cyan-300 shrink-0" />
+              )}
+              <span>1D · ~90д</span>
+            </button>
           </div>
 
           {/* Unit Toggle (% vs $) */}
@@ -357,11 +399,15 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
           {isOutOfCredits ? (
             <button
               type="button"
-              onClick={() => onUpgradePro?.()}
+              onClick={() => (isPro && !isMax ? (onUpgradeMax ?? onUpgradePro)?.() : onUpgradePro?.())}
               className="cta-shimmer min-h-[40px] px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
             >
               <Crown className="w-3.5 h-3.5 shrink-0" />
-              <span>{isPro ? `Продлить PRO (+${PRO_MONTHLY_QUOTA} кр.)` : 'Перейти на PRO'}</span>
+              <span>
+                {isPro
+                  ? `Безлимит в MAX (${MAX_X10_MONTHLY_QUOTA}–${MAX_X20_MONTHLY_QUOTA} кр.)`
+                  : 'Перейти на PRO / MAX'}
+              </span>
             </button>
           ) : (
             <button
@@ -373,9 +419,11 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
               <span className="hidden sm:inline">
-                {isSignedIn
-                  ? `Пересчитать (${CREDIT_COSTS.portfolioBacktest} кр.)`
-                  : 'Пересчитать'}
+                {isMax
+                  ? 'Пересчитать (0 кр. · MAX)'
+                  : isSignedIn
+                    ? `Пересчитать (${CREDIT_COSTS.portfolioBacktest} кр.)`
+                    : 'Пересчитать'}
               </span>
             </button>
           )}
@@ -394,17 +442,17 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
               </div>
               <p className="mt-0.5 text-amber-200/80">
                 {isPro
-                  ? `Продлите подписку PRO, чтобы пополнить +${PRO_MONTHLY_QUOTA} кредитов для новых пересчётов и AI-сигналов.`
-                  : `Перейдите на PRO: ${PRO_MONTHLY_QUOTA} кредитов на месяц, 4H-бэктест всех ${STRATEGY_CATALOG.length} стратегий и снятие дневных лимитов сигналов.`}
+                  ? `Продлите PRO (+${PRO_MONTHLY_QUOTA} кр.) или перейдите на MAX X10 / X20 (${MAX_X10_MONTHLY_QUOTA}–${MAX_X20_MONTHLY_QUOTA} кр. и 0 кр. за бэктесты).`
+                  : `Перейдите на PRO (${PRO_MONTHLY_QUOTA} кр.) или MAX (${MAX_X10_MONTHLY_QUOTA}–${MAX_X20_MONTHLY_QUOTA} кр.): 4H/1D-бэктесты всех ${STRATEGY_CATALOG.length} стратегий и безлимит сигналов.`}
               </p>
             </div>
           </div>
           <button
             type="button"
-            onClick={() => onUpgradePro?.()}
+            onClick={() => (isPro && !isMax ? (onUpgradeMax ?? onUpgradePro)?.() : onUpgradePro?.())}
             className="cta-shimmer min-h-[38px] px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold whitespace-nowrap shrink-0 transition-colors"
           >
-            {isPro ? 'Продлить PRO' : 'Оформить PRO'}
+            {isPro ? 'Открыть MAX (X10 / X20)' : 'Оформить PRO / MAX'}
           </button>
         </div>
       )}
@@ -662,33 +710,47 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/6 font-mono tabular-nums">
-                {report.breakdown.map((row) => (
-                  <tr key={row.strategyKey} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="py-2.5 pr-4 font-sans font-medium text-white whitespace-nowrap">
-                      {row.name}
-                    </td>
-                    <td className="py-2.5 px-3 font-sans text-slate-400 whitespace-nowrap">
-                      {row.marketType === 'futures' ? 'Фьючерсы' : 'Спот'}
-                    </td>
-                    <td
-                      className={`py-2.5 px-3 font-sans font-medium whitespace-nowrap ${
-                        row.enabled ? 'text-emerald-400' : 'text-slate-500'
-                      }`}
-                    >
-                      {row.enabled ? 'Активен' : 'Неактивен'}
-                    </td>
-                    <td className="py-2.5 px-3 text-right text-slate-300">{row.tradesCount}</td>
-                    <td className="py-2.5 px-3 text-right text-slate-200">{row.winRatePct}%</td>
-                    <td className="py-2.5 px-3 text-right text-rose-300">{row.maxDrawdownPct}%</td>
-                    <td
-                      className={`py-2.5 pl-3 text-right font-semibold whitespace-nowrap ${
-                        row.totalPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                      }`}
-                    >
-                      {formatSignedPct(row.totalPnlPct)} · {formatSignedUsdt(row.totalPnlUsdt)}
-                    </td>
-                  </tr>
-                ))}
+                {report.breakdown.map((row) => {
+                  const tplTier = getStrategyTemplate(row.strategyKey)?.tier;
+                  return (
+                    <tr key={row.strategyKey} className="hover:bg-white/[0.02] transition-colors">
+                      <td className="py-2.5 pr-4 font-sans font-medium text-white whitespace-nowrap">
+                        <span className="inline-flex items-center gap-1.5">
+                          {tplTier === 'max' && (
+                            <span className="font-mono text-[10px] font-semibold text-cyan-300">MAX</span>
+                          )}
+                          <span>{row.name}</span>
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 font-sans text-slate-400 whitespace-nowrap">
+                        {row.marketType === 'futures' ? 'Фьючерсы' : 'Спот'}
+                      </td>
+                      <td
+                        className={`py-2.5 px-3 font-sans font-medium whitespace-nowrap ${
+                          row.enabled ? 'text-emerald-400' : 'text-slate-500'
+                        }`}
+                      >
+                        {row.enabled ? 'Активен' : 'Неактивен'}
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-300">{row.tradesCount}</td>
+                      <td
+                        className={`py-2.5 px-3 text-right ${
+                          row.winRatePct >= 55 ? 'text-emerald-300 font-semibold' : 'text-slate-200'
+                        }`}
+                      >
+                        {row.winRatePct}%
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-rose-300">{row.maxDrawdownPct}%</td>
+                      <td
+                        className={`py-2.5 pl-3 text-right font-semibold whitespace-nowrap ${
+                          row.totalPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {formatSignedPct(row.totalPnlPct)} · {formatSignedUsdt(row.totalPnlUsdt)}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

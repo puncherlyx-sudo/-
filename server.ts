@@ -6,24 +6,29 @@ import http from 'http';
 import path from 'path';
 import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
-import { isAllowedPushEndpoint, requireAuth } from './server/auth.ts';
+import { isAllowedPushEndpoint, requireAuth, verifyFirebaseIdToken } from './server/auth.ts';
 import {
   createCheckout,
+  getMaxMultiplierPlans,
   getPlanPrices,
+  getTieredPlanPrices,
   getUserPlanTier,
   isBillingConfigured,
   processIpn,
   startProExpiryMonitor,
   verifyIpnSignature,
   type BillingPeriod,
+  type MaxMultiplier,
+  type SubscriptionTier,
 } from './server/billing.ts';
-import { FREE_MAX_LEVERAGE, isProOnlyStrategy } from './src/data/strategies.ts';
+import { CREDIT_COSTS, FREE_MAX_LEVERAGE, STRATEGY_CATALOG, isProOnlyStrategy } from './src/data/strategies.ts';
 import {
   AiServiceError,
   askTerminalAssistant,
   fetchEconomicCalendar,
   fetchGroundedCryptoNews,
   runStrategyAnalysis,
+  translateNewsBatchToRussian,
   type TerminalChatTurn,
 } from './server/aiAnalyst.ts';
 import {
@@ -33,12 +38,18 @@ import {
   getMarketOverview,
   SUPPORTED_SYMBOLS,
 } from './server/market.ts';
-import { runStrategyPortfolioBacktest, type StrategySimulationInput } from './server/strategyBacktest.ts';
+import {
+  runLiveStrategyScanner,
+  runStrategyPortfolioBacktest,
+  type StrategySimulationInput,
+} from './server/strategyBacktest.ts';
 import {
   checkPriceAlertsForUser,
   dispatchPushToUser,
   getVapidPublicKey,
   notifyHighImpactNews,
+  notifyPortfolioDailyPnl,
+  notifyPortfolioTargetReached,
   registerPushSubscription,
   scanMarketAndNotify,
   startMarketAlertMonitor,
@@ -54,6 +65,14 @@ import {
   hashBackupCode,
   verifyTotpCode,
 } from './server/security.ts';
+import {
+  connectAndEncryptExchange,
+  ExchangeApiError,
+  executeEncryptedExchangeOrder,
+  isValidExchangeId,
+  isValidPermissions,
+  syncEncryptedExchangeBalances,
+} from './server/exchanges.ts';
 
 async function startServer() {
   const app = express();
@@ -82,7 +101,15 @@ async function startServer() {
                 'https://*.firebaseapp.com',
                 'wss://*.firebaseio.com',
               ],
-              'frame-src': ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com', 'https://apis.google.com'],
+              'frame-src': [
+                "'self'",
+                'https://*.firebaseapp.com',
+                'https://accounts.google.com',
+                'https://apis.google.com',
+                'https://www.tradingview-widget.com',
+                'https://s.tradingview.com',
+                'https://*.tradingview.com',
+              ],
               'worker-src': ["'self'", 'blob:'],
               'manifest-src': ["'self'"],
               'object-src': ["'none'"],
@@ -308,13 +335,13 @@ async function startServer() {
   app.get('/api/widgets/template/:kind', (req, res) => {
     const kind = String(req.params.kind || 'price');
     const titles: Record<string, string> = {
-      chart: 'AegisQuant · График',
-      price: 'AegisQuant · Цена',
-      position: 'AegisQuant · Позиция',
-      pnl: 'AegisQuant · Доходность',
-      strategies: 'AegisQuant · Стратегии',
+      chart: 'Vernier · График',
+      price: 'Vernier · Цена',
+      position: 'Vernier · Позиция',
+      pnl: 'Vernier · Доходность',
+      strategies: 'Vernier · Стратегии',
     };
-    const title = titles[kind] || 'AegisQuant · Виджет';
+    const title = titles[kind] || 'Vernier · Виджет';
 
     const bodyByKind: Record<string, unknown[]> = {
       price: [
@@ -355,7 +382,7 @@ async function startServer() {
       actions: [
         {
           type: 'Action.OpenUrl',
-          title: 'Открыть в AegisQuant',
+          title: 'Открыть в Vernier',
           url: `/?widget=${encodeURIComponent(kind)}`,
         },
       ],
@@ -383,6 +410,22 @@ async function startServer() {
         return;
       }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки новостей' });
+    }
+  });
+
+  // Batch full-sentence Russian translation for English RSS/news headlines
+  app.post('/api/news/translate', async (req, res) => {
+    try {
+      const body = req.body as { items?: Array<{ id: string; title: string; summary: string }> };
+      const list = Array.isArray(body?.items) ? body.items.slice(0, 24) : [];
+      if (list.length === 0) {
+        res.json({ translations: {} });
+        return;
+      }
+      const translations = await translateNewsBatchToRussian(list);
+      res.json({ translations });
+    } catch {
+      res.json({ translations: {} });
     }
   });
 
@@ -416,11 +459,11 @@ async function startServer() {
       const depositUsdt = Math.min(10_000_000, Math.max(10, Number(body.depositUsdt || 1000)));
       const riskPerTradePct = Math.min(10, Math.max(0.25, Number(body.riskPerTradePct || 1.5)));
       const dbPlan = await getUserPlanTier(req.user!.uid);
-      const isPro = dbPlan === 'pro';
+      const isPro = dbPlan === 'pro' || dbPlan === 'max';
 
       if (isProOnlyStrategy(strategyKey) && !isPro) {
         res.status(403).json({
-          error: 'Выбранная стратегия доступна только в подписке PRO. Выберите базовую стратегию или обновите тариф.',
+          error: 'Выбранная стратегия доступна только в подписке PRO или MAX. Выберите базовую стратегию или обновите тариф.',
           code: 'PRO_REQUIRED',
         });
         return;
@@ -444,6 +487,7 @@ async function startServer() {
         riskPerTradePct,
         leverage,
         isPro,
+        planTier: dbPlan || 'free',
       });
 
       res.json({
@@ -460,6 +504,19 @@ async function startServer() {
     }
   });
 
+  // Helper to optionally resolve verified plan tier from Authorization header
+  const resolveOptionalUserTier = async (req: express.Request): Promise<'free' | 'pro' | 'max'> => {
+    const header = req.headers.authorization;
+    const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
+    if (!match) return 'free';
+    try {
+      const verified = await verifyFirebaseIdToken(match[1]);
+      return (await getUserPlanTier(verified.uid)) || 'free';
+    } catch {
+      return 'free';
+    }
+  };
+
   // Quantitative Strategy PnL Portfolio Backtest (based on live/cached exchange candles)
   app.post('/api/strategies/pnl', expensiveLimiter, async (req, res) => {
     try {
@@ -473,15 +530,346 @@ async function startServer() {
         res.status(400).json({ error: 'Передайте хотя бы одну стратегию для расчета PnL.' });
         return;
       }
+      let requestedInterval: '1h' | '4h' | '1d' =
+        body.interval === '1d' ? '1d' : body.interval === '4h' ? '4h' : '1h';
+      if (requestedInterval === '1d') {
+        const tier = await resolveOptionalUserTier(req);
+        if (tier !== 'max') {
+          requestedInterval = '4h';
+        }
+      }
       const report = await runStrategyPortfolioBacktest({
-        strategies: body.strategies.slice(0, 12),
-        interval: body.interval === '4h' ? '4h' : '1h',
+        strategies: body.strategies.slice(0, 40),
+        interval: requestedInterval,
         depositUsdt: Number(body.depositUsdt || 2500),
         scope: body.scope === 'all' ? 'all' : 'active',
       });
       res.json(report);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка расчета доходности стратегий' });
+    }
+  });
+
+  // Live Multi-Pair Quantitative Strategy Scanner (PRO: top-16 pairs, MAX: all 44 pairs + 4H)
+  app.post('/api/strategies/scanner', expensiveLimiter, async (req, res) => {
+    try {
+      const tier = await resolveOptionalUserTier(req);
+      const body = req.body as {
+        timeframe?: string;
+        minConfidence?: number;
+        marketFilter?: 'all' | 'spot' | 'futures';
+      };
+
+      const maxPairs = tier === 'max' ? SUPPORTED_SYMBOLS.length : tier === 'pro' ? 16 : 3;
+      const timeframe: '1h' | '4h' = tier === 'max' && body.timeframe === '4h' ? '4h' : '1h';
+      const minConfidence = Math.min(95, Math.max(55, Number(body.minConfidence || 70)));
+      const marketFilter = body.marketFilter === 'spot' || body.marketFilter === 'futures' ? body.marketFilter : 'all';
+
+      const allowedStrategies = STRATEGY_CATALOG.filter((tpl) => {
+        if (marketFilter !== 'all' && tpl.marketType !== marketFilter) return false;
+        if (tier === 'free') return tpl.tier === 'free';
+        if (tier === 'pro') return tpl.tier !== 'max';
+        return true;
+      }).map((tpl) => ({
+        strategyKey: tpl.key,
+        name: tpl.name,
+        marketType: tpl.marketType,
+        tier: tpl.tier,
+      }));
+
+      const scanSymbols = SUPPORTED_SYMBOLS.slice(0, maxPairs);
+      const opportunities = await runLiveStrategyScanner({
+        symbols: scanSymbols,
+        strategies: allowedStrategies,
+        timeframe,
+        minConfidence,
+      });
+
+      res.json({
+        tier,
+        scannedPairsCount: scanSymbols.length,
+        totalPairsAvailable: SUPPORTED_SYMBOLS.length,
+        timeframe,
+        opportunities,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка сканера торговых сетапов' });
+    }
+  });
+
+  // Exclusive PRO/MAX Advanced Market Sentiment forecast + real Free-vs-Sentiment backtest comparison
+  app.post('/api/strategies/sentiment', expensiveLimiter, async (req, res) => {
+    try {
+      const dbTier = await resolveOptionalUserTier(req);
+      const body = req.body as { asset?: string; interval?: string; demoTier?: string };
+      const requestedDemoTier: 'pro' | 'max' | null =
+        body.demoTier === 'max' ? 'max' : body.demoTier === 'pro' ? 'pro' : null;
+      const tier =
+        dbTier === 'max'
+          ? 'max'
+          : dbTier === 'pro'
+            ? requestedDemoTier === 'max'
+              ? 'max'
+              : 'pro'
+            : requestedDemoTier ?? 'free';
+      const rawAsset = String(body.asset || 'ALL').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'ALL';
+      const allowedAssets = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
+      const asset = allowedAssets.has(rawAsset) ? rawAsset : 'ALL';
+
+      const requestedInterval: '1h' | '4h' | '1d' =
+        tier === 'max' && body.interval === '1d'
+          ? '1d'
+          : tier !== 'free' && body.interval === '4h'
+            ? '4h'
+            : '1h';
+
+      const [fearGreed, spotTickers, futuresTickers] = await Promise.all([
+        getFearAndGreedIndex(),
+        getMarketOverview('spot'),
+        getMarketOverview('futures'),
+      ]);
+
+      const advancingCount = spotTickers.filter((t) => t.change24hPct > 0).length;
+      const decliningCount = spotTickers.length - advancingCount;
+      const advancingPct =
+        spotTickers.length > 0 ? Number(((advancingCount / spotTickers.length) * 100).toFixed(1)) : 50;
+      const avgChange24hPct =
+        spotTickers.length > 0
+          ? Number((spotTickers.reduce((acc, t) => acc + t.change24hPct, 0) / spotTickers.length).toFixed(2))
+          : 0;
+      const fundingItems = futuresTickers.filter((t) => typeof t.fundingRatePct === 'number');
+      const avgFundingRatePct =
+        fundingItems.length > 0
+          ? Number((fundingItems.reduce((acc, t) => acc + (t.fundingRatePct ?? 0), 0) / fundingItems.length).toFixed(4))
+          : 0.01;
+
+      const delta7d = fearGreed.value - fearGreed.weekAgoValue;
+
+      // Locked preview for Free users (never expose full PRO/MAX catalysts or forecasts)
+      if (tier === 'free') {
+        res.json({
+          locked: true,
+          tier,
+          asset,
+          interval: '1h',
+          compositeScore: Math.round(fearGreed.value * 0.55 + advancingPct * 0.45),
+          forecastBias: 'NEUTRAL_ROTATION',
+          forecastHeadline: 'Доступно в подписке PRO и MAX',
+          forecastSummary:
+            'Модуль «Advanced Market Sentiment» объединяет индекс Fear & Greed, ширину рынка (44 пары), ставки Funding и новостной сентимент с проверкой реального Win Rate на исторических свечах.',
+          fearGreed: {
+            value: fearGreed.value,
+            classificationRu: fearGreed.classificationRu,
+            yesterdayValue: fearGreed.yesterdayValue,
+            weekAgoValue: fearGreed.weekAgoValue,
+            monthAgoValue: fearGreed.monthAgoValue,
+            delta7d,
+          },
+          marketBreadth: {
+            advancingCount,
+            decliningCount,
+            totalPairs: spotTickers.length,
+            advancingPct,
+            avgChange24hPct,
+            avgFundingRatePct,
+          },
+          newsBreakdown: {
+            bullishCount: 0,
+            bearishCount: 0,
+            neutralCount: 0,
+            catalysts: [],
+          },
+          comparison: {
+            sentimentStrategy: null,
+            freeAverageWinRatePct: 0,
+            freeAveragePnlPct: 0,
+            winRateDeltaPp: 0,
+            pnlDeltaPct: 0,
+            freeStrategies: [],
+          },
+          updatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const newsPromise = fetchGroundedCryptoNews(asset, false).catch(() => ({
+        items: [],
+        notice: '',
+        source: 'rss' as const,
+      }));
+
+      const freeTemplates = STRATEGY_CATALOG.filter((s) => s.tier === 'free');
+      const sentimentTemplate = STRATEGY_CATALOG.find((s) => s.key === 'spot_advanced_market_sentiment');
+      const evalPairs =
+        asset !== 'ALL' && (SUPPORTED_SYMBOLS as readonly string[]).includes(`${asset}USDT`)
+          ? [`${asset}USDT`, 'BTCUSDT']
+          : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+
+      const simInputs: StrategySimulationInput[] = [
+        ...(sentimentTemplate ? [sentimentTemplate] : []),
+        ...freeTemplates,
+      ].map((tpl) => ({
+        strategyKey: tpl.key,
+        name: tpl.name,
+        shortTag: tpl.shortTag,
+        marketType: tpl.marketType,
+        enabled: true,
+        dailySignalLimit: tpl.tier === 'pro' ? 0 : 1,
+        minConfidence: 70,
+        riskPerTradePct: tpl.defaultRiskPct,
+        leverage: tpl.marketType === 'futures' ? Math.min(FREE_MAX_LEVERAGE, tpl.defaultLeverage) : 1,
+        pairs: evalPairs,
+      }));
+
+      const [newsFeed, backtestReport] = await Promise.all([
+        newsPromise,
+        runStrategyPortfolioBacktest({
+          strategies: simInputs,
+          interval: requestedInterval,
+          depositUsdt: 2500,
+          scope: 'all',
+        }),
+      ]);
+
+      const maxCatalysts = tier === 'max' ? 6 : 3;
+      const catalysts = newsFeed.items.slice(0, maxCatalysts);
+      const bullishCount = newsFeed.items.filter((i) => i.sentiment === 'BULLISH').length;
+      const bearishCount = newsFeed.items.filter((i) => i.sentiment === 'BEARISH').length;
+      const neutralCount = newsFeed.items.filter((i) => i.sentiment === 'NEUTRAL').length;
+      const newsTotal = Math.max(1, newsFeed.items.length);
+      const newsScore = Math.max(0, Math.min(100, Math.round(50 + ((bullishCount - bearishCount) / newsTotal) * 45)));
+      const fundingRegimeScore =
+        avgFundingRatePct > 0.045 ? 38 : avgFundingRatePct < -0.02 ? 62 : 55 + avgChange24hPct * 1.4;
+      const compositeScore = Math.max(
+        5,
+        Math.min(
+          95,
+          Math.round(
+            fearGreed.value * 0.35 +
+              advancingPct * 0.25 +
+              Math.max(10, Math.min(90, fundingRegimeScore)) * 0.2 +
+              newsScore * 0.2
+          )
+        )
+      );
+
+      let forecastBias: 'BULLISH_EXPANSION' | 'ACCUMULATION_BIAS' | 'NEUTRAL_ROTATION' | 'RISK_OFF_HEDGING' =
+        'NEUTRAL_ROTATION';
+      let forecastHeadline = 'Нейтральная ротация капитала (24–72ч)';
+      let forecastSummary =
+        'Рынок сбалансирован без выраженного перегрева деривативов. Оптимальны выборочные входы по подтверждению объёма и откатам к EMA20.';
+
+      if (compositeScore >= 64 && avgFundingRatePct < 0.04) {
+        forecastBias = 'BULLISH_EXPANSION';
+        forecastHeadline = 'Конструктивный бычий импульс (24–72ч)';
+        forecastSummary = `Ширина спотового рынка ${advancingPct}% в плюсе (${advancingCount}/${spotTickers.length} пар), сентимент новостей преобладает позитивный (${bullishCount} против ${bearishCount}), а ставка финансирования (${avgFundingRatePct}%) не перегрета.`;
+      } else if (fearGreed.value <= 38 && (delta7d >= -4 || bullishCount >= bearishCount)) {
+        forecastBias = 'ACCUMULATION_BIAS';
+        forecastHeadline = 'Зона осторожного накопления против толпы (24–72ч)';
+        forecastSummary = `Индекс страха (${fearGreed.value}/100) указывает на пессимизм ритейла при умеренном давлении в новостях. Исторически в этой фазе работают поэтапные длинные сетапы от поддержки.`;
+      } else if (compositeScore <= 42 || avgFundingRatePct >= 0.05) {
+        forecastBias = 'RISK_OFF_HEDGING';
+        forecastHeadline = 'Защитный режим / повышенный риск отката (24–72ч)';
+        forecastSummary = `Слабая ширина рынка (${advancingPct}% в росте) или перегрев деривативов (Funding ${avgFundingRatePct}%). Рекомендуется сократить риск на сделку и ждать подтверждения разворота.`;
+      }
+
+      const sentimentRowRaw = backtestReport.breakdown.find(
+        (b) => b.strategyKey === 'spot_advanced_market_sentiment'
+      );
+      const freeRowsRaw = backtestReport.breakdown.filter((b) =>
+        freeTemplates.some((f) => f.key === b.strategyKey)
+      );
+
+      const sentimentStrategy = sentimentRowRaw
+        ? {
+            strategyKey: sentimentRowRaw.strategyKey,
+            name: sentimentRowRaw.name,
+            tier: 'pro' as const,
+            winRatePct: sentimentRowRaw.winRatePct,
+            totalPnlPct: sentimentRowRaw.totalPnlPct,
+            profitFactor: sentimentRowRaw.profitFactor,
+            tradesCount: sentimentRowRaw.tradesCount,
+          }
+        : null;
+
+      const freeStrategies = freeRowsRaw.map((r) => ({
+        strategyKey: r.strategyKey,
+        name: r.name,
+        tier: 'free' as const,
+        winRatePct: r.winRatePct,
+        totalPnlPct: r.totalPnlPct,
+        profitFactor: r.profitFactor,
+        tradesCount: r.tradesCount,
+      }));
+
+      const freeAverageWinRatePct =
+        freeStrategies.length > 0
+          ? Number(
+              (
+                freeStrategies.reduce((acc, r) => acc + r.winRatePct, 0) / freeStrategies.length
+              ).toFixed(1)
+            )
+          : 0;
+      const freeAveragePnlPct =
+        freeStrategies.length > 0
+          ? Number(
+              (
+                freeStrategies.reduce((acc, r) => acc + r.totalPnlPct, 0) / freeStrategies.length
+              ).toFixed(2)
+            )
+          : 0;
+
+      const winRateDeltaPp = sentimentStrategy
+        ? Number((sentimentStrategy.winRatePct - freeAverageWinRatePct).toFixed(1))
+        : 0;
+      const pnlDeltaPct = sentimentStrategy
+        ? Number((sentimentStrategy.totalPnlPct - freeAveragePnlPct).toFixed(2))
+        : 0;
+
+      res.json({
+        locked: false,
+        tier,
+        asset,
+        interval: requestedInterval,
+        compositeScore,
+        forecastBias,
+        forecastHeadline,
+        forecastSummary,
+        fearGreed: {
+          value: fearGreed.value,
+          classificationRu: fearGreed.classificationRu,
+          yesterdayValue: fearGreed.yesterdayValue,
+          weekAgoValue: fearGreed.weekAgoValue,
+          monthAgoValue: fearGreed.monthAgoValue,
+          delta7d,
+        },
+        marketBreadth: {
+          advancingCount,
+          decliningCount,
+          totalPairs: spotTickers.length,
+          advancingPct,
+          avgChange24hPct,
+          avgFundingRatePct,
+        },
+        newsBreakdown: {
+          bullishCount,
+          bearishCount,
+          neutralCount,
+          catalysts,
+        },
+        comparison: {
+          sentimentStrategy,
+          freeAverageWinRatePct,
+          freeAveragePnlPct,
+          winRateDeltaPp,
+          pnlDeltaPct,
+          freeStrategies,
+        },
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка загрузки модуля настроений' });
     }
   });
 
@@ -497,7 +885,7 @@ async function startServer() {
         return;
       }
       const plainSecret = generateBase32Secret(20);
-      const otpauthUri = buildOtpAuthUri(email, 'AegisQuant', plainSecret);
+      const otpauthUri = buildOtpAuthUri(email, 'Vernier', plainSecret);
       const qrDataUrl = await QRCode.toDataURL(otpauthUri, {
         margin: 2,
         width: 220,
@@ -716,19 +1104,28 @@ async function startServer() {
     });
   });
 
-  // Оплата PRO (криптовалюта через NOWPayments)
+  // Оплата PRO / MAX (криптовалюта через NOWPayments)
   app.get('/api/billing/plans', (_req, res) => {
-    res.json({ enabled: isBillingConfigured(), plans: getPlanPrices() });
+    res.json({
+      enabled: isBillingConfigured(),
+      plans: getPlanPrices(),
+      tiers: getTieredPlanPrices(),
+      maxMultipliers: getMaxMultiplierPlans(),
+      creditCosts: CREDIT_COSTS,
+    });
   });
 
   app.post('/api/billing/checkout', requireAuth, strictAuthLimiter, async (req, res) => {
     try {
-      const period = (req.body as { period?: unknown })?.period;
+      const body = req.body as { period?: unknown; tier?: unknown; maxMultiplier?: unknown };
+      const period = body?.period;
       if (period !== 'month' && period !== 'year') {
         res.status(400).json({ error: 'Выберите период подписки: месяц или год.' });
         return;
       }
-      const { invoiceUrl } = await createCheckout(req.user!.uid, period as BillingPeriod);
+      const tier: SubscriptionTier = body?.tier === 'max' ? 'max' : 'pro';
+      const maxMultiplier: MaxMultiplier = Number(body?.maxMultiplier) === 20 ? 20 : 10;
+      const { invoiceUrl } = await createCheckout(req.user!.uid, period as BillingPeriod, tier, maxMultiplier);
       res.json({ invoiceUrl });
     } catch (err) {
       res.status(503).json({ error: err instanceof Error ? err.message : 'Не удалось создать счёт на оплату.' });
@@ -769,6 +1166,8 @@ async function startServer() {
         notifyMarketMoves?: boolean;
         notifyVolatilitySpikes?: boolean;
         volatilityThresholdPct?: number;
+        notifyPortfolioPnl?: boolean;
+        portfolioPnlThresholdPct?: number;
         notifyNews?: boolean;
         notifyAuthLogins?: boolean;
         notifyStrategyChanges?: boolean;
@@ -791,6 +1190,12 @@ async function startServer() {
           ? Math.round(rawVolThreshold * 10) / 10
           : 5;
 
+      const rawPortfolioThreshold = Number(body.portfolioPnlThresholdPct);
+      const portfolioPnlThresholdPct =
+        Number.isFinite(rawPortfolioThreshold) && rawPortfolioThreshold >= 1 && rawPortfolioThreshold <= 50
+          ? Math.round(rawPortfolioThreshold * 10) / 10
+          : 5;
+
       registerPushSubscription({
         uid,
         endpoint,
@@ -802,6 +1207,8 @@ async function startServer() {
         notifyMarketMoves: body.notifyMarketMoves !== false,
         notifyVolatilitySpikes: body.notifyVolatilitySpikes !== false,
         volatilityThresholdPct,
+        notifyPortfolioPnl: body.notifyPortfolioPnl !== false,
+        portfolioPnlThresholdPct,
         notifyNews: body.notifyNews !== false,
         notifyAuthLogins: body.notifyAuthLogins !== false,
         notifyStrategyChanges: body.notifyStrategyChanges !== false,
@@ -831,7 +1238,7 @@ async function startServer() {
     try {
       const uid = req.user!.uid;
       const result = await dispatchPushToUser(uid, {
-        title: 'AegisQuant · Тест фоновых уведомлений',
+        title: 'Vernier · Тест фоновых уведомлений',
         body: 'Push-канал активен. Вы будете получать сигналы стратегий и рыночные импульсы даже при закрытом приложении.',
         tag: 'aegisquant-test',
         url: '/?tab=security',
@@ -874,7 +1281,7 @@ async function startServer() {
       const entryZone = String(body.entryZone || '').slice(0, 80);
 
       const result = await dispatchPushToUser(uid, {
-        title: `AegisQuant · Сигнал ${direction} ${symbol}`,
+        title: `Vernier · Сигнал ${direction} ${symbol}`,
         body: `${strategyName} (${marketLabel}) · Уверенность ${confidence}%${entryZone ? ` · Вход: ${entryZone}` : ''}`,
         tag: `signal-${symbol}-${direction}`,
         url: '/?tab=market',
@@ -918,6 +1325,95 @@ async function startServer() {
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отправки критического Push' });
+    }
+  });
+
+  // Web Push: Notify user when daily portfolio PnL exceeds configured threshold (e.g. ±5%)
+  app.post('/api/push/portfolio-pnl', requireAuth, expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as {
+        dailyPnlPct?: number;
+        dailyPnlUsdt?: number;
+        totalValue?: number;
+        thresholdPct?: number;
+      };
+      const dailyPnlPct = Number(body.dailyPnlPct);
+      const dailyPnlUsdt = Number(body.dailyPnlUsdt);
+      const totalValue = Number(body.totalValue);
+      const thresholdPct =
+        body.thresholdPct !== undefined ? Number(body.thresholdPct) : undefined;
+
+      if (
+        !Number.isFinite(dailyPnlPct) ||
+        !Number.isFinite(dailyPnlUsdt) ||
+        !Number.isFinite(totalValue) ||
+        totalValue <= 0 ||
+        (thresholdPct !== undefined && !Number.isFinite(thresholdPct))
+      ) {
+        res.status(400).json({ error: 'Некорректные метрики дневного PnL портфеля.' });
+        return;
+      }
+
+      const result = await notifyPortfolioDailyPnl(req.user!.uid, {
+        dailyPnlPct,
+        dailyPnlUsdt,
+        totalValue,
+        thresholdPct,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отправки Push по PnL портфеля' });
+    }
+  });
+
+  // Web Push: Notify user when a specific portfolio reaches its Target PnL / target balance goal
+  app.post('/api/push/portfolio-target', requireAuth, expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as {
+        portfolioId?: string;
+        portfolioLabel?: string;
+        targetBalanceUsdt?: number;
+        currentBalanceUsdt?: number;
+        baselineBalanceUsdt?: number;
+        targetPnlPct?: number;
+      };
+      const portfolioId = String(body.portfolioId || 'manual')
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 64);
+      const portfolioLabel = String(body.portfolioLabel || 'Портфель')
+        .replace(/[\r\n]/g, ' ')
+        .trim()
+        .slice(0, 80);
+      const targetBalanceUsdt = Number(body.targetBalanceUsdt);
+      const currentBalanceUsdt = Number(body.currentBalanceUsdt);
+      const baselineBalanceUsdt =
+        body.baselineBalanceUsdt !== undefined ? Number(body.baselineBalanceUsdt) : undefined;
+      const targetPnlPct =
+        body.targetPnlPct !== undefined ? Number(body.targetPnlPct) : undefined;
+
+      if (
+        !portfolioId ||
+        !portfolioLabel ||
+        !Number.isFinite(targetBalanceUsdt) ||
+        !Number.isFinite(currentBalanceUsdt) ||
+        targetBalanceUsdt <= 0 ||
+        currentBalanceUsdt <= 0
+      ) {
+        res.status(400).json({ error: 'Некорректные параметры цели доходности портфеля.' });
+        return;
+      }
+
+      const result = await notifyPortfolioTargetReached(req.user!.uid, {
+        portfolioId,
+        portfolioLabel,
+        targetBalanceUsdt,
+        currentBalanceUsdt,
+        baselineBalanceUsdt: Number.isFinite(baselineBalanceUsdt) ? baselineBalanceUsdt : undefined,
+        targetPnlPct: Number.isFinite(targetPnlPct) ? targetPnlPct : undefined,
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отправки Push по цели портфеля' });
     }
   });
 
@@ -989,6 +1485,145 @@ async function startServer() {
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка проверки ценовых алертов' });
+    }
+  });
+
+  // Exchange Integration: Verify API credentials against exchange, fetch initial balances, encrypt secrets
+  app.post('/api/exchanges/connect', requireAuth, strictAuthLimiter, async (req, res) => {
+    try {
+      const uid = req.user!.uid;
+      const body = req.body as Record<string, unknown>;
+      const exchange = body.exchange;
+      const permissions = body.permissions;
+      const label = typeof body.label === 'string' ? body.label.trim().slice(0, 64) : '';
+      const apiKey = typeof body.apiKey === 'string' ? body.apiKey : '';
+      const apiSecret = typeof body.apiSecret === 'string' ? body.apiSecret : '';
+      const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
+      const testnet = Boolean(body.testnet);
+
+      if (!isValidExchangeId(exchange)) {
+        res.status(400).json({ error: 'Поддерживаются только биржи Binance, Bybit и OKX.' });
+        return;
+      }
+      if (!isValidPermissions(permissions)) {
+        res.status(400).json({ error: 'Укажите уровень доступа ключа: только чтение или торговля.' });
+        return;
+      }
+      if (label.length < 2) {
+        res.status(400).json({ error: 'Укажите название подключения (минимум 2 символа).' });
+        return;
+      }
+
+      const result = await connectAndEncryptExchange({
+        uid,
+        exchange,
+        label,
+        apiKey,
+        apiSecret,
+        passphrase,
+        permissions,
+        testnet,
+      });
+
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      if (err instanceof ExchangeApiError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка подключения биржи' });
+    }
+  });
+
+  // Exchange Integration: Decrypt stored user credentials on server and sync live wallet balances
+  app.post('/api/exchanges/sync', requireAuth, expensiveLimiter, async (req, res) => {
+    try {
+      const uid = req.user!.uid;
+      const body = req.body as Record<string, unknown>;
+      const exchange = body.exchange;
+      const encryptedApiKey = typeof body.encryptedApiKey === 'string' ? body.encryptedApiKey : '';
+      const encryptedApiSecret = typeof body.encryptedApiSecret === 'string' ? body.encryptedApiSecret : '';
+      const encryptedPassphrase = typeof body.encryptedPassphrase === 'string' ? body.encryptedPassphrase : '';
+      const testnet = Boolean(body.testnet);
+
+      if (!isValidExchangeId(exchange) || !encryptedApiKey || !encryptedApiSecret) {
+        res.status(400).json({ error: 'Недостаточно данных для синхронизации баланса биржи.' });
+        return;
+      }
+
+      const sync = await syncEncryptedExchangeBalances({
+        uid,
+        exchange,
+        encryptedApiKey,
+        encryptedApiSecret,
+        encryptedPassphrase,
+        testnet,
+      });
+
+      res.json({ ok: true, sync });
+    } catch (err) {
+      if (err instanceof ExchangeApiError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка синхронизации баланса биржи' });
+    }
+  });
+
+  // Exchange Integration: Execute Spot or Futures order on connected exchange
+  app.post('/api/exchanges/order', requireAuth, strictAuthLimiter, async (req, res) => {
+    try {
+      const uid = req.user!.uid;
+      const body = req.body as Record<string, unknown>;
+      const exchange = body.exchange;
+      const permissions = body.permissions;
+      const encryptedApiKey = typeof body.encryptedApiKey === 'string' ? body.encryptedApiKey : '';
+      const encryptedApiSecret = typeof body.encryptedApiSecret === 'string' ? body.encryptedApiSecret : '';
+      const encryptedPassphrase = typeof body.encryptedPassphrase === 'string' ? body.encryptedPassphrase : '';
+      const testnet = Boolean(body.testnet);
+      const symbol = typeof body.symbol === 'string' ? body.symbol : '';
+      const marketType = body.marketType === 'futures' ? 'futures' : 'spot';
+      const side = body.side === 'SELL' ? 'SELL' : body.side === 'BUY' ? 'BUY' : null;
+      const orderType = body.orderType === 'LIMIT' ? 'LIMIT' : 'MARKET';
+      const quantity = Number(body.quantity);
+      const limitPrice = body.limitPrice !== undefined ? Number(body.limitPrice) : undefined;
+      const stopLoss = body.stopLoss !== undefined ? Number(body.stopLoss) : undefined;
+      const takeProfit = body.takeProfit !== undefined ? Number(body.takeProfit) : undefined;
+
+      if (!isValidExchangeId(exchange) || !isValidPermissions(permissions) || !side) {
+        res.status(400).json({ error: 'Некорректные параметры торгового ордера.' });
+        return;
+      }
+      if (!encryptedApiKey || !encryptedApiSecret) {
+        res.status(400).json({ error: 'Отсутствуют зашифрованные ключи выбранной биржи.' });
+        return;
+      }
+
+      const order = await executeEncryptedExchangeOrder({
+        uid,
+        exchange,
+        encryptedApiKey,
+        encryptedApiSecret,
+        encryptedPassphrase,
+        permissions,
+        testnet,
+        symbol,
+        marketType,
+        side,
+        orderType,
+        quantity,
+        limitPrice,
+        stopLoss,
+        takeProfit,
+      });
+
+      res.json({ ok: true, order });
+    } catch (err) {
+      if (err instanceof ExchangeApiError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка исполнения ордера на бирже' });
     }
   });
 
@@ -1116,8 +1751,8 @@ async function startServer() {
     const page = `<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TradingView</title>
-<style>html,body{margin:0;height:100%;background:#0B0F17;overflow:hidden}
-.tradingview-widget-container{height:100%;width:100%}
+<style>html,body,iframe{margin:0;height:100%;background:#0B0F17;overflow:hidden}
+.tradingview-widget-container{height:100%;width:100%;background:#0B0F17}
 .tradingview-widget-container__widget{height:calc(100% - 28px);width:100%}
 .tradingview-widget-copyright{font:12px/28px system-ui,sans-serif;text-align:center;height:28px;color:#94a3b8}
 .tradingview-widget-copyright a{color:#60a5fa;text-decoration:none}</style></head>
@@ -1130,12 +1765,12 @@ async function startServer() {
       'Cache-Control': 'public, max-age=300',
       'Content-Security-Policy': [
         "default-src 'none'",
-        "script-src https://s3.tradingview.com",
+        "script-src https://s3.tradingview.com https://www.tradingview-widget.com",
         "style-src 'unsafe-inline' https:",
         'img-src https: data: blob:',
         'font-src https: data:',
         'connect-src https: wss:',
-        'frame-src https:',
+        'frame-src https://www.tradingview-widget.com https://s.tradingview.com https:',
         "base-uri 'none'",
         "form-action 'none'",
         "frame-ancestors 'self' https://aistudio.google.com https://*.google.com",
@@ -1147,10 +1782,33 @@ async function startServer() {
   if (!isProd) {
     const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
+      plugins: hmrDisabled
+        ? [
+            {
+              name: 'disable-hmr-client-ws',
+              enforce: 'post',
+              transform(code, id) {
+                if (
+                  (id.includes('vite/dist/client/client.mjs') || id.endsWith('/@vite/client')) &&
+                  code.includes('await wsTransport.connect(handlers);')
+                ) {
+                  return {
+                    code: code
+                      .replace('await wsTransport.connect(handlers);', 'return;')
+                      .replace('await wsTransport.disconnect();', 'return;')
+                      .replace('wsTransport.send(data);', 'void data;'),
+                    map: null,
+                  };
+                }
+              },
+            },
+          ]
+        : [],
       server: {
         middlewareMode: true,
+        allowedHosts: true,
         ws: hmrDisabled ? false : { server: httpServer },
-        hmr: hmrDisabled ? false : { server: httpServer },
+        hmr: hmrDisabled ? false : true,
       },
       appType: 'spa',
     });
@@ -1167,7 +1825,7 @@ async function startServer() {
   startProExpiryMonitor();
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`AegisQuant server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Vernier server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

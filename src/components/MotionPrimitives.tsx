@@ -320,20 +320,22 @@ export function WorkspaceShell<T extends string>({
           </div>
 
           {sidebarTopSlot && (
-            <motion.div
-              layout="position"
-              transition={WORKSPACE_SHARED_SPRING}
-              className="pb-2.5 border-b border-white/8"
-            >
+            <div className="pb-2.5 border-b border-white/8 relative z-10">
               {sidebarTopSlot}
-            </motion.div>
+            </div>
           )}
 
-          {/* Isolate only inner section active pill LayoutGroup so outer shell layoutIds stay shared across tabs */}
+          {/* Visible Mobile Segmented Control (2-3 items) or 2-Column Grid (4+ items), vertical sidebar on lg+ */}
           <LayoutGroup id={`workspace-nav-${layoutId}`}>
             <nav
               aria-label={`Разделы: ${title}`}
-              className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-1 gap-1.5"
+              className={`grid ${
+                items.length === 2
+                  ? 'grid-cols-2'
+                  : items.length === 3
+                    ? 'grid-cols-3'
+                    : 'grid-cols-2'
+              } lg:flex lg:flex-col gap-1.5`}
             >
               {items.map((item) => {
                 const isActive = item.id === activeId;
@@ -341,12 +343,21 @@ export function WorkspaceShell<T extends string>({
                   <motion.button
                     key={item.id}
                     type="button"
-                    whileTap={{ scale: 0.96 }}
-                    onClick={() => onChange(item.id)}
-                    className={`relative min-h-[40px] px-2.5 sm:px-3 rounded-xl text-left text-xs font-medium flex items-center justify-between gap-2 transition-colors ${
+                    whileTap={{ scale: 0.97 }}
+                    onClick={() => {
+                      try {
+                        if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+                          navigator.vibrate(8);
+                        }
+                      } catch {
+                        // ignore
+                      }
+                      onChange(item.id);
+                    }}
+                    className={`relative min-h-[40px] px-2.5 sm:px-3 rounded-xl text-left text-[11px] sm:text-xs font-medium flex items-center justify-between gap-1.5 transition-colors w-full min-w-0 ${
                       isActive
                         ? 'text-white'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.03] border border-white/5 lg:border-transparent'
+                        : 'text-slate-400 hover:text-slate-200 bg-[var(--surface-0)]/80 lg:bg-transparent hover:bg-white/[0.04] border border-white/8 lg:border-transparent'
                     }`}
                   >
                     {isActive && (
@@ -356,12 +367,16 @@ export function WorkspaceShell<T extends string>({
                         className={`absolute inset-0 rounded-xl border ${activeBorder}`}
                       />
                     )}
-                    <span className="relative z-10 flex items-center gap-2 min-w-0">
+                    <span className="relative z-10 flex items-center gap-1.5 min-w-0">
                       {item.icon && <span className="shrink-0 opacity-90">{item.icon}</span>}
                       <span className="truncate">{item.label}</span>
                     </span>
                     {item.meta !== undefined && item.meta !== '' && (
-                      <span className="relative z-10 font-mono tabular-nums text-[11px] opacity-75 shrink-0">
+                      <span
+                        className={`relative z-10 font-mono tabular-nums text-[10px] px-1.5 py-0.5 rounded-md shrink-0 ${
+                          isActive ? 'bg-white/15 text-white' : 'bg-white/5 text-slate-400'
+                        }`}
+                      >
                         {item.meta}
                       </span>
                     )}
@@ -372,13 +387,9 @@ export function WorkspaceShell<T extends string>({
           </LayoutGroup>
 
           {sidebarBottomSlot && (
-            <motion.div
-              layout="position"
-              transition={WORKSPACE_SHARED_SPRING}
-              className="hidden lg:block pt-2.5 border-t border-white/8"
-            >
+            <div className="hidden lg:block pt-2.5 border-t border-white/8">
               {sidebarBottomSlot}
-            </motion.div>
+            </div>
           )}
         </motion.div>
       </aside>

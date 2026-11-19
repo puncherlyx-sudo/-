@@ -15,6 +15,13 @@ interface CandlestickChartProps {
   priceAlerts?: PriceAlertRecord[];
   draftAlertPrice?: number | null;
   onPickPriceFromChart?: (price: number) => void;
+  /** PRO #2 Smart Money оверлеи */
+  showSR?: boolean;
+  showOrderBlocks?: boolean;
+  showFvg?: boolean;
+  showBosChoch?: boolean;
+  /** PRO #3 Профиль объёма (VPVR) */
+  showVpvr?: boolean;
 }
 
 const RIBBON_COLORS = ['#34D399', '#22D3EE', '#FBBF24', '#FB7185'] as const;
@@ -77,6 +84,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   priceAlerts = [],
   draftAlertPrice,
   onPickPriceFromChart,
+  showSR = false,
+  showOrderBlocks = false,
+  showFvg = false,
+  showBosChoch = false,
+  showVpvr = false,
 }) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [hoverPrice, setHoverPrice] = useState<number | null>(null);
@@ -169,6 +181,152 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       isBullCloud: fast >= slow,
     };
   }, [showRibbon, ribbonSeries, visibleCandles, activeIdx]);
+
+  // PRO #2: Автоматический расчёт Smart Money зон (S/R, Order Blocks, FVG, BOS/CHoCH)
+  const smcOverlays = useMemo(() => {
+    if (visibleCandles.length < 10) {
+      return {
+        support: null as number | null,
+        resistance: null as number | null,
+        orderBlocks: [] as Array<{ startIdx: number; top: number; bottom: number; type: 'BULL' | 'BEAR' }>,
+        fvgs: [] as Array<{ startIdx: number; top: number; bottom: number; type: 'BULL' | 'BEAR' }>,
+        structures: [] as Array<{ idx: number; price: number; label: 'BOS' | 'CHoCH'; bull: boolean }>,
+      };
+    }
+
+    const lows = visibleCandles.map((c) => c.low);
+    const highs = visibleCandles.map((c) => c.high);
+    const sortedLows = [...lows].sort((a, b) => a - b);
+    const sortedHighs = [...highs].sort((a, b) => b - a);
+    const support = sortedLows[Math.min(2, sortedLows.length - 1)];
+    const resistance = sortedHighs[Math.min(2, sortedHighs.length - 1)];
+
+    // Order Blocks: последняя противоположная свеча перед сильным импульсом
+    const orderBlocks: Array<{ startIdx: number; top: number; bottom: number; type: 'BULL' | 'BEAR' }> = [];
+    for (let i = visibleCandles.length - 3; i >= 4 && orderBlocks.length < 2; i -= 1) {
+      const prev = visibleCandles[i - 1];
+      const cur = visibleCandles[i];
+      const body = Math.abs(cur.close - cur.open);
+      const prevBody = Math.abs(prev.close - prev.open) || cur.close * 0.002;
+      if (cur.close > cur.open && prev.close < prev.open && body > prevBody * 1.45) {
+        if (!orderBlocks.some((b) => b.type === 'BULL')) {
+          orderBlocks.push({ startIdx: i - 1, top: prev.open, bottom: prev.low, type: 'BULL' });
+        }
+      } else if (cur.close < cur.open && prev.close > prev.open && body > prevBody * 1.45) {
+        if (!orderBlocks.some((b) => b.type === 'BEAR')) {
+          orderBlocks.push({ startIdx: i - 1, top: prev.high, bottom: prev.open, type: 'BEAR' });
+        }
+      }
+    }
+
+    // Fair Value Gaps (FVG): 3-свечный дисбаланс
+    const fvgs: Array<{ startIdx: number; top: number; bottom: number; type: 'BULL' | 'BEAR' }> = [];
+    for (let i = visibleCandles.length - 1; i >= 2 && fvgs.length < 3; i -= 1) {
+      const c0 = visibleCandles[i - 2];
+      const c2 = visibleCandles[i];
+      if (c2.low > c0.high) {
+        fvgs.push({ startIdx: i - 1, top: c2.low, bottom: c0.high, type: 'BULL' });
+      } else if (c2.high < c0.low) {
+        fvgs.push({ startIdx: i - 1, top: c0.low, bottom: c2.high, type: 'BEAR' });
+      }
+    }
+
+    // BOS / CHoCH структурные пробои свингов
+    const structures: Array<{ idx: number; price: number; label: 'BOS' | 'CHoCH'; bull: boolean }> = [];
+    let runningHigh = visibleCandles[0].high;
+    let runningLow = visibleCandles[0].low;
+    let trend: 'up' | 'down' = visibleCandles[5].close >= visibleCandles[0].open ? 'up' : 'down';
+    for (let i = 6; i < visibleCandles.length; i += 1) {
+      const c = visibleCandles[i];
+      if (c.close > runningHigh) {
+        structures.push({
+          idx: i,
+          price: runningHigh,
+          label: trend === 'down' ? 'CHoCH' : 'BOS',
+          bull: true,
+        });
+        trend = 'up';
+        runningHigh = c.high;
+      } else if (c.close < runningLow) {
+        structures.push({
+          idx: i,
+          price: runningLow,
+          label: trend === 'up' ? 'CHoCH' : 'BOS',
+          bull: false,
+        });
+        trend = 'down';
+        runningLow = c.low;
+      }
+    }
+
+    return {
+      support,
+      resistance,
+      orderBlocks,
+      fvgs,
+      structures: structures.slice(-3),
+    };
+  }, [visibleCandles]);
+
+  // PRO #3: VPVR (Volume Profile Visible Range) — гистограмма по правому краю + POC / VAH / VAL
+  const vpvrData = useMemo(() => {
+    if (!showVpvr || visibleCandles.length < 4 || !metrics) return null;
+    const binsCount = 20;
+    const range = metrics.maxPrice - metrics.minPrice || 1;
+    const binSize = range / binsCount;
+    const bins = Array.from({ length: binsCount }, (_, idx) => ({
+      priceMid: metrics.minPrice + (idx + 0.5) * binSize,
+      low: metrics.minPrice + idx * binSize,
+      high: metrics.minPrice + (idx + 1) * binSize,
+      buyVol: 0,
+      sellVol: 0,
+      totalVol: 0,
+    }));
+
+    for (const c of visibleCandles) {
+      const mid = (c.high + c.low + c.close) / 3;
+      const bIdx = Math.min(binsCount - 1, Math.max(0, Math.floor((mid - metrics.minPrice) / binSize)));
+      if (c.close >= c.open) {
+        bins[bIdx].buyVol += c.volume;
+      } else {
+        bins[bIdx].sellVol += c.volume;
+      }
+      bins[bIdx].totalVol += c.volume;
+    }
+
+    const maxBinVol = Math.max(...bins.map((b) => b.totalVol), 1);
+    const totalVol = bins.reduce((acc, b) => acc + b.totalVol, 0) || 1;
+    let pocIdx = 0;
+    for (let i = 1; i < bins.length; i += 1) {
+      if (bins[i].totalVol > bins[pocIdx].totalVol) pocIdx = i;
+    }
+
+    // 70% Value Area (VAH / VAL) расширяется от POC
+    let vaVol = bins[pocIdx].totalVol;
+    let lo = pocIdx;
+    let hi = pocIdx;
+    while (vaVol < totalVol * 0.7 && (lo > 0 || hi < binsCount - 1)) {
+      const nextLo = lo > 0 ? bins[lo - 1].totalVol : -1;
+      const nextHi = hi < binsCount - 1 ? bins[hi + 1].totalVol : -1;
+      if (nextHi >= nextLo && hi < binsCount - 1) {
+        hi += 1;
+        vaVol += bins[hi].totalVol;
+      } else if (lo > 0) {
+        lo -= 1;
+        vaVol += bins[lo].totalVol;
+      } else {
+        break;
+      }
+    }
+
+    return {
+      bins,
+      maxBinVol,
+      pocPrice: bins[pocIdx].priceMid,
+      vahPrice: bins[hi].high,
+      valPrice: bins[lo].low,
+    };
+  }, [showVpvr, visibleCandles, metrics]);
 
   if (!metrics || visibleCandles.length === 0) {
     return (
@@ -425,6 +583,229 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 points={buildPolyline((c) => c.bbLower)}
               />
             </>
+          )}
+
+          {/* PRO #2: Smart Money Overlays (S/R, Order Blocks, FVG, BOS/CHoCH) */}
+          {showSR && smcOverlays.support && smcOverlays.resistance && (
+            <g>
+              <rect
+                x={PAD_L}
+                y={priceToY(smcOverlays.resistance) - 5}
+                width={chartW}
+                height={10}
+                fill="rgba(244, 63, 94, 0.14)"
+              />
+              <line
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={priceToY(smcOverlays.resistance)}
+                y2={priceToY(smcOverlays.resistance)}
+                stroke="rgba(251, 113, 133, 0.65)"
+                strokeDasharray="4 4"
+              />
+              <text
+                x={PAD_L + 6}
+                y={priceToY(smcOverlays.resistance) - 7}
+                fill="#FDA4AF"
+                fontSize="9.5"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                R (Сопротивление) {formatPrice(smcOverlays.resistance)}
+              </text>
+
+              <rect
+                x={PAD_L}
+                y={priceToY(smcOverlays.support) - 5}
+                width={chartW}
+                height={10}
+                fill="rgba(16, 185, 129, 0.14)"
+              />
+              <line
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={priceToY(smcOverlays.support)}
+                y2={priceToY(smcOverlays.support)}
+                stroke="rgba(52, 211, 153, 0.65)"
+                strokeDasharray="4 4"
+              />
+              <text
+                x={PAD_L + 6}
+                y={priceToY(smcOverlays.support) + 12}
+                fill="#6EE7B7"
+                fontSize="9.5"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                S (Поддержка) {formatPrice(smcOverlays.support)}
+              </text>
+            </g>
+          )}
+
+          {showOrderBlocks &&
+            smcOverlays.orderBlocks.map((ob, idx) => {
+              const x = PAD_L + ob.startIdx * stepX;
+              const yTop = priceToY(ob.top);
+              const yBot = priceToY(ob.bottom);
+              const h = Math.max(8, Math.abs(yBot - yTop));
+              return (
+                <g key={`ob-${idx}`}>
+                  <rect
+                    x={x}
+                    y={Math.min(yTop, yBot)}
+                    width={Math.max(24, W - PAD_R - x)}
+                    height={h}
+                    fill={ob.type === 'BULL' ? 'rgba(16, 185, 129, 0.18)' : 'rgba(244, 63, 94, 0.18)'}
+                    stroke={ob.type === 'BULL' ? 'rgba(52, 211, 153, 0.5)' : 'rgba(251, 113, 133, 0.5)'}
+                    strokeWidth="0.9"
+                    rx="2"
+                  />
+                  <text
+                    x={x + 4}
+                    y={Math.min(yTop, yBot) + 10}
+                    fill={ob.type === 'BULL' ? '#6EE7B7' : '#FDA4AF'}
+                    fontSize="9"
+                    fontFamily="JetBrains Mono, monospace"
+                  >
+                    {ob.type === 'BULL' ? 'Bull OB' : 'Bear OB'}
+                  </text>
+                </g>
+              );
+            })}
+
+          {showFvg &&
+            smcOverlays.fvgs.map((gap, idx) => {
+              const x = PAD_L + gap.startIdx * stepX;
+              const yTop = priceToY(gap.top);
+              const yBot = priceToY(gap.bottom);
+              return (
+                <g key={`fvg-${idx}`}>
+                  <rect
+                    x={x}
+                    y={Math.min(yTop, yBot)}
+                    width={Math.max(28, W - PAD_R - x)}
+                    height={Math.max(5, Math.abs(yBot - yTop))}
+                    fill={gap.type === 'BULL' ? 'rgba(34, 211, 238, 0.16)' : 'rgba(251, 191, 36, 0.16)'}
+                    stroke={gap.type === 'BULL' ? 'rgba(34, 211, 238, 0.45)' : 'rgba(251, 191, 36, 0.45)'}
+                    strokeDasharray="2 2"
+                  />
+                  <text
+                    x={W - PAD_R - 42}
+                    y={Math.min(yTop, yBot) + 9}
+                    fill={gap.type === 'BULL' ? '#67E8F9' : '#FDE68A'}
+                    fontSize="8.5"
+                    fontFamily="JetBrains Mono, monospace"
+                  >
+                    FVG
+                  </text>
+                </g>
+              );
+            })}
+
+          {showBosChoch &&
+            smcOverlays.structures.map((st, idx) => {
+              const xEnd = PAD_L + st.idx * stepX + stepX / 2;
+              const xStart = Math.max(PAD_L, xEnd - stepX * 9);
+              const y = priceToY(st.price);
+              const color = st.bull ? '#34D399' : '#FB7185';
+              return (
+                <g key={`st-${idx}`}>
+                  <line x1={xStart} x2={xEnd} y1={y} y2={y} stroke={color} strokeWidth="1.2" strokeDasharray="3 2" />
+                  <rect x={xEnd - 28} y={y - 13} width={34} height={12} rx="3" fill="#0B0F17" stroke={color} strokeWidth="0.8" />
+                  <text
+                    x={xEnd - 11}
+                    y={y - 4.5}
+                    textAnchor="middle"
+                    fill={color}
+                    fontSize="8"
+                    fontFamily="JetBrains Mono, monospace"
+                    fontWeight="700"
+                  >
+                    {st.label}
+                  </text>
+                </g>
+              );
+            })}
+
+          {/* PRO #3: Volume Profile (VPVR) горизонтальная гистограмма справа + POC / VAH / VAL */}
+          {showVpvr && vpvrData && (
+            <g>
+              {vpvrData.bins.map((b, idx) => {
+                const maxBarW = 86;
+                const barW = (b.totalVol / vpvrData.maxBinVol) * maxBarW;
+                const y1 = priceToY(b.high);
+                const y2 = priceToY(b.low);
+                const h = Math.max(2, Math.abs(y2 - y1) - 1);
+                const buyRatio = b.totalVol > 0 ? b.buyVol / b.totalVol : 0.5;
+                const buyW = barW * buyRatio;
+                const sellW = barW - buyW;
+                const rightX = W - PAD_R;
+                return (
+                  <g key={`vpvr-${idx}`}>
+                    <rect x={rightX - barW} y={Math.min(y1, y2)} width={sellW} height={h} fill="rgba(244, 63, 94, 0.28)" />
+                    <rect x={rightX - buyW} y={Math.min(y1, y2)} width={buyW} height={h} fill="rgba(16, 185, 129, 0.34)" />
+                  </g>
+                );
+              })}
+
+              {/* POC пунктирная линия */}
+              <line
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={priceToY(vpvrData.pocPrice)}
+                y2={priceToY(vpvrData.pocPrice)}
+                stroke="#F59E0B"
+                strokeWidth="1.3"
+                strokeDasharray="5 3"
+              />
+              <text
+                x={W - PAD_R - 72}
+                y={priceToY(vpvrData.pocPrice) - 3}
+                fill="#FBBF24"
+                fontSize="9"
+                fontFamily="JetBrains Mono, monospace"
+                fontWeight="700"
+              >
+                POC {formatPrice(vpvrData.pocPrice)}
+              </text>
+
+              {/* VAH / VAL */}
+              <line
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={priceToY(vpvrData.vahPrice)}
+                y2={priceToY(vpvrData.vahPrice)}
+                stroke="rgba(34, 211, 238, 0.5)"
+                strokeWidth="0.9"
+                strokeDasharray="2 4"
+              />
+              <text
+                x={W - PAD_R - 30}
+                y={priceToY(vpvrData.vahPrice) - 2}
+                fill="#67E8F9"
+                fontSize="8.5"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                VAH
+              </text>
+
+              <line
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={priceToY(vpvrData.valPrice)}
+                y2={priceToY(vpvrData.valPrice)}
+                stroke="rgba(34, 211, 238, 0.5)"
+                strokeWidth="0.9"
+                strokeDasharray="2 4"
+              />
+              <text
+                x={W - PAD_R - 30}
+                y={priceToY(vpvrData.valPrice) + 9}
+                fill="#67E8F9"
+                fontSize="8.5"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                VAL
+              </text>
+            </g>
           )}
 
           {/* Strategy Price Levels (Entry / SL / TP) */}

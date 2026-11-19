@@ -3,17 +3,25 @@ import {
   ArrowDownUp,
   ArrowRight,
   BarChart2,
+  Check,
   Download,
   Flame,
+  Grid2x2,
+  ListChecks,
   Lock,
+  Pencil,
   PieChart as PieChartIcon,
   Plus,
+  Radar,
   RefreshCw,
+  Repeat,
   Search,
   Star,
   Table2,
+  Target,
   Trash2,
   Wallet,
+  X,
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import {
@@ -30,18 +38,200 @@ import {
 } from 'recharts';
 import { TRADING_PAIRS } from '../data/strategies';
 import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
-import type { MarketType, PortfolioHolding, TickerOverview } from '../types/domain';
+import {
+  fetchJsonWithBackoff,
+  getCachedValue,
+  setCachedValue,
+  shouldApplyThrottledUpdate,
+} from '../lib/marketCache';
+import { usePlan } from '../contexts/PlanContext';
+import { FeatureGuide } from './FeatureGuide';
+import {
+  readCustomWatchlists,
+  writeCustomWatchlists,
+  type CustomWatchlist,
+} from '../lib/proMaxStore';
+import { parseLocalePositiveNumber, sanitizePlainText, triggerHaptic } from '../lib/securityDlp';
+import type { MarketType, PortfolioHolding, PortfolioTargetRecord, TickerOverview } from '../types/domain';
 import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { MiniSparkline } from './MiniSparkline';
+import { PortfolioStressTestCard } from './PortfolioStressTestCard';
+import {
+  FundingArbitrageScannerTab,
+  LivePatternScannerTab,
+  SectorHeatmapCorrelationTab,
+} from './ScreenerProMaxTabs';
 
-export type ScreenerSection = 'table' | 'momentum' | 'portfolio';
+function deriveSparklineFromTicker(t: TickerOverview): number[] {
+  const existing = (t as TickerOverview & { sparkline24h?: number[] }).sparkline24h;
+  if (Array.isArray(existing) && existing.length >= 4) return existing;
+  const low = t.low24h > 0 ? t.low24h : t.price * 0.97;
+  const high = t.high24h > low ? t.high24h : t.price * 1.03;
+  const openEst = t.price / (1 + (t.change24hPct || 0) / 100);
+  const seed = t.symbol.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  const pts: number[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    const prog = i / 7;
+    const base = openEst + (t.price - openEst) * prog;
+    const wave = Math.sin(seed * 0.37 + i * 1.15) * (high - low) * 0.16;
+    pts.push(Math.max(low, Math.min(high, base + wave)));
+  }
+  pts[pts.length - 1] = t.price;
+  return pts;
+}
+
+function deriveEstimatedRsi(t: TickerOverview): number {
+  const span = Math.max(1e-9, t.high24h - t.low24h);
+  const pos = Math.max(0, Math.min(1, (t.price - t.low24h) / span));
+  const momentum = Math.max(-18, Math.min(18, t.change24hPct * 1.9));
+  return Math.max(18, Math.min(86, Math.round(32 + pos * 36 + momentum)));
+}
+
+interface ScreenerTableRowProps {
+  ticker: TickerOverview;
+  marketType: MarketType;
+  isStarred: boolean;
+  onToggleWatchlist: (symbol: string) => void;
+  onOpenPair: (symbol: string, marketType: MarketType) => void;
+}
+
+const ScreenerTableRow: React.FC<ScreenerTableRowProps> = React.memo(
+  ({ ticker: t, marketType, isStarred, onToggleWatchlist, onOpenPair }) => {
+    const span = Math.max(1e-9, t.high24h - t.low24h);
+    const posInRange = Math.max(0, Math.min(100, Math.round(((t.price - t.low24h) / span) * 100)));
+    const rangePct = t.low24h > 0 ? ((span / t.low24h) * 100).toFixed(1) : '0.0';
+    const sparkData = deriveSparklineFromTicker(t);
+    const rsi = deriveEstimatedRsi(t);
+    const fundingPct = t.fundingRatePct ?? 0.01;
+
+    return (
+      <tr
+        role="button"
+        tabIndex={0}
+        onClick={() => {
+          triggerHaptic(8);
+          onOpenPair(t.symbol, marketType);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            triggerHaptic(8);
+            onOpenPair(t.symbol, marketType);
+          }
+        }}
+        aria-label={`Открыть график ${t.symbol}`}
+        className="hover:bg-emerald-500/[0.06] active:bg-emerald-500/[0.1] cursor-pointer transition-colors"
+      >
+        <td className="py-2.5 pl-2.5 pr-1.5 sm:px-4 font-sans">
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                triggerHaptic(8);
+                onToggleWatchlist(t.symbol);
+              }}
+              aria-label={`Добавить ${t.symbol} в избранное`}
+              className={`p-1 rounded-md transition-colors shrink-0 ${
+                isStarred ? 'text-amber-400' : 'text-slate-600 hover:text-slate-300'
+              }`}
+            >
+              <Star className={`w-3.5 h-3.5 ${isStarred ? 'fill-amber-400' : ''}`} />
+            </button>
+            <div className="min-w-0">
+              <span className="font-semibold text-white">{t.baseAsset}</span>
+              <span className="text-slate-500 hidden sm:inline"> / USDT</span>
+            </div>
+          </div>
+        </td>
+        <td className="py-2.5 px-1.5 sm:px-3 text-right font-mono tabular-nums text-slate-100 whitespace-nowrap text-[11px] sm:text-xs">
+          <FlashValue value={t.price}>{formatUsd(t.price)}</FlashValue>
+        </td>
+        <td
+          style={{
+            backgroundColor: `${
+              t.change24hPct >= 0 ? 'rgba(16,185,129,' : 'rgba(244,63,94,'
+            }${Math.min(0.26, 0.03 + (Math.abs(t.change24hPct) / 10) * 0.23).toFixed(3)})`,
+          }}
+          className={`py-2.5 px-1.5 sm:px-3 text-right font-mono tabular-nums font-semibold whitespace-nowrap text-[11px] sm:text-xs ${
+            t.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+          }`}
+        >
+          {t.change24hPct >= 0 ? '+' : ''}
+          {t.change24hPct.toFixed(2)}%
+        </td>
+        <td className="py-2.5 px-3 hidden md:table-cell">
+          <div className="w-28 space-y-1">
+            <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div
+                style={{ width: `${Math.max(6, posInRange)}%` }}
+                className="h-full rounded-full bg-gradient-to-r from-rose-400 via-amber-400 to-emerald-400"
+              />
+            </div>
+            <div className="flex justify-between text-[10px] text-slate-500">
+              <span>{rangePct}%</span>
+            </div>
+          </div>
+        </td>
+        <td className="py-2.5 px-3 text-right text-slate-300 hidden sm:table-cell whitespace-nowrap">
+          ${(t.volume24hUsdt / 1_000_000).toFixed(1)}M
+        </td>
+        <td className="py-2 pl-1.5 pr-2.5 sm:px-4 text-right">
+          <div className="inline-flex items-center justify-end gap-1.5 sm:gap-2">
+            <MiniSparkline
+              data={sparkData}
+              changePct={t.change24hPct}
+              width={46}
+              height={18}
+              showArea={false}
+            />
+            {marketType === 'futures' ? (
+              <span
+                className={`text-[10px] font-mono tabular-nums font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                  fundingPct >= 0.02
+                    ? 'border-amber-500/35 bg-amber-500/12 text-amber-300'
+                    : fundingPct < 0
+                      ? 'border-rose-500/35 bg-rose-500/12 text-rose-300'
+                      : 'border-white/10 bg-white/5 text-slate-300'
+                }`}
+              >
+                {fundingPct >= 0 ? '+' : ''}
+                {fundingPct.toFixed(3)}%
+              </span>
+            ) : (
+              <span
+                className={`text-[10px] font-mono tabular-nums font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                  rsi >= 70
+                    ? 'border-rose-500/35 bg-rose-500/12 text-rose-300'
+                    : rsi <= 30
+                      ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                      : 'border-white/10 bg-white/5 text-slate-300'
+                }`}
+              >
+                RSI {rsi}
+              </span>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  }
+);
+ScreenerTableRow.displayName = 'ScreenerTableRow';
+
+export type ScreenerSection = 'table' | 'patterns' | 'sectors' | 'arbitrage' | 'momentum' | 'portfolio';
 
 interface MarketScreenerViewProps {
   isPro?: boolean;
+  privacyMode?: boolean;
   onUpgradePro?: () => void;
   onOpenPairOnMarket: (symbol: string, marketType: MarketType) => void;
   holdings: PortfolioHolding[];
   portfolioReport: PaperPortfolioReport;
+  activeTarget?: PortfolioTargetRecord | null;
+  onOpenPortfolioDetails?: () => void;
   onAddHolding: (symbol: string, amount: number, avgEntryPrice: number) => void;
+  onUpdateHolding?: (id: string, amount: number, avgEntryPrice: number) => void;
   onRemoveHolding: (id: string) => void;
   externalSection?: { section: ScreenerSection; nonce: number } | null;
 }
@@ -88,24 +278,45 @@ function downloadCsvWithBom(
 
 export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   isPro = false,
+  privacyMode = false,
   onUpgradePro,
   onOpenPairOnMarket,
   holdings,
   portfolioReport,
+  activeTarget,
+  onOpenPortfolioDetails,
   onAddHolding,
+  onUpdateHolding,
   onRemoveHolding,
   externalSection,
 }) => {
+  const planCtx = usePlan();
+  const effIsPro = isPro || planCtx.isPro;
+  const effPrivacy = privacyMode || planCtx.privacyMode;
+
   const [screenerSection, setScreenerSection] = useState<ScreenerSection>('table');
   const [marketType, setMarketType] = useState<MarketType>('spot');
-  const [tickers, setTickers] = useState<TickerOverview[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [tickers, setTickers] = useState<TickerOverview[]>(() => {
+    const cached = getCachedValue<{ tickers: TickerOverview[]; updatedAt?: string }>('screener_overview_spot');
+    return cached?.data.tickers ?? [];
+  });
+  const [loading, setLoading] = useState(() => !getCachedValue('screener_overview_spot'));
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(() => {
+    const cached = getCachedValue<{ tickers: TickerOverview[]; updatedAt?: string }>('screener_overview_spot');
+    return cached?.data.updatedAt ?? null;
+  });
 
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<ScreenerFilter>('all');
   const [sortBy, setSortBy] = useState<SortField>('volume');
   const [sortAsc, setSortAsc] = useState(false);
+  const [visibleCount, setVisibleCount] = useState<number>(20);
+
+  // PRO #10: Кастомные вотчлисты (до 5 списков в localStorage)
+  const [customWatchlists, setCustomWatchlists] = useState<CustomWatchlist[]>(() => readCustomWatchlists());
+  const [activeWatchlistId, setActiveWatchlistId] = useState<string | null>(null);
+  const [creatingWl, setCreatingWl] = useState(false);
+  const [newWlName, setNewWlName] = useState('');
 
   const [watchlist, setWatchlist] = useState<string[]>(() => {
     try {
@@ -123,6 +334,14 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   const [newSymbol, setNewSymbol] = useState('BTCUSDT');
   const [newAmount, setNewAmount] = useState('0.1');
   const [newEntryPrice, setNewEntryPrice] = useState('90000');
+  const [portfolioError, setPortfolioError] = useState<string | null>(null);
+  const [editingHoldingId, setEditingHoldingId] = useState<string | null>(null);
+  const [editAmount, setEditAmount] = useState<string>('');
+  const [editEntryPrice, setEditEntryPrice] = useState<string>('');
+
+  useEffect(() => {
+    setVisibleCount(20);
+  }, [search, filter, marketType]);
 
   useEffect(() => {
     if (externalSection) {
@@ -151,16 +370,30 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
 
   const loadOverview = useCallback(
     async (forceRefresh = false) => {
-      setLoading(true);
+      const cacheKey = `screener_overview_${marketType}`;
+      if (!forceRefresh) {
+        const cached = getCachedValue<{ tickers: TickerOverview[]; updatedAt?: string }>(cacheKey);
+        if (cached && cached.data.tickers.length > 0) {
+          setTickers(cached.data.tickers);
+          setLastUpdatedAt(cached.data.updatedAt ?? null);
+          setLoading(false);
+        }
+      }
+      if (forceRefresh) {
+        setLoading(true);
+      }
       try {
         const refreshParam = forceRefresh ? '&refresh=1' : '';
-        const res = await fetch(`/api/market/overview?marketType=${marketType}${refreshParam}`, {
-          cache: 'no-store',
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { tickers: TickerOverview[]; updatedAt?: string };
-          setTickers(data.tickers || []);
-          setLastUpdatedAt(data.updatedAt || new Date().toISOString());
+        const res = await fetchJsonWithBackoff<{ tickers: TickerOverview[]; updatedAt?: string }>(
+          `/api/market/overview?marketType=${marketType}${refreshParam}`,
+          { init: { cache: 'no-store' }, retries: 2 }
+        );
+        if (res.ok && res.data && (forceRefresh || shouldApplyThrottledUpdate(cacheKey, 1000))) {
+          const list = res.data.tickers || [];
+          const updatedAt = res.data.updatedAt || new Date().toISOString();
+          setTickers(list);
+          setLastUpdatedAt(updatedAt);
+          setCachedValue(cacheKey, { tickers: list, updatedAt }, 25_000);
         }
       } catch {
         // Keep prior tickers if network glitch
@@ -191,8 +424,63 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   }, [loadOverview]);
 
   const toggleWatchlist = (sym: string) => {
+    if (activeWatchlistId && effIsPro) {
+      setCustomWatchlists((prev) => {
+        const next = prev.map((wl) => {
+          if (wl.id !== activeWatchlistId) return wl;
+          const exists = wl.symbols.includes(sym);
+          return {
+            ...wl,
+            symbols: exists ? wl.symbols.filter((s) => s !== sym) : [...wl.symbols, sym],
+          };
+        });
+        writeCustomWatchlists(next);
+        return next;
+      });
+      return;
+    }
     setWatchlist((prev) => (prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]));
   };
+
+  const handleCreateCustomWatchlist = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!effIsPro) {
+      onUpgradePro?.();
+      return;
+    }
+    const clean = sanitizePlainText(newWlName, 24);
+    if (!clean || customWatchlists.length >= 5) return;
+    triggerHaptic(10);
+    const created: CustomWatchlist = {
+      id: `wl-${Date.now()}`,
+      name: clean,
+      symbols: watchlist.slice(0, 5),
+    };
+    const next = [...customWatchlists, created].slice(0, 5);
+    setCustomWatchlists(next);
+    writeCustomWatchlists(next);
+    setActiveWatchlistId(created.id);
+    setFilter('watchlist');
+    setNewWlName('');
+    setCreatingWl(false);
+  };
+
+  const handleDeleteCustomWatchlist = (id: string) => {
+    const next = customWatchlists.filter((w) => w.id !== id);
+    setCustomWatchlists(next);
+    writeCustomWatchlists(next);
+    if (activeWatchlistId === id) {
+      setActiveWatchlistId(null);
+      setFilter('all');
+    }
+  };
+
+  const activeWatchlistSymbols = useMemo(() => {
+    if (activeWatchlistId && effIsPro) {
+      return customWatchlists.find((w) => w.id === activeWatchlistId)?.symbols ?? [];
+    }
+    return watchlist;
+  }, [activeWatchlistId, effIsPro, customWatchlists, watchlist]);
 
   const handleSort = (field: SortField) => {
     if (sortBy === field) {
@@ -222,7 +510,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
       if (filter === 'gainers') return t.change24hPct > 0;
       if (filter === 'losers') return t.change24hPct < 0;
       if (filter === 'volume') return t.volume24hUsdt >= 150_000_000;
-      if (filter === 'watchlist') return watchlist.includes(t.symbol);
+      if (filter === 'watchlist') return activeWatchlistSymbols.includes(t.symbol);
       return true;
     });
 
@@ -240,7 +528,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     });
 
     return sorted;
-  }, [tickers, search, filter, watchlist, sortBy, sortAsc]);
+  }, [tickers, search, filter, activeWatchlistSymbols, sortBy, sortAsc]);
 
   const momentumChartData = useMemo(
     () =>
@@ -261,12 +549,35 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
 
   const handleAddHolding = (e: React.FormEvent) => {
     e.preventDefault();
-    const amountNum = Number(newAmount);
-    const entryNum = Number(newEntryPrice);
-    if (!Number.isFinite(amountNum) || amountNum <= 0 || !Number.isFinite(entryNum) || entryNum <= 0) {
+    const amountNum = parseLocalePositiveNumber(newAmount);
+    const entryNum = parseLocalePositiveNumber(newEntryPrice);
+    if (!amountNum || !entryNum) {
+      setPortfolioError('Введите корректные положительные числа (можно через точку или запятую).');
       return;
     }
+    setPortfolioError(null);
+    triggerHaptic(10);
     onAddHolding(newSymbol, amountNum, entryNum);
+  };
+
+  const handleStartEditHolding = (row: { id: string; amount: number; avgEntryPrice: number }) => {
+    setEditingHoldingId(row.id);
+    setEditAmount(String(row.amount));
+    setEditEntryPrice(String(row.avgEntryPrice));
+    setPortfolioError(null);
+  };
+
+  const handleSaveEditHolding = (id: string) => {
+    const amountNum = parseLocalePositiveNumber(editAmount);
+    const entryNum = parseLocalePositiveNumber(editEntryPrice);
+    if (!amountNum || !entryNum) {
+      setPortfolioError('Количество и цена входа должны быть положительными числами.');
+      return;
+    }
+    setPortfolioError(null);
+    triggerHaptic(10);
+    onUpdateHolding?.(id, amountNum, entryNum);
+    setEditingHoldingId(null);
   };
 
   const handleExportScreenerCsv = () => {
@@ -319,13 +630,31 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     () => [
       {
         id: 'table' as const,
-        label: 'Таблица пар',
+        label: 'Таблица',
         icon: <Table2 className="w-3.5 h-3.5 text-cyan-400" />,
-        meta: tickers.length || undefined,
+        meta: tickers.length || 44,
+      },
+      {
+        id: 'patterns' as const,
+        label: 'Паттерны',
+        icon: <Radar className="w-3.5 h-3.5 text-amber-400" />,
+        meta: 'PRO',
+      },
+      {
+        id: 'sectors' as const,
+        label: 'Сектора',
+        icon: <Grid2x2 className="w-3.5 h-3.5 text-emerald-400" />,
+        meta: 'PRO',
+      },
+      {
+        id: 'arbitrage' as const,
+        label: 'Арбитраж',
+        icon: <Repeat className="w-3.5 h-3.5 text-cyan-300" />,
+        meta: 'MAX',
       },
       {
         id: 'momentum' as const,
-        label: 'Карта импульса',
+        label: 'Импульс',
         icon: <BarChart2 className="w-3.5 h-3.5 text-emerald-400" />,
       },
       {
@@ -430,6 +759,18 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
         sidebarTopSlot={sidebarControls}
         sidebarBottomSlot={sidebarBottom}
       >
+        <div className="mb-3">
+          <FeatureGuide
+            title="Как пользоваться Скринером рынка"
+            summary="Сравнивайте 44 ликвидные пары по объёму, импульсу, паттернам, секторам (L1/L2/DeFi/AI/Meme/RWA) и ставкам Funding в одном окне."
+            steps={[
+              'Таблица: фильтруйте по Споту/Фьючерсам и сортируйте по изменению за 24ч или объёму; тап по паре открывает график.',
+              'Паттерны и Сектора (PRO): находите сжатие Bollinger, пробои уровней и самые сильные сектора дня.',
+              'Арбитраж (MAX) и Портфель: оценивайте годовой APR фандинга и ведите учёт позиций с живым PnL.',
+            ]}
+            compact
+          />
+        </div>
         {screenerSection === 'table' && (
           <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow overflow-hidden">
             <div className="p-4 border-b border-white/8 flex flex-col xl:flex-row xl:items-center justify-between gap-3">
@@ -476,27 +817,124 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                   type="button"
                   onClick={handleExportScreenerCsv}
                   className={`min-h-[36px] px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
-                    isPro
+                    effIsPro
                       ? 'border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-200'
                       : 'border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200'
                   }`}
                 >
-                  {isPro ? (
+                  {effIsPro ? (
                     <Download className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                   ) : (
                     <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                   )}
-                  <span>{isPro ? 'Экспорт CSV' : 'CSV (PRO)'}</span>
+                  <span>{effIsPro ? 'Экспорт CSV' : 'CSV (PRO)'}</span>
                 </button>
               </div>
+            </div>
+
+            {/* PRO #10: Кастомные вотчлисты (до 5 списков) */}
+            <div className="px-4 py-2.5 border-b border-white/8 bg-[#0B0F17]/60 flex flex-wrap items-center gap-1.5 text-xs">
+              <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-400 mr-1">
+                <ListChecks className="w-3.5 h-3.5 text-amber-400" />
+                <span>Вотчлисты:</span>
+              </span>
+              {customWatchlists.map((wl) => {
+                const selected = filter === 'watchlist' && activeWatchlistId === wl.id;
+                return (
+                  <div
+                    key={wl.id}
+                    className={`inline-flex items-center rounded-lg border transition-colors ${
+                      selected
+                        ? 'border-amber-400/50 bg-amber-500/15 text-amber-200'
+                        : 'border-white/10 bg-[#111827] text-slate-300'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        if (!effIsPro) {
+                          onUpgradePro?.();
+                          return;
+                        }
+                        if (selected) {
+                          setActiveWatchlistId(null);
+                          setFilter('all');
+                        } else {
+                          setActiveWatchlistId(wl.id);
+                          setFilter('watchlist');
+                        }
+                      }}
+                      className="min-h-[28px] px-2.5 text-[11px] font-medium inline-flex items-center gap-1 whitespace-nowrap"
+                    >
+                      {!effIsPro && <Lock className="w-3 h-3 text-amber-400 shrink-0" />}
+                      <span>{wl.name}</span>
+                      <span className="text-[10px] font-mono text-slate-400">({wl.symbols.length})</span>
+                    </button>
+                    {effIsPro && customWatchlists.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteCustomWatchlist(wl.id)}
+                        aria-label={`Удалить список ${wl.name}`}
+                        className="pr-1.5 text-slate-500 hover:text-rose-400"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+
+              {customWatchlists.length < 5 && (
+                creatingWl ? (
+                  <form onSubmit={handleCreateCustomWatchlist} className="inline-flex items-center gap-1">
+                    <input
+                      type="text"
+                      value={newWlName}
+                      onChange={(e) => setNewWlName(e.target.value)}
+                      placeholder="Название..."
+                      maxLength={24}
+                      className="w-28 min-h-[28px] rounded-lg border border-amber-500/40 bg-[#111827] px-2 text-[11px] text-white focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      className="min-h-[28px] px-2 rounded-lg bg-amber-500 text-slate-950 text-[11px] font-semibold"
+                    >
+                      OK
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCreatingWl(false)}
+                      className="min-h-[28px] px-1.5 text-slate-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </form>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!effIsPro) {
+                        onUpgradePro?.();
+                        return;
+                      }
+                      setCreatingWl(true);
+                    }}
+                    className="min-h-[28px] px-2 rounded-lg border border-dashed border-amber-500/35 bg-amber-500/[0.06] hover:bg-amber-500/15 text-[11px] font-medium text-amber-300 inline-flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>Список ({customWatchlists.length}/5)</span>
+                  </button>
+                )
+              )}
             </div>
 
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="border-b border-white/8 text-slate-400">
-                    <th className="py-2.5 px-4 font-medium">Пара</th>
-                    <th className="py-2.5 px-3 font-medium text-right">
+                    <th className="py-2.5 pl-2.5 pr-1.5 sm:px-4 font-medium">Пара</th>
+                    <th className="py-2.5 px-1.5 sm:px-3 font-medium text-right whitespace-nowrap">
                       <button
                         type="button"
                         onClick={() => handleSort('price')}
@@ -506,7 +944,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                         <ArrowDownUp className="w-3 h-3" />
                       </button>
                     </th>
-                    <th className="py-2.5 px-3 font-medium text-right">
+                    <th className="py-2.5 px-1.5 sm:px-3 font-medium text-right whitespace-nowrap">
                       <button
                         type="button"
                         onClick={() => handleSort('change')}
@@ -526,7 +964,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                         <ArrowDownUp className="w-3 h-3" />
                       </button>
                     </th>
-                    <th className="py-2.5 px-3 font-medium text-right">
+                    <th className="py-2.5 px-3 font-medium text-right hidden sm:table-cell whitespace-nowrap">
                       <button
                         type="button"
                         onClick={() => handleSort('volume')}
@@ -536,99 +974,81 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                         <ArrowDownUp className="w-3 h-3" />
                       </button>
                     </th>
-                    {marketType === 'futures' && <th className="py-2.5 px-3 font-medium text-right">Funding</th>}
-                    <th className="py-2.5 px-4 font-medium text-right">График</th>
+                    <th className="py-2.5 pl-1.5 pr-2.5 sm:px-4 font-medium text-right whitespace-nowrap">
+                      {marketType === 'futures' ? '24ч · Fund' : '24ч · RSI'}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/6 font-mono tabular-nums">
                   {filteredTickers.length === 0 ? (
                     <tr>
-                      <td colSpan={marketType === 'futures' ? 7 : 6} className="py-8 text-center font-sans text-slate-400">
+                      <td colSpan={6} className="py-8 text-center font-sans text-slate-400">
                         По выбранным фильтрам пары не найдены.
                       </td>
                     </tr>
                   ) : (
-                    filteredTickers.map((t) => {
-                      const isStarred = watchlist.includes(t.symbol);
-                      const span = Math.max(1e-9, t.high24h - t.low24h);
-                      const posInRange = Math.max(0, Math.min(100, Math.round(((t.price - t.low24h) / span) * 100)));
-                      const rangePct = t.low24h > 0 ? ((span / t.low24h) * 100).toFixed(1) : '0.0';
-
-                      return (
-                        <tr key={t.symbol} className="hover:bg-white/[0.03] transition-colors">
-                          <td className="py-2.5 px-4 font-sans">
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                onClick={() => toggleWatchlist(t.symbol)}
-                                aria-label={`Добавить ${t.symbol} в избранное`}
-                                className={`p-1 rounded-md transition-colors ${
-                                  isStarred ? 'text-amber-400' : 'text-slate-600 hover:text-slate-300'
-                                }`}
-                              >
-                                <Star className={`w-3.5 h-3.5 ${isStarred ? 'fill-amber-400' : ''}`} />
-                              </button>
-                              <div>
-                                <span className="font-semibold text-white">{t.baseAsset}</span>
-                                <span className="text-slate-500"> / USDT</span>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-2.5 px-3 text-right text-slate-100">
-                            <FlashValue value={t.price}>{formatUsd(t.price)}</FlashValue>
-                          </td>
-                          <td
-                            style={{
-                              // «тепловая карта»: чем сильнее движение, тем насыщеннее подсветка ячейки
-                              backgroundColor: `${
-                                t.change24hPct >= 0 ? 'rgba(16,185,129,' : 'rgba(244,63,94,'
-                              }${Math.min(0.26, 0.03 + (Math.abs(t.change24hPct) / 10) * 0.23).toFixed(3)})`,
-                            }}
-                            className={`py-2.5 px-3 text-right font-semibold ${
-                              t.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                            }`}
-                          >
-                            {t.change24hPct >= 0 ? '+' : ''}
-                            {t.change24hPct}%
-                          </td>
-                          <td className="py-2.5 px-3 hidden md:table-cell">
-                            <div className="w-28 space-y-1">
-                              <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
-                                <div
-                                  style={{ width: `${Math.max(6, posInRange)}%` }}
-                                  className="h-full rounded-full bg-gradient-to-r from-rose-400 via-amber-400 to-emerald-400"
-                                />
-                              </div>
-                              <div className="flex justify-between text-[10px] text-slate-500">
-                                <span>{rangePct}%</span>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-2.5 px-3 text-right text-slate-300">
-                            ${(t.volume24hUsdt / 1_000_000).toFixed(1)}M
-                          </td>
-                          {marketType === 'futures' && (
-                            <td className="py-2.5 px-3 text-right text-amber-300">
-                              {(t.fundingRatePct ?? 0.01).toFixed(4)}%
-                            </td>
-                          )}
-                          <td className="py-2.5 px-4 text-right font-sans">
-                            <button
-                              type="button"
-                              onClick={() => onOpenPairOnMarket(t.symbol, marketType)}
-                              className="min-h-[30px] px-2.5 rounded-lg border border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs font-medium inline-flex items-center gap-1 whitespace-nowrap transition-colors"
-                            >
-                              <span>Открыть</span>
-                              <ArrowRight className="w-3 h-3" />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
+                    filteredTickers.slice(0, visibleCount).map((t) => (
+                      <ScreenerTableRow
+                        key={t.symbol}
+                        ticker={t}
+                        marketType={marketType}
+                        isStarred={activeWatchlistSymbols.includes(t.symbol)}
+                        onToggleWatchlist={toggleWatchlist}
+                        onOpenPair={onOpenPairOnMarket}
+                      />
+                    ))
                   )}
                 </tbody>
               </table>
             </div>
+
+            {filteredTickers.length > visibleCount && (
+              <div className="p-3 border-t border-white/8 flex items-center justify-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    setVisibleCount((v) => v + 24);
+                  }}
+                  className="min-h-[36px] px-4 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 transition-colors"
+                >
+                  Показать ещё ({filteredTickers.length - visibleCount} пар)
+                </button>
+              </div>
+            )}
+
+            <div className="px-4 py-2.5 border-t border-white/6 text-[11px] text-slate-500">
+              Рыночные данные предоставлены публичными API криптобирж и агрегаторов. Упоминания торговых площадок носят информационный характер.
+            </div>
+          </section>
+        )}
+
+        {screenerSection === 'patterns' && (
+          <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5">
+            <LivePatternScannerTab
+              tickers={tickers}
+              marketType={marketType}
+              onOpenPair={onOpenPairOnMarket}
+            />
+          </section>
+        )}
+
+        {screenerSection === 'sectors' && (
+          <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5">
+            <SectorHeatmapCorrelationTab
+              tickers={tickers}
+              marketType={marketType}
+              onOpenPair={onOpenPairOnMarket}
+            />
+          </section>
+        )}
+
+        {screenerSection === 'arbitrage' && (
+          <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5">
+            <FundingArbitrageScannerTab
+              tickers={tickers}
+              onOpenPair={onOpenPairOnMarket}
+            />
           </section>
         )}
 
@@ -702,6 +1122,26 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-3">
+                {onOpenPortfolioDetails && (
+                  <button
+                    type="button"
+                    onClick={onOpenPortfolioDetails}
+                    className={`min-h-[36px] px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
+                      activeTarget?.active
+                        ? 'border-cyan-500/40 bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-200'
+                        : 'border-white/12 bg-white/5 hover:bg-white/10 text-slate-200'
+                    }`}
+                  >
+                    <Target className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                    <span>
+                      {activeTarget?.active
+                        ? `Цель: $${activeTarget.targetBalanceUsdt.toLocaleString('en-US', {
+                            maximumFractionDigits: activeTarget.targetBalanceUsdt >= 100 ? 0 : 2,
+                          })}`
+                        : 'Задать Target PnL'}
+                    </span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleExportPortfolioCsv}
@@ -720,20 +1160,34 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                 </button>
                 <div className="text-right font-mono tabular-nums">
                   <div className="text-lg font-bold text-white">
-                    ${portfolioReport.totalValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    {privacyMode
+                      ? '•••••'
+                      : `$${portfolioReport.totalValue.toLocaleString('en-US', {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}`}
                   </div>
                   <div
                     className={`text-xs font-semibold ${
                       portfolioReport.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
                     }`}
                   >
-                    PnL: {portfolioReport.totalPnl >= 0 ? '+' : ''}${portfolioReport.totalPnl.toFixed(2)} (
-                    {portfolioReport.totalPnlPct >= 0 ? '+' : ''}
+                    Всего PnL:{' '}
+                    {privacyMode
+                      ? '•••••'
+                      : `${portfolioReport.totalPnl >= 0 ? '+' : ''}$${portfolioReport.totalPnl.toFixed(2)}`}{' '}
+                    ({portfolioReport.totalPnlPct >= 0 ? '+' : ''}
                     {portfolioReport.totalPnlPct.toFixed(2)}%)
                   </div>
                 </div>
               </div>
             </div>
+
+            {portfolioError && (
+              <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+                {portfolioError}
+              </div>
+            )}
 
             <form onSubmit={handleAddHolding} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
               <div className="sm:col-span-4">
@@ -758,15 +1212,15 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
               </div>
               <div className="sm:col-span-3">
                 <label htmlFor="pf-amount" className="block text-[11px] text-slate-400 mb-1">
-                  Кол-во
+                  Кол-во (точка или запятая)
                 </label>
                 <input
                   id="pf-amount"
-                  type="number"
-                  step="any"
-                  min="0.0001"
+                  type="text"
+                  inputMode="decimal"
                   value={newAmount}
                   onChange={(e) => setNewAmount(e.target.value)}
+                  placeholder="0,15"
                   className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-emerald-500 focus:outline-none"
                 />
               </div>
@@ -776,11 +1230,11 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                 </label>
                 <input
                   id="pf-price"
-                  type="number"
-                  step="any"
-                  min="0.0001"
+                  type="text"
+                  inputMode="decimal"
                   value={newEntryPrice}
                   onChange={(e) => setNewEntryPrice(e.target.value)}
+                  placeholder="64000,50"
                   className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-emerald-500 focus:outline-none"
                 />
               </div>
@@ -814,35 +1268,97 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                         </td>
                       </tr>
                     ) : (
-                      portfolioReport.rows.map((row) => (
-                        <tr key={row.id}>
-                          <td className="py-2 font-sans">
-                            <div className="font-semibold text-white">{row.baseAsset}</div>
-                            <div className="text-[11px] font-mono text-slate-400">
-                              {row.amount} × {formatUsd(row.avgEntryPrice)}
-                            </div>
-                          </td>
-                          <td className="py-2 text-right text-slate-100">${row.valueUsdt.toFixed(2)}</td>
-                          <td
-                            className={`py-2 text-right font-semibold ${
-                              row.pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                            }`}
-                          >
-                            {row.pnlPct >= 0 ? '+' : ''}
-                            {row.pnlPct.toFixed(1)}%
-                          </td>
-                          <td className="py-2 text-right">
-                            <button
-                              type="button"
-                              onClick={() => onRemoveHolding(row.id)}
-                              aria-label={`Удалить позицию ${row.baseAsset}`}
-                              className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                      portfolioReport.rows.map((row) => {
+                        const isEditingRow = editingHoldingId === row.id;
+                        return (
+                          <tr key={row.id}>
+                            <td className="py-2 font-sans">
+                              <div className="font-semibold text-white">{row.baseAsset}</div>
+                              {isEditingRow ? (
+                                <div className="mt-1 flex items-center gap-1.5 font-mono">
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={editAmount}
+                                    onChange={(e) => setEditAmount(e.target.value)}
+                                    aria-label="Новое количество"
+                                    className="w-20 rounded-lg border border-emerald-500/40 bg-[#0B0F17] px-2 py-1 text-[11px] text-white"
+                                  />
+                                  <span className="text-slate-500">×</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={editEntryPrice}
+                                    onChange={(e) => setEditEntryPrice(e.target.value)}
+                                    aria-label="Новая цена входа"
+                                    className="w-24 rounded-lg border border-emerald-500/40 bg-[#0B0F17] px-2 py-1 text-[11px] text-white"
+                                  />
+                                </div>
+                              ) : (
+                                <div className="text-[11px] font-mono text-slate-400">
+                                  {effPrivacy ? '••••' : row.amount} × {formatUsd(row.avgEntryPrice)}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-2 text-right text-slate-100 whitespace-nowrap">
+                              {effPrivacy ? '•••••' : `$${row.valueUsdt.toFixed(2)}`}
+                            </td>
+                            <td
+                              className={`py-2 text-right font-semibold whitespace-nowrap ${
+                                row.pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                              }`}
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </td>
-                        </tr>
-                      ))
+                              {row.pnlPct >= 0 ? '+' : ''}
+                              {row.pnlPct.toFixed(1)}%
+                            </td>
+                            <td className="py-2 text-right">
+                              <div className="inline-flex items-center gap-1">
+                                {isEditingRow ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSaveEditHolding(row.id)}
+                                      aria-label="Сохранить позицию"
+                                      className="p-1.5 rounded-lg text-emerald-400 hover:bg-emerald-500/15 transition-colors"
+                                    >
+                                      <Check className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingHoldingId(null)}
+                                      aria-label="Отменить редактирование"
+                                      className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 transition-colors"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </>
+                                ) : (
+                                  <>
+                                    {onUpdateHolding && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleStartEditHolding(row)}
+                                        aria-label={`Изменить позицию ${row.baseAsset}`}
+                                        className="p-1.5 rounded-lg text-slate-500 hover:text-emerald-300 hover:bg-emerald-500/10 transition-colors"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => onRemoveHolding(row.id)}
+                                      aria-label={`Удалить позицию ${row.baseAsset}`}
+                                      className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -893,6 +1409,15 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                 </div>
               </div>
             </div>
+
+            {/* MAX #9: Стресс-тест портфеля («Что если?») */}
+            <PortfolioStressTestCard
+              holdings={portfolioReport.allocations.map((a) => ({
+                symbol: a.symbol,
+                valueUsdt: a.valueUsdt,
+              }))}
+              totalValueUsdt={portfolioReport.totalValue}
+            />
           </section>
         )}
       </WorkspaceShell>

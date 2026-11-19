@@ -1,8 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
-  <rect width="512" height="512" rx="112" fill="#0B0F17"/>
-  <path d="M256 64L416 128V252C416 352 346 426 256 456C166 426 96 352 96 252V128L256 64Z" fill="#111827" stroke="#10B981" stroke-width="14"/>
-  <path d="M256 96L384 148V248C384 328 326 392 256 418C186 392 128 328 128 248V148L256 96Z" fill="#0F172A" stroke="#F59E0B" stroke-width="4" stroke-opacity="0.65"/>
-  <line x1="256" y1="146" x2="256" y2="186" stroke="#10B981" stroke-width="14" stroke-linecap="round"/>
-  <rect x="226" y="186" width="60" height="128" rx="10" fill="#10B981"/>
-  <line x1="256" y1="314" x2="256" y2="358" stroke="#10B981" stroke-width="14" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Vernier">
+  <defs>
+    <linearGradient id="vn-fav-accent" gradientUnits="userSpaceOnUse" x1="6" y1="26" x2="26" y2="8">
+      <stop offset="0" stop-color="#34D399"/>
+      <stop offset="0.52" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <radialGradient id="vn-fav-glow" cx="0.22" cy="0.1" r="0.9">
+      <stop offset="0" stop-color="#10B981" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#10B981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="32" height="32" rx="7" fill="#0B0F17"/>
+  <rect width="32" height="32" rx="7" fill="url(#vn-fav-glow)"/>
+
+  <!-- 2 Crisp Asymmetric Vernier Ticks (strictly inward, clearly legible at 16-32px) -->
+  <rect x="12.2" y="16.4" width="2.9" height="1.7" rx="0.85" fill="#94A3B8"/>
+  <rect x="17.6" y="12.6" width="4.4" height="1.7" rx="0.85" fill="#94A3B8"/>
+
+  <!-- Coincident Top Caliper Jaws -->
+  <rect x="7.5" y="7.8" width="4.8" height="2" rx="0.8" fill="url(#vn-fav-accent)"/>
+  <rect x="19.7" y="7.8" width="4.8" height="2" rx="0.8" fill="url(#vn-fav-accent)"/>
+
+  <!-- Crisp Architectural V Silhouette -->
+  <path d="M 6 7.8 L 9.2 7.8 L 16 20.4 L 22.8 7.8 L 26 7.8 L 16.5 25.2 Q 16 26 15.5 25.2 Z" fill="#E2E8F0"/>
+
+  <!-- Coincident Apex Prism -->
+  <path d="M 14.0 22.4 L 16 20.4 L 18.0 22.4 L 16.5 25.2 Q 16 26 15.5 25.2 Z" fill="url(#vn-fav-accent)"/>
 </svg>

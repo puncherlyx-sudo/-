@@ -167,7 +167,7 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
                     Связаться с поддержкой
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Если в «Быстрых ответах» нет решения — опишите задачу команде AegisQuant
+                    Если в «Быстрых ответах» нет решения — опишите задачу команде Vernier
                   </p>
                 </div>
               </div>

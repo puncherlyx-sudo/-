@@ -60,7 +60,7 @@ const WIDGET_CATALOG: WidgetCatalogItem[] = [
     sizeLabel: '2×2',
     description: 'Текущая цена выбранной пары, суточное изменение (%) и диапазон 24ч.',
     icon: TrendingUp,
-    imageSrc: '/src/assets/images/aegis_terminal_emblem_1794855840828.jpg',
+    imageSrc: '/brand/vernier-app-icon.svg',
   },
   {
     kind: 'position',
@@ -412,12 +412,11 @@ export const AndroidWidgetsModal: React.FC<AndroidWidgetsModalProps> = ({
               <div className="pt-2 border-t border-white/10 flex items-center justify-around text-[10px] text-slate-400">
                 <div className="flex flex-col items-center gap-1">
                   <img
-                    src="/src/assets/images/aegis_terminal_emblem_1794855840828.jpg"
-                    alt="AegisQuant"
-                    referrerPolicy="no-referrer"
-                    className="w-9 h-9 rounded-xl object-cover border border-white/15"
+                    src="/brand/vernier-app-icon.svg"
+                    alt="Vernier"
+                    className="w-9 h-9 rounded-xl object-cover"
                   />
-                  <span className="text-slate-200">AegisQuant</span>
+                  <span className="text-slate-200">Vernier</span>
                 </div>
                 <span className="text-[10px] text-slate-500 text-center max-w-[170px]">
                   Нажмите на любой виджет, чтобы открыть его в режиме закрепления
@@ -532,7 +531,7 @@ export const AndroidWidgetsModal: React.FC<AndroidWidgetsModalProps> = ({
                       Быстрые ярлыки в лаунчере Android (App Shortcuts)
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Установите PWA на Android — при удержании иконки AegisQuant появятся все 5 виджет-режимов, которые можно перетянуть на рабочий стол.
+                      Установите PWA на Android — при удержании иконки Vernier появятся все 5 виджет-режимов, которые можно перетянуть на рабочий стол.
                     </p>
                   </div>
 
@@ -557,7 +556,7 @@ export const AndroidWidgetsModal: React.FC<AndroidWidgetsModalProps> = ({
                   </li>
                   <li>
                     <strong className="text-white">Шаг 2.</strong> На рабочем столе Android удерживайте палец на иконке{' '}
-                    <strong className="text-emerald-300">AegisQuant</strong> 1 секунду — откроется системное меню ярлыков: <em>График, Цена, Позиция, Доходность, Стратегии</em>.
+                    <strong className="text-emerald-300">Vernier</strong> 1 секунду — откроется системное меню ярлыков: <em>График, Цена, Позиция, Доходность, Стратегии</em>.
                   </li>
                   <li>
                     <strong className="text-white">Шаг 3.</strong> Зажмите нужный пункт (например, <em>График</em> или <em>Цена</em>) и перетащите прямо на свободное место рабочего стола.

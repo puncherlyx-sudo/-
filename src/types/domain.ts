@@ -1,5 +1,5 @@
 export type MarketType = 'spot' | 'futures';
-export type PlanTier = 'free' | 'pro';
+export type PlanTier = 'free' | 'pro' | 'max';
 export type Timeframe = '15m' | '1h' | '4h' | '1d';
 export type AppTab = 'market' | 'screener' | 'strategies' | 'news' | 'security';
 export type RibbonType = 'EMA' | 'SMA';
@@ -269,8 +269,10 @@ export interface UserProfile {
   nextResetAt: string;
   twoFactorEnabled: boolean;
   autoLockMinutes: number;
-  /** Конец оплаченного периода PRO (мс). Выставляется только сервером. */
+  /** Конец оплаченного периода PRO/MAX (мс). Выставляется только сервером. */
   proUntil?: number;
+  /** Множитель токенов для тарифа MAX (10 = 1000 кр., 20 = 2000 кр.). Выставляется только сервером. */
+  maxMultiplier?: 10 | 20;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -305,6 +307,8 @@ export interface PushSubscriptionRecord {
   notifyMarketMoves: boolean;
   notifyVolatilitySpikes?: boolean;
   volatilityThresholdPct?: number;
+  notifyPortfolioPnl?: boolean;
+  portfolioPnlThresholdPct?: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
@@ -393,7 +397,7 @@ export interface EquityCurvePoint {
 }
 
 export interface StrategyPerformanceReport {
-  interval: '1h' | '4h';
+  interval: '1h' | '4h' | '1d';
   depositUsdt: number;
   scope: 'active' | 'all';
   dataSource: 'live' | 'cached';
@@ -408,6 +412,85 @@ export interface StrategyPerformanceReport {
   };
   equityCurve: EquityCurvePoint[];
   breakdown: StrategyBreakdownResult[];
+}
+
+export interface LiveScannerOpportunity {
+  symbol: string;
+  marketType: MarketType;
+  timeframe: '1h' | '4h';
+  strategyKey: string;
+  strategyName: string;
+  strategyTier: PlanTier;
+  direction: 'LONG' | 'SHORT';
+  confidence: number;
+  entryPrice: number;
+  stopLossPrice: number;
+  takeProfitPrice: number;
+  riskRewardRatio: number;
+  rsi14: number;
+  trendBias: 'BULLISH' | 'BEARISH' | 'RANGE';
+  change24hPct: number;
+}
+
+export interface LiveScannerReport {
+  tier: PlanTier;
+  scannedPairsCount: number;
+  totalPairsAvailable: number;
+  timeframe: '1h' | '4h';
+  opportunities: LiveScannerOpportunity[];
+  updatedAt: string;
+}
+
+export interface SentimentComparisonRow {
+  strategyKey: string;
+  name: string;
+  tier: PlanTier;
+  winRatePct: number;
+  totalPnlPct: number;
+  profitFactor: number;
+  tradesCount: number;
+}
+
+export interface AdvancedSentimentReport {
+  locked: boolean;
+  tier: PlanTier;
+  asset: string;
+  interval: '1h' | '4h' | '1d';
+  compositeScore: number;
+  forecastBias: 'BULLISH_EXPANSION' | 'ACCUMULATION_BIAS' | 'NEUTRAL_ROTATION' | 'RISK_OFF_HEDGING';
+  forecastHeadline: string;
+  forecastSummary: string;
+  fearGreed: {
+    value: number;
+    classificationRu: string;
+    yesterdayValue: number;
+    weekAgoValue: number;
+    monthAgoValue: number;
+    delta7d: number;
+  };
+  marketBreadth: {
+    advancingCount: number;
+    decliningCount: number;
+    totalPairs: number;
+    advancingPct: number;
+    avgChange24hPct: number;
+    avgFundingRatePct: number;
+  };
+  newsBreakdown: {
+    bullishCount: number;
+    bearishCount: number;
+    neutralCount: number;
+    catalysts: GroundedNewsItem[];
+  };
+  comparison: {
+    sentimentStrategy: SentimentComparisonRow | null;
+    freeAverageWinRatePct: number;
+    freeAveragePnlPct: number;
+    winRateDeltaPp: number;
+    pnlDeltaPct: number;
+    freeStrategies: SentimentComparisonRow[];
+  };
+  updatedAt: string;
 }
 
 export interface EconomicCalendarEvent {
@@ -425,3 +508,110 @@ export interface EconomicCalendarEvent {
   marketBias: 'VOLATILITY' | 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   sourceUrl?: string;
 }
+
+export interface TradeRecord {
+  id: string;
+  userId: string;
+  symbol: string;
+  marketType: MarketType;
+  side: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopPrice: number;
+  exitPrice: number;
+  status: 'open' | 'closed';
+  note: string;
+  closedAt: string;
+  createdAt?: { seconds?: number };
+}
+
+export interface TradeJournalEntry {
+  id: string;
+  uid: string;
+  symbol: string;
+  marketType: MarketType;
+  direction: 'LONG' | 'SHORT';
+  status: 'OPEN' | 'CLOSED';
+  entryPrice: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  exitPrice?: number;
+  positionSizeUsdt: number;
+  leverage: number;
+  pnlUsdt?: number;
+  pnlPct?: number;
+  strategyName?: string;
+  note?: string;
+  openedAt: string;
+  closedAt?: string;
+}
+
+export type ExchangeId = 'binance' | 'bybit' | 'okx';
+export type ExchangeKeyPermissions = 'read_only' | 'trade';
+
+export interface ExchangeKeyRecord {
+  id: string;
+  userId: string;
+  exchange: ExchangeId;
+  label: string;
+  apiKeyPreview: string;
+  encryptedApiKey: string;
+  encryptedApiSecret: string;
+  encryptedPassphrase: string;
+  permissions: ExchangeKeyPermissions;
+  testnet: boolean;
+  enabled: boolean;
+  lastSyncedAt: string;
+  lastBalanceUsdt: number;
+  lastSyncError: string;
+  createdAt?: { seconds?: number } | unknown;
+  updatedAt?: { seconds?: number } | unknown;
+}
+
+export interface ExchangeAssetBalance {
+  asset: string;
+  symbol: string;
+  free: number;
+  locked: number;
+  total: number;
+  priceUsdt: number;
+  valueUsdt: number;
+}
+
+export interface ExchangeSyncResult {
+  exchange: ExchangeId;
+  testnet: boolean;
+  totalBalanceUsdt: number;
+  assets: ExchangeAssetBalance[];
+  syncedAt: string;
+  accountType?: string;
+}
+
+export interface ExchangeOrderResult {
+  exchange: ExchangeId;
+  orderId: string;
+  symbol: string;
+  marketType: MarketType;
+  side: 'BUY' | 'SELL';
+  orderType: 'MARKET' | 'LIMIT';
+  status: string;
+  executedQty: number;
+  price: number;
+  testnet: boolean;
+  submittedAt: string;
+}
+
+export interface PortfolioTargetRecord {
+  id: string;
+  userId: string;
+  portfolioId: string;
+  portfolioLabel: string;
+  targetBalanceUsdt: number;
+  baselineBalanceUsdt: number;
+  targetPnlPct: number;
+  active: boolean;
+  triggeredAt: string;
+  triggeredBalanceUsdt: number;
+  createdAt?: { seconds?: number } | unknown;
+  updatedAt?: { seconds?: number } | unknown;
+}
+

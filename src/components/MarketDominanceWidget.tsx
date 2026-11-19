@@ -301,7 +301,7 @@ export const MarketDominanceWidget: React.FC<MarketDominanceWidgetProps> = ({
             </div>
 
             {/* Breakdown Table */}
-            <div className="sm:col-span-7 divide-y divide-white/8 text-xs">
+            <div className="sm:col-span-7 divide-y divide-white/8 text-xs min-w-0">
               {groupSlices.map((slice) => {
                 const isHighlighted =
                   hoveredId === slice.id || (slice.symbol && slice.symbol === selectedSymbol);
@@ -313,27 +313,27 @@ export const MarketDominanceWidget: React.FC<MarketDominanceWidgetProps> = ({
                     onMouseEnter={() => setHoveredId(slice.id)}
                     onMouseLeave={() => setHoveredId(null)}
                     onClick={() => slice.symbol && onSelectSymbol?.(slice.symbol)}
-                    className={`w-full py-2.5 px-2 -mx-2 rounded-lg flex items-center justify-between gap-2 text-left transition-colors ${
+                    className={`w-full py-2.5 px-2 rounded-lg flex items-center justify-between gap-2 text-left transition-colors ${
                       isHighlighted ? 'bg-white/[0.04]' : 'hover:bg-white/[0.02]'
                     }`}
                   >
-                    <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
                       <span
                         className="w-2.5 h-2.5 rounded-full shrink-0"
                         style={{ backgroundColor: slice.color }}
                       />
                       <div className="min-w-0">
                         <div className="font-medium text-white truncate">{slice.name}</div>
-                        <div className="text-[11px] font-mono tabular-nums text-slate-400">
+                        <div className="text-[11px] font-mono tabular-nums text-slate-400 truncate">
                           {formatCompactVolume(slice.volumeUsdt)}
                         </div>
                       </div>
                     </div>
 
-                    <div className="text-right font-mono tabular-nums shrink-0">
-                      <div className="font-bold text-white">{slice.sharePct.toFixed(1)}%</div>
+                    <div className="text-right font-mono tabular-nums shrink-0 pl-1">
+                      <div className="font-bold text-white whitespace-nowrap">{slice.sharePct.toFixed(1)}%</div>
                       <div
-                        className={`text-[11px] ${
+                        className={`text-[11px] whitespace-nowrap ${
                           slice.weightedChangePct >= 0 ? 'text-emerald-400' : 'text-rose-400'
                         }`}
                       >

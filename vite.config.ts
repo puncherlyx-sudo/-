@@ -15,11 +15,21 @@ export default defineConfig(() => {
         srcDir: 'src',
         filename: 'sw.ts',
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: [
+          'icon.svg',
+          'apple-touch-icon.png',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
+          'brand/vernier-app-icon.svg',
+          'brand/vernier-mark.svg',
+          'brand/vernier-mono.svg',
+          'brand/vernier-lockup.svg',
+        ],
         manifest: {
           id: '/',
-          name: 'AegisQuant Crypto Terminal',
-          short_name: 'AegisQuant',
+          name: 'Vernier Crypto Terminal',
+          short_name: 'Vernier',
           description: 'Защищенный терминал анализа крипторынка, новостей и стратегий Спот и Фьючерсы с 2FA.',
           theme_color: '#0B0F17',
           background_color: '#0B0F17',
@@ -90,7 +100,7 @@ export default defineConfig(() => {
           // W3C Web App Widgets spec (cast safely for ManifestOptions compatibility)
           widgets: [
             {
-              name: 'AegisQuant · Виджет графика',
+              name: 'Vernier · Виджет графика',
               short_name: 'График',
               description: 'Тренд, RSI(14) и ключевые уровни выбранной пары',
               tag: 'chart-widget',
@@ -102,7 +112,7 @@ export default defineConfig(() => {
               icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
             },
             {
-              name: 'AegisQuant · Виджет цены',
+              name: 'Vernier · Виджет цены',
               short_name: 'Цена',
               description: 'Актуальная цена и изменение за 24 часа',
               tag: 'price-widget',
@@ -114,7 +124,7 @@ export default defineConfig(() => {
               icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
             },
             {
-              name: 'AegisQuant · Виджет позиции',
+              name: 'Vernier · Виджет позиции',
               short_name: 'Позиция',
               description: 'Расчет объема лота и риск на сделку',
               tag: 'position-widget',
@@ -126,7 +136,7 @@ export default defineConfig(() => {
               icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
             },
             {
-              name: 'AegisQuant · Виджет доходности',
+              name: 'Vernier · Виджет доходности',
               short_name: 'Доходность',
               description: 'Сводка доходности, лидеров рынка и настроений',
               tag: 'pnl-widget',
@@ -138,7 +148,7 @@ export default defineConfig(() => {
               icons: [{ src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' }],
             },
             {
-              name: 'AegisQuant · Стратегии',
+              name: 'Vernier · Стратегии',
               short_name: 'Стратегии',
               description: 'Сигналы торговых стратегий и волатильность',
               tag: 'strategies-widget',

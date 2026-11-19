@@ -119,11 +119,11 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
       price: `Цена ${symbol}`,
       position: `Позиция ${symbol}`,
       pnl: 'Доходность портфеля',
-      strategies: 'Стратегии AegisQuant',
+      strategies: 'Стратегии Vernier',
     };
-    document.title = `${labelMap[widgetKind]} · AegisQuant`;
+    document.title = `${labelMap[widgetKind]} · Vernier`;
     return () => {
-      document.title = 'AegisQuant — Терминал анализа крипторынка и стратегий';
+      document.title = 'Vernier — Терминал анализа крипторынка и стратегий';
     };
   }, [widgetKind, symbol]);
 
@@ -251,7 +251,7 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
                   Нажмите <strong className="text-white">Добавить на главный экран</strong> — Android закрепит именно этот виджет (<strong className="text-emerald-300">{document.title.split(' · ')[0]}</strong>).
                 </li>
                 <li>
-                  Либо установите <strong className="text-white">AegisQuant</strong> и удерживайте иконку на рабочем столе для доступа ко всем 5 быстрым ярлыкам.
+                  Либо установите <strong className="text-white">Vernier</strong> и удерживайте иконку на рабочем столе для доступа ко всем 5 быстрым ярлыкам.
                 </li>
               </ol>
             )}
@@ -671,7 +671,7 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
       </div>
 
       <footer className="w-full max-w-xl mx-auto pt-4 flex items-center justify-between text-[11px] text-slate-500">
-        <span>AegisQuant · Автообновление 15 сек</span>
+        <span>Vernier · Автообновление 15 сек</span>
         <span>
           {feed?.updatedAt
             ? new Date(feed.updatedAt).toLocaleTimeString('ru-RU')

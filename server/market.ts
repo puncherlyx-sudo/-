@@ -169,7 +169,7 @@ async function fetchJsonWithTimeout(url: string, timeoutMs = 4500): Promise<unkn
       headers: {
         Accept: 'application/json',
         'Cache-Control': 'no-cache',
-        'User-Agent': 'AegisQuant/1.0',
+        'User-Agent': 'Vernier/1.0',
       },
     });
     if (!res.ok) {

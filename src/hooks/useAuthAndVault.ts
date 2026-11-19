@@ -23,6 +23,11 @@ import {
   PRO_MONTHLY_QUOTA,
   STRATEGY_CATALOG,
   countTodayStrategySignals,
+  getActivePlanTier,
+  getCreditQuotaForProfile,
+  getTierDisplayName,
+  isMaxOnlyStrategy,
+  isMaxSubscriptionActive,
   isProOnlyStrategy,
   isProSubscriptionActive,
 } from '../data/strategies';
@@ -31,8 +36,14 @@ import {
   OperationType,
   type AnalysisRecord,
   type AnalysisResultPayload,
+  type ExchangeId,
+  type ExchangeKeyPermissions,
+  type ExchangeKeyRecord,
+  type ExchangeOrderResult,
+  type ExchangeSyncResult,
   type MarketType,
   type PlanTier,
+  type PortfolioTargetRecord,
   type PriceAlertCondition,
   type PriceAlertRecord,
   type PushSubscriptionRecord,
@@ -47,6 +58,14 @@ import {
 } from '../types/domain';
 import { playAlertChime } from '../lib/alertSound';
 import { authFetch } from '../lib/authFetch';
+import {
+  buildCachedExchangeSyncEntry,
+  pruneExchangeSyncCache,
+  readExchangeSyncCache,
+  removeExchangeSyncCacheEntry,
+  writeExchangeSyncCacheEntry,
+  type ExchangeSyncCacheMap,
+} from '../lib/exchangeSyncCache';
 import { safeFetchJson } from '../utils/safeFetchJson';
 
 function nextWeekIso(): string {
@@ -146,6 +165,7 @@ export function useAuthAndVault() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const clearAuthError = useCallback(() => setAuthError(null), []);
 
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [privateSecurity, setPrivateSecurity] = useState<UserPrivateSecurity | null>(null);
@@ -156,6 +176,10 @@ export function useAuthAndVault() {
   const [sessions, setSessions] = useState<UserSessionRecord[]>([]);
   const [priceAlerts, setPriceAlerts] = useState<PriceAlertRecord[]>([]);
   const [supportTickets, setSupportTickets] = useState<SupportTicketRecord[]>([]);
+  const [exchangeKeys, setExchangeKeys] = useState<ExchangeKeyRecord[]>([]);
+  const [exchangeSyncCache, setExchangeSyncCache] = useState<ExchangeSyncCacheMap>({});
+  const [backgroundSyncingKeyIds, setBackgroundSyncingKeyIds] = useState<string[]>([]);
+  const [portfolioTargets, setPortfolioTargets] = useState<PortfolioTargetRecord[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>(() => getOrCreateLocalSessionId());
 
   const [isLocked, setIsLocked] = useState(false);
@@ -318,7 +342,7 @@ export function useAuthAndVault() {
           }
         }
 
-        // Backfill newly added catalog strategies for existing accounts
+        // Backfill newly added catalog strategies for existing accounts (per-item resilient)
         try {
           const existingStratsSnap = await getDocs(
             query(collection(db, 'users', uid, 'strategies'), where('userId', '==', uid))
@@ -329,31 +353,34 @@ export function useAuthAndVault() {
           for (const tpl of STRATEGY_CATALOG) {
             if (existingKeys.has(tpl.key)) continue;
             const stratId = sanitizeId(`strat_${tpl.key}`);
-            const stratPath = `users/${uid}/strategies/${stratId}`;
             const initialLeverage =
               tpl.marketType === 'spot'
                 ? 1
                 : isExistingPro
                   ? tpl.defaultLeverage
                   : Math.min(FREE_MAX_LEVERAGE, tpl.defaultLeverage);
-            await setDoc(doc(db, 'users', uid, 'strategies', stratId), {
-              id: stratId,
-              userId: uid,
-              marketType: tpl.marketType,
-              strategyKey: tpl.key,
-              name: tpl.name.slice(0, 120),
-              enabled: false,
-              dailySignalLimit: 1,
-              minConfidence: 70,
-              riskPerTradePct: tpl.defaultRiskPct,
-              leverage: initialLeverage,
-              pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
+            try {
+              await setDoc(doc(db, 'users', uid, 'strategies', stratId), {
+                id: stratId,
+                userId: uid,
+                marketType: tpl.marketType,
+                strategyKey: tpl.key,
+                name: tpl.name.slice(0, 120),
+                enabled: false,
+                dailySignalLimit: 1,
+                minConfidence: 70,
+                riskPerTradePct: tpl.defaultRiskPct,
+                leverage: initialLeverage,
+                pairs: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+            } catch {
+              // Skip individual backfill failures without blocking the session
+            }
           }
-        } catch (err) {
-          handleFirestoreError(err, OperationType.WRITE, `users/${uid}/strategies`);
+        } catch {
+          // Non-blocking: existing strategies remain available via onSnapshot
         }
       }
 
@@ -461,9 +488,15 @@ export function useAuthAndVault() {
         setSessions([]);
         setPriceAlerts([]);
         setSupportTickets([]);
+        setExchangeKeys([]);
+        setExchangeSyncCache({});
+        setBackgroundSyncingKeyIds([]);
+        setPortfolioTargets([]);
         setIsLocked(false);
         selfSignOutRef.current = false;
       } else {
+        // Мгновенно поднимаем локальный кэш балансов/активов бирж до завершения сетевого обновления
+        setExchangeSyncCache(readExchangeSyncCache(user.uid));
         void bootstrapUserAccount(user).catch((err) => {
           setAuthError(err instanceof Error ? err.message : 'Ошибка инициализации профиля');
         });
@@ -625,6 +658,46 @@ export function useAuthAndVault() {
       (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/supportTickets`)
     );
 
+    const exchangeKeysQuery = query(
+      collection(db, 'users', uid, 'exchangeKeys'),
+      where('userId', '==', uid),
+      limit(15)
+    );
+    const unsubExchangeKeys = onSnapshot(
+      exchangeKeysQuery,
+      (snap) => {
+        const docs = snap.docs.map((d) => d.data() as ExchangeKeyRecord);
+        docs.sort((a, b) => {
+          const tsA = (a.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          const tsB = (b.createdAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          return tsB - tsA;
+        });
+        setExchangeKeys(docs);
+        setExchangeSyncCache(pruneExchangeSyncCache(uid, docs.map((d) => d.id)));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/exchangeKeys`)
+    );
+
+    const portfolioTargetsQuery = query(
+      collection(db, 'users', uid, 'portfolioTargets'),
+      where('userId', '==', uid),
+      limit(20)
+    );
+    const unsubPortfolioTargets = onSnapshot(
+      portfolioTargetsQuery,
+      (snap) => {
+        const docs = snap.docs.map((d) => d.data() as PortfolioTargetRecord);
+        docs.sort((a, b) => {
+          if (a.active !== b.active) return a.active ? -1 : 1;
+          const tsA = (a.updatedAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          const tsB = (b.updatedAt as { seconds?: number } | undefined)?.seconds ?? 0;
+          return tsB - tsA;
+        });
+        setPortfolioTargets(docs);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/portfolioTargets`)
+    );
+
     return () => {
       unsubProfile();
       unsubPrivate();
@@ -635,6 +708,8 @@ export function useAuthAndVault() {
       unsubSessions();
       unsubPriceAlerts();
       unsubSupport();
+      unsubExchangeKeys();
+      unsubPortfolioTargets();
     };
   }, [authReady, firebaseUser]);
 
@@ -707,15 +782,17 @@ export function useAuthAndVault() {
   const consumeCredits = useCallback(
     async (amount: number, auditReason?: string): Promise<boolean> => {
       if (!firebaseUser || !profile) return false;
-      const activePro = isProSubscriptionActive(profile);
-      const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
+      const activeTier = getActivePlanTier(profile);
+      const activePro = activeTier === 'pro' || activeTier === 'max';
+      const tierLabel = getTierDisplayName(activeTier);
+      const quota = getCreditQuotaForProfile(profile);
       const cost = Math.max(1, Math.round(amount));
 
       if (profile.creditsRemaining < cost) {
         throw new Error(
           activePro
-            ? `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Продлите PRO, чтобы начислить ещё ${PRO_MONTHLY_QUOTA} кредитов.`
-            : `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Перейдите на PRO (100 кр./мес.) или дождитесь сброса квоты.`
+            ? `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Продлите ${tierLabel}, чтобы начислить ещё ${quota} кредитов.`
+            : `Недостаточно кредитов (нужно ${cost}, доступно ${profile.creditsRemaining}/${quota}). Перейдите на PRO (${PRO_MONTHLY_QUOTA} кр./мес.) или MAX (1 000–2 000 кр./мес.).`
         );
       }
 
@@ -749,8 +826,10 @@ export function useAuthAndVault() {
   }) => {
     if (!firebaseUser || !profile) return;
     const uid = firebaseUser.uid;
-    const activePro = isProSubscriptionActive(profile);
-    const quota = activePro ? PRO_MONTHLY_QUOTA : profile.weeklyQuota || FREE_WEEKLY_QUOTA;
+    const activeTier = getActivePlanTier(profile);
+    const activePro = activeTier === 'pro' || activeTier === 'max';
+    const tierLabel = getTierDisplayName(activeTier);
+    const quota = getCreditQuotaForProfile(profile);
     const cost = Math.max(
       1,
       Math.round(
@@ -763,7 +842,7 @@ export function useAuthAndVault() {
       const usedToday = countTodayStrategySignals(analyses, params.strategyKey);
       if (usedToday >= FREE_DAILY_SIGNAL_LIMIT) {
         throw new Error(
-          `Достигнут дневной лимит Free (${FREE_DAILY_SIGNAL_LIMIT}/день) для «${params.strategyName}». Перейдите на PRO для снятия дневных ограничений.`
+          `Достигнут дневной лимит Free (${FREE_DAILY_SIGNAL_LIMIT}/день) для «${params.strategyName}». Перейдите на PRO или MAX для снятия дневных ограничений.`
         );
       }
     }
@@ -771,8 +850,8 @@ export function useAuthAndVault() {
     if (profile.creditsRemaining < cost) {
       throw new Error(
         activePro
-          ? `Недостаточно кредитов PRO (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Продлите подписку для пополнения квоты.`
-          : `Недостаточно кредитов (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Перейдите на PRO или дождитесь сброса квоты.`
+          ? `Недостаточно кредитов ${tierLabel} (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Продлите подписку для пополнения квоты.`
+          : `Недостаточно кредитов (нужно ${cost}, осталось ${profile.creditsRemaining}/${quota}). Перейдите на PRO или MAX.`
       );
     }
 
@@ -827,34 +906,70 @@ export function useAuthAndVault() {
     if (!firebaseUser || !profile) return;
     const uid = firebaseUser.uid;
     const activePro = isProSubscriptionActive(profile);
+    const activeMax = isMaxSubscriptionActive(profile);
     const matched = strategies.find((s) => s.id === strategyId);
     const strategyKey = matched?.strategyKey || strategyId.replace(/^strat_/, '');
+    const catalogTpl = STRATEGY_CATALOG.find((t) => t.key === strategyKey);
+    if (!activeMax && isMaxOnlyStrategy(strategyKey)) {
+      throw new Error('Эта стратегия открывается только в активной подписке MAX.');
+    }
     if (!activePro && isProOnlyStrategy(strategyKey)) {
-      throw new Error('Эта стратегия открывается только в активной подписке PRO.');
+      throw new Error('Эта стратегия открывается только в активной подписке PRO или MAX.');
     }
 
     const cappedLimit = activePro
       ? Math.min(100, Math.max(0, Math.round(updates.dailySignalLimit)))
       : FREE_DAILY_SIGNAL_LIMIT;
     const maxLev = activePro ? 20 : FREE_MAX_LEVERAGE;
-    const cappedLeverage = Math.min(maxLev, Math.max(1, Math.round(updates.leverage)));
+    const resolvedMarketType: MarketType =
+      matched?.marketType ?? catalogTpl?.marketType ?? 'spot';
+    const cappedLeverage =
+      resolvedMarketType === 'spot'
+        ? 1
+        : Math.min(maxLev, Math.max(1, Math.round(updates.leverage)));
+    const safePairs =
+      Array.isArray(updates.pairs) && updates.pairs.length > 0
+        ? updates.pairs.slice(0, 10)
+        : ['BTCUSDT'];
+    const safeMinConfidence = Math.min(95, Math.max(50, Math.round(updates.minConfidence)));
+    const safeRiskPct = Math.min(10, Math.max(0.25, Number(updates.riskPerTradePct) || 1));
+
+    const stratRef = doc(db, 'users', uid, 'strategies', strategyId);
     const path = `users/${uid}/strategies/${strategyId}`;
     try {
-      await updateDoc(doc(db, 'users', uid, 'strategies', strategyId), {
-        enabled: updates.enabled,
-        dailySignalLimit: cappedLimit,
-        minConfidence: Math.min(95, Math.max(50, Math.round(updates.minConfidence))),
-        riskPerTradePct: Math.min(10, Math.max(0.25, Number(updates.riskPerTradePct))),
-        leverage: cappedLeverage,
-        pairs: updates.pairs.slice(0, 10),
-        updatedAt: serverTimestamp(),
-      });
+      if (matched) {
+        await updateDoc(stratRef, {
+          enabled: updates.enabled,
+          dailySignalLimit: cappedLimit,
+          minConfidence: safeMinConfidence,
+          riskPerTradePct: safeRiskPct,
+          leverage: cappedLeverage,
+          pairs: safePairs,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(stratRef, {
+          id: strategyId,
+          userId: uid,
+          marketType: resolvedMarketType,
+          strategyKey: strategyKey.slice(0, 64),
+          name: (catalogTpl?.name ?? strategyKey).slice(0, 120),
+          enabled: updates.enabled,
+          dailySignalLimit: cappedLimit,
+          minConfidence: safeMinConfidence,
+          riskPerTradePct: safeRiskPct,
+          leverage: cappedLeverage,
+          pairs: safePairs,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
       await writeAuditLog(
         uid,
         'STRATEGY_UPDATED',
         `Обновлена стратегия ${strategyId}: ${
           cappedLimit === 0 ? 'без лимита сигналов/день (PRO)' : `лимит ${cappedLimit} сигн./день`
-        }, плечо ${cappedLeverage}x, риск ${updates.riskPerTradePct}%.`,
+        }, плечо ${cappedLeverage}x, риск ${safeRiskPct}%.`,
         'SUCCESS'
       );
     } catch (err) {
@@ -976,6 +1091,8 @@ export function useAuthAndVault() {
       notifyMarketMoves: boolean;
       notifyVolatilitySpikes: boolean;
       volatilityThresholdPct: number;
+      notifyPortfolioPnl: boolean;
+      portfolioPnlThresholdPct: number;
       notifyNews: boolean;
       notifyAuthLogins: boolean;
       notifyStrategyChanges: boolean;
@@ -996,6 +1113,8 @@ export function useAuthAndVault() {
         notifyMarketMoves: params.notifyMarketMoves,
         notifyVolatilitySpikes: params.notifyVolatilitySpikes,
         volatilityThresholdPct: Math.max(1, Math.min(25, Number(params.volatilityThresholdPct) || 5)),
+        notifyPortfolioPnl: params.notifyPortfolioPnl,
+        portfolioPnlThresholdPct: Math.max(1, Math.min(50, Number(params.portfolioPnlThresholdPct) || 5)),
         notifyNews: params.notifyNews,
         notifyAuthLogins: params.notifyAuthLogins,
         notifyStrategyChanges: params.notifyStrategyChanges,
@@ -1421,10 +1540,516 @@ export function useAuthAndVault() {
     [firebaseUser, writeAuditLog]
   );
 
+  const connectExchangeKey = useCallback(
+    async (params: {
+      exchange: ExchangeId;
+      label: string;
+      apiKey: string;
+      apiSecret: string;
+      passphrase?: string;
+      permissions: ExchangeKeyPermissions;
+      testnet: boolean;
+    }): Promise<{ key: ExchangeKeyRecord; sync: ExchangeSyncResult }> => {
+      if (!firebaseUser) {
+        throw new Error('Авторизуйтесь для подключения биржи.');
+      }
+      const uid = firebaseUser.uid;
+      const cleanLabel = params.label.trim().slice(0, 64);
+      if (cleanLabel.length < 2) {
+        throw new Error('Укажите название подключения (минимум 2 символа).');
+      }
+
+      const res = await authFetch('/api/exchanges/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: params.exchange,
+          label: cleanLabel,
+          apiKey: params.apiKey,
+          apiSecret: params.apiSecret,
+          passphrase: params.passphrase || '',
+          permissions: params.permissions,
+          testnet: params.testnet,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        apiKeyPreview?: string;
+        encryptedApiKey?: string;
+        encryptedApiSecret?: string;
+        encryptedPassphrase?: string;
+        sync?: ExchangeSyncResult;
+      };
+      if (!res.ok || !data.encryptedApiKey || !data.encryptedApiSecret || !data.apiKeyPreview || !data.sync) {
+        throw new Error(data.error || 'Не удалось проверить API-ключ на бирже.');
+      }
+
+      const keyId = sanitizeId(`exk_${params.exchange}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`);
+      const path = `users/${uid}/exchangeKeys/${keyId}`;
+      const record: ExchangeKeyRecord = {
+        id: keyId,
+        userId: uid,
+        exchange: params.exchange,
+        label: cleanLabel,
+        apiKeyPreview: data.apiKeyPreview.slice(0, 24),
+        encryptedApiKey: data.encryptedApiKey,
+        encryptedApiSecret: data.encryptedApiSecret,
+        encryptedPassphrase: data.encryptedPassphrase || '',
+        permissions: params.permissions,
+        testnet: params.testnet,
+        enabled: true,
+        lastSyncedAt: data.sync.syncedAt.slice(0, 64),
+        lastBalanceUsdt: Math.max(0, Math.min(1_000_000_000, Number(data.sync.totalBalanceUsdt) || 0)),
+        lastSyncError: '',
+      };
+
+      try {
+        await setDoc(doc(db, 'users', uid, 'exchangeKeys', keyId), {
+          ...record,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        await writeAuditLog(
+          uid,
+          'EXCHANGE_CONNECTED',
+          `Подключён API-ключ ${params.exchange.toUpperCase()} (${cleanLabel}, ${params.permissions === 'trade' ? 'торговля' : 'чтение'}).`,
+          'SUCCESS'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, path);
+      }
+
+      setExchangeSyncCache(
+        writeExchangeSyncCacheEntry(
+          uid,
+          buildCachedExchangeSyncEntry({
+            keyId,
+            label: cleanLabel,
+            testnet: params.testnet,
+            sync: data.sync,
+          })
+        )
+      );
+
+      return { key: record, sync: data.sync };
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const updateExchangeKey = useCallback(
+    async (
+      existingKey: ExchangeKeyRecord,
+      params: {
+        label: string;
+        apiKey: string;
+        apiSecret: string;
+        passphrase?: string;
+        permissions: ExchangeKeyPermissions;
+        testnet: boolean;
+      }
+    ): Promise<{ key: ExchangeKeyRecord; sync: ExchangeSyncResult }> => {
+      if (!firebaseUser) {
+        throw new Error('Авторизуйтесь для редактирования API-ключа.');
+      }
+      const uid = firebaseUser.uid;
+      const cleanLabel = params.label.trim().slice(0, 64);
+      if (cleanLabel.length < 2) {
+        throw new Error('Укажите название подключения (минимум 2 символа).');
+      }
+
+      const res = await authFetch('/api/exchanges/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: existingKey.exchange,
+          label: cleanLabel,
+          apiKey: params.apiKey,
+          apiSecret: params.apiSecret,
+          passphrase: params.passphrase || '',
+          permissions: params.permissions,
+          testnet: params.testnet,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        apiKeyPreview?: string;
+        encryptedApiKey?: string;
+        encryptedApiSecret?: string;
+        encryptedPassphrase?: string;
+        sync?: ExchangeSyncResult;
+      };
+      if (!res.ok || !data.encryptedApiKey || !data.encryptedApiSecret || !data.apiKeyPreview || !data.sync) {
+        throw new Error(data.error || 'Не удалось проверить обновлённый API-ключ на бирже.');
+      }
+
+      const updatedRecord: ExchangeKeyRecord = {
+        ...existingKey,
+        label: cleanLabel,
+        apiKeyPreview: data.apiKeyPreview.slice(0, 24),
+        encryptedApiKey: data.encryptedApiKey,
+        encryptedApiSecret: data.encryptedApiSecret,
+        encryptedPassphrase: data.encryptedPassphrase || '',
+        permissions: params.permissions,
+        testnet: params.testnet,
+        enabled: true,
+        lastSyncedAt: data.sync.syncedAt.slice(0, 64),
+        lastBalanceUsdt: Math.max(0, Math.min(1_000_000_000, Number(data.sync.totalBalanceUsdt) || 0)),
+        lastSyncError: '',
+      };
+
+      const path = `users/${uid}/exchangeKeys/${existingKey.id}`;
+      try {
+        await updateDoc(doc(db, 'users', uid, 'exchangeKeys', existingKey.id), {
+          label: updatedRecord.label,
+          apiKeyPreview: updatedRecord.apiKeyPreview,
+          encryptedApiKey: updatedRecord.encryptedApiKey,
+          encryptedApiSecret: updatedRecord.encryptedApiSecret,
+          encryptedPassphrase: updatedRecord.encryptedPassphrase,
+          permissions: updatedRecord.permissions,
+          testnet: updatedRecord.testnet,
+          enabled: true,
+          lastSyncedAt: updatedRecord.lastSyncedAt,
+          lastBalanceUsdt: updatedRecord.lastBalanceUsdt,
+          lastSyncError: '',
+          updatedAt: serverTimestamp(),
+        });
+        await writeAuditLog(
+          uid,
+          'EXCHANGE_UPDATED',
+          `Обновлён API-ключ ${existingKey.exchange.toUpperCase()} (${cleanLabel}, ${params.permissions === 'trade' ? 'торговля' : 'чтение'}).`,
+          'SUCCESS'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, path);
+      }
+
+      setExchangeSyncCache(
+        writeExchangeSyncCacheEntry(
+          uid,
+          buildCachedExchangeSyncEntry({
+            keyId: existingKey.id,
+            label: cleanLabel,
+            testnet: params.testnet,
+            sync: data.sync,
+          })
+        )
+      );
+
+      return { key: updatedRecord, sync: data.sync };
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const syncExchangeKey = useCallback(
+    async (
+      keyRecord: ExchangeKeyRecord,
+      options?: { silent?: boolean; background?: boolean }
+    ): Promise<ExchangeSyncResult> => {
+      if (!firebaseUser) {
+        throw new Error('Авторизуйтесь для синхронизации биржи.');
+      }
+      const uid = firebaseUser.uid;
+      const path = `users/${uid}/exchangeKeys/${keyRecord.id}`;
+      const isBackground = Boolean(options?.background);
+      const isSilent = Boolean(options?.silent);
+
+      if (isBackground) {
+        setBackgroundSyncingKeyIds((prev) =>
+          prev.includes(keyRecord.id) ? prev : [...prev, keyRecord.id]
+        );
+      }
+
+      try {
+        const res = await authFetch('/api/exchanges/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            exchange: keyRecord.exchange,
+            encryptedApiKey: keyRecord.encryptedApiKey,
+            encryptedApiSecret: keyRecord.encryptedApiSecret,
+            encryptedPassphrase: keyRecord.encryptedPassphrase,
+            testnet: keyRecord.testnet,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          sync?: ExchangeSyncResult;
+        };
+
+        if (!res.ok || !data.sync) {
+          const errMsg = (data.error || 'Ошибка синхронизации с биржей.').slice(0, 240);
+          if (!isSilent || (res.status >= 400 && res.status < 500)) {
+            try {
+              await updateDoc(doc(db, 'users', uid, 'exchangeKeys', keyRecord.id), {
+                lastSyncError: errMsg,
+                updatedAt: serverTimestamp(),
+              });
+            } catch (err) {
+              if (!isSilent) {
+                handleFirestoreError(err, OperationType.UPDATE, path);
+              }
+            }
+          }
+          throw new Error(errMsg);
+        }
+
+        // Обновляем локальный кэш сразу после ответа биржи
+        setExchangeSyncCache(
+          writeExchangeSyncCacheEntry(
+            uid,
+            buildCachedExchangeSyncEntry({
+              keyId: keyRecord.id,
+              label: keyRecord.label,
+              testnet: keyRecord.testnet,
+              sync: data.sync,
+            })
+          )
+        );
+
+        try {
+          await updateDoc(doc(db, 'users', uid, 'exchangeKeys', keyRecord.id), {
+            lastSyncedAt: data.sync.syncedAt.slice(0, 64),
+            lastBalanceUsdt: Math.max(0, Math.min(1_000_000_000, Number(data.sync.totalBalanceUsdt) || 0)),
+            lastSyncError: '',
+            updatedAt: serverTimestamp(),
+          });
+          if (!isSilent) {
+            await writeAuditLog(
+              uid,
+              'EXCHANGE_SYNCED',
+              `Синхронизирован баланс ${keyRecord.exchange.toUpperCase()} (${keyRecord.label}): $${data.sync.totalBalanceUsdt.toFixed(2)}.`,
+              'SUCCESS'
+            );
+          }
+        } catch (err) {
+          if (!isSilent) {
+            handleFirestoreError(err, OperationType.UPDATE, path);
+          }
+        }
+
+        return data.sync;
+      } finally {
+        if (isBackground) {
+          setBackgroundSyncingKeyIds((prev) => prev.filter((id) => id !== keyRecord.id));
+        }
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const toggleExchangeKey = useCallback(
+    async (keyId: string, nextEnabled: boolean) => {
+      if (!firebaseUser) return;
+      const uid = firebaseUser.uid;
+      const path = `users/${uid}/exchangeKeys/${keyId}`;
+      try {
+        await updateDoc(doc(db, 'users', uid, 'exchangeKeys', keyId), {
+          enabled: nextEnabled,
+          updatedAt: serverTimestamp(),
+        });
+        await writeAuditLog(
+          uid,
+          nextEnabled ? 'EXCHANGE_RESUMED' : 'EXCHANGE_PAUSED',
+          nextEnabled ? `Интеграция биржи ${keyId} включена.` : `Интеграция биржи ${keyId} поставлена на паузу.`,
+          'SUCCESS'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, path);
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const deleteExchangeKey = useCallback(
+    async (keyId: string) => {
+      if (!firebaseUser) return;
+      const uid = firebaseUser.uid;
+      const path = `users/${uid}/exchangeKeys/${keyId}`;
+      try {
+        await deleteDoc(doc(db, 'users', uid, 'exchangeKeys', keyId));
+        setExchangeSyncCache(removeExchangeSyncCacheEntry(uid, keyId));
+        await writeAuditLog(uid, 'EXCHANGE_DISCONNECTED', `Удалён API-ключ биржи ${keyId}.`, 'WARNING');
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, path);
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const placeExchangeOrder = useCallback(
+    async (
+      keyRecord: ExchangeKeyRecord,
+      orderParams: {
+        symbol: string;
+        marketType: MarketType;
+        side: 'BUY' | 'SELL';
+        orderType: 'MARKET' | 'LIMIT';
+        quantity: number;
+        limitPrice?: number;
+        stopLoss?: number;
+        takeProfit?: number;
+      }
+    ): Promise<ExchangeOrderResult> => {
+      if (!firebaseUser) {
+        throw new Error('Авторизуйтесь для исполнения ордеров на бирже.');
+      }
+      const uid = firebaseUser.uid;
+      const res = await authFetch('/api/exchanges/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          exchange: keyRecord.exchange,
+          permissions: keyRecord.permissions,
+          encryptedApiKey: keyRecord.encryptedApiKey,
+          encryptedApiSecret: keyRecord.encryptedApiSecret,
+          encryptedPassphrase: keyRecord.encryptedPassphrase,
+          testnet: keyRecord.testnet,
+          ...orderParams,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        order?: ExchangeOrderResult;
+      };
+      if (!res.ok || !data.order) {
+        await writeAuditLog(
+          uid,
+          'EXCHANGE_ORDER_FAILED',
+          `Отклонён ордер ${orderParams.side} ${orderParams.symbol} на ${keyRecord.exchange.toUpperCase()}: ${data.error || 'ошибка'}.`,
+          'BLOCKED'
+        );
+        throw new Error(data.error || 'Не удалось исполнить ордер на бирже.');
+      }
+
+      await writeAuditLog(
+        uid,
+        'EXCHANGE_ORDER_SUBMITTED',
+        `Исполнен ${orderParams.orderType} ордер ${orderParams.side} ${orderParams.quantity} ${orderParams.symbol} на ${keyRecord.exchange.toUpperCase()} (#${data.order.orderId}).`,
+        'SUCCESS'
+      );
+      return data.order;
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const upsertPortfolioTarget = useCallback(
+    async (params: {
+      portfolioId: string;
+      portfolioLabel: string;
+      targetBalanceUsdt: number;
+      baselineBalanceUsdt: number;
+      targetPnlPct: number;
+    }) => {
+      if (!firebaseUser) {
+        throw new Error('Войдите в аккаунт, чтобы синхронизировать цель доходности.');
+      }
+      const uid = firebaseUser.uid;
+      const targetId = sanitizeId(params.portfolioId || 'manual') || 'manual';
+      const cleanLabel = params.portfolioLabel.trim().slice(0, 80) || 'Портфель';
+      const targetBalanceUsdt = Math.max(0.01, Math.min(1_000_000_000, Number(params.targetBalanceUsdt)));
+      const baselineBalanceUsdt = Math.max(0, Math.min(1_000_000_000, Number(params.baselineBalanceUsdt) || 0));
+      const targetPnlPct = Math.max(-99, Math.min(10000, Number(params.targetPnlPct) || 0));
+
+      const docRef = doc(db, 'users', uid, 'portfolioTargets', targetId);
+      const path = `users/${uid}/portfolioTargets/${targetId}`;
+      try {
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          await updateDoc(docRef, {
+            portfolioLabel: cleanLabel,
+            targetBalanceUsdt,
+            baselineBalanceUsdt,
+            targetPnlPct,
+            active: true,
+            triggeredAt: '',
+            triggeredBalanceUsdt: 0,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          await setDoc(docRef, {
+            id: targetId,
+            userId: uid,
+            portfolioId: targetId,
+            portfolioLabel: cleanLabel,
+            targetBalanceUsdt,
+            baselineBalanceUsdt,
+            targetPnlPct,
+            active: true,
+            triggeredAt: '',
+            triggeredBalanceUsdt: 0,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        await writeAuditLog(
+          uid,
+          'PORTFOLIO_TARGET_SET',
+          `Установлена цель доходности для «${cleanLabel}»: $${targetBalanceUsdt.toFixed(2)} (${targetPnlPct >= 0 ? '+' : ''}${targetPnlPct.toFixed(1)}%).`,
+          'SUCCESS'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, path);
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const markPortfolioTargetTriggered = useCallback(
+    async (targetId: string, portfolioLabel: string, triggeredBalanceUsdt: number) => {
+      if (!firebaseUser || !targetId) return;
+      const uid = firebaseUser.uid;
+      const cleanId = sanitizeId(targetId);
+      const path = `users/${uid}/portfolioTargets/${cleanId}`;
+      try {
+        await updateDoc(doc(db, 'users', uid, 'portfolioTargets', cleanId), {
+          active: false,
+          triggeredAt: new Date().toISOString().slice(0, 64),
+          triggeredBalanceUsdt: Math.max(0, Math.min(1_000_000_000, Number(triggeredBalanceUsdt) || 0)),
+          updatedAt: serverTimestamp(),
+        });
+        await writeAuditLog(
+          uid,
+          'PORTFOLIO_TARGET_REACHED',
+          `Портфель «${portfolioLabel}» достиг целевого баланса $${triggeredBalanceUsdt.toFixed(2)}.`,
+          'SUCCESS'
+        );
+      } catch {
+        // Ignore if concurrently deleted
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
+  const deletePortfolioTarget = useCallback(
+    async (targetId: string) => {
+      if (!firebaseUser || !targetId) return;
+      const uid = firebaseUser.uid;
+      const cleanId = sanitizeId(targetId);
+      const path = `users/${uid}/portfolioTargets/${cleanId}`;
+      try {
+        await deleteDoc(doc(db, 'users', uid, 'portfolioTargets', cleanId));
+        await writeAuditLog(
+          uid,
+          'PORTFOLIO_TARGET_DELETED',
+          `Удалена цель доходности для портфеля ${cleanId}.`,
+          'WARNING'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, path);
+      }
+    },
+    [firebaseUser, writeAuditLog]
+  );
+
   return {
     firebaseUser,
     authReady,
     authError,
+    clearAuthError,
     profile,
     privateSecurity,
     strategies,
@@ -1434,6 +2059,10 @@ export function useAuthAndVault() {
     sessions,
     priceAlerts,
     supportTickets,
+    exchangeKeys,
+    exchangeSyncCache,
+    backgroundSyncingKeyIds,
+    portfolioTargets,
     currentSessionId,
     isLocked,
     setIsLocked,
@@ -1457,6 +2086,15 @@ export function useAuthAndVault() {
     deletePriceAlert,
     checkPriceAlertsNow,
     createSupportTicket,
+    connectExchangeKey,
+    updateExchangeKey,
+    syncExchangeKey,
+    toggleExchangeKey,
+    deleteExchangeKey,
+    placeExchangeOrder,
+    upsertPortfolioTarget,
+    markPortfolioTargetTriggered,
+    deletePortfolioTarget,
     writeAuditLog,
   };
 }

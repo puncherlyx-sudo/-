@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { ExternalLink, Maximize2, X } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ExternalLink, Maximize2, RefreshCw, X } from 'lucide-react';
 import type { MarketType, Timeframe } from '../types/domain';
 
 export type ChartEngine = 'native' | 'tradingview';
@@ -67,21 +67,53 @@ interface TradingViewChartProps {
 
 /**
  * Официальный виджет TradingView Advanced Real-Time Chart.
- * Загружается в изолированном iframe (sandbox без allow-same-origin): скрипт TradingView
- * не видит ни аккаунт, ни данные приложения.
+ * Загружается напрямую в изолированном кросс-доменном iframe (tradingview-widget.com):
+ * allow-same-origin даёт виджету доступ только к его собственному origin/localStorage,
+ * сохраняя полную изоляцию от аккаунта и данных приложения по Same-Origin Policy.
  */
 export const TradingViewChart: React.FC<TradingViewChartProps> = ({ symbol, marketType, timeframe }) => {
   const [fullscreen, setFullscreen] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [loadTimedOut, setLoadTimedOut] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
-  const src = `/embed/tradingview?symbol=${encodeURIComponent(symbol)}&marketType=${marketType}&interval=${INTERVAL_MAP[timeframe]}`;
-  const externalUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(
-    `BINANCE:${symbol}${marketType === 'futures' ? '.P' : ''}`
-  )}`;
+  const tvSymbol = `BINANCE:${symbol}${marketType === 'futures' ? '.P' : ''}`;
+
+  const src = useMemo(() => {
+    const config = {
+      autosize: true,
+      symbol: tvSymbol,
+      interval: INTERVAL_MAP[timeframe],
+      timezone: 'Etc/UTC',
+      theme: 'dark',
+      style: '1',
+      backgroundColor: 'rgba(11, 15, 23, 1)',
+      gridColor: 'rgba(255, 255, 255, 0.05)',
+      withdateranges: true,
+      hide_side_toolbar: false,
+      allow_symbol_change: true,
+      save_image: false,
+      calendar: false,
+      support_host: 'https://www.tradingview.com',
+      utm_source: typeof window !== 'undefined' ? window.location.hostname : 'aegisquant.app',
+      utm_medium: 'widget',
+      utm_campaign: 'chart',
+    };
+    return `https://www.tradingview-widget.com/embed-widget/advanced-chart/?locale=ru#${encodeURIComponent(
+      JSON.stringify(config)
+    )}`;
+  }, [tvSymbol, timeframe]);
+
+  const externalUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSymbol)}`;
 
   useEffect(() => {
     setLoaded(false);
-  }, [src]);
+    setLoadTimedOut(false);
+    const timer = window.setTimeout(() => {
+      setLoadTimedOut(true);
+    }, 9000);
+    return () => window.clearTimeout(timer);
+  }, [src, reloadNonce]);
 
   useEffect(() => {
     if (!fullscreen) return;
@@ -99,14 +131,20 @@ export const TradingViewChart: React.FC<TradingViewChartProps> = ({ symbol, mark
 
   const frame = (
     <iframe
-      key={src}
+      key={`${src}-${reloadNonce}`}
       title={`График TradingView ${symbol}`}
       src={src}
-      sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+      sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-forms"
       allow="fullscreen"
-      referrerPolicy="no-referrer"
-      loading="lazy"
-      onLoad={() => setLoaded(true)}
+      referrerPolicy="strict-origin-when-cross-origin"
+      onLoad={() => {
+        setLoaded(true);
+        setLoadTimedOut(false);
+      }}
+      onError={() => {
+        setLoaded(false);
+        setLoadTimedOut(true);
+      }}
       className="w-full h-full border-0 bg-[#0B0F17]"
     />
   );
@@ -117,7 +155,7 @@ export const TradingViewChart: React.FC<TradingViewChartProps> = ({ symbol, mark
         className={
           fullscreen
             ? 'fixed inset-0 z-[90] bg-[#0B0F17] flex flex-col pt-[env(safe-area-inset-top)]'
-            : 'relative h-[460px] sm:h-[560px] rounded-xl overflow-hidden border border-white/8'
+            : 'relative h-[460px] sm:h-[560px] rounded-xl overflow-hidden border border-white/8 bg-[#0B0F17]'
         }
       >
         {fullscreen && (
@@ -135,10 +173,37 @@ export const TradingViewChart: React.FC<TradingViewChartProps> = ({ symbol, mark
             </button>
           </div>
         )}
-        <div className={fullscreen ? 'flex-1 min-h-0' : 'absolute inset-0'}>{frame}</div>
+        <div className={fullscreen ? 'flex-1 min-h-0 bg-[#0B0F17]' : 'absolute inset-0 bg-[#0B0F17]'}>{frame}</div>
         {!loaded && (
-          <div className="absolute inset-0 flex items-center justify-center text-xs text-slate-400 bg-[#0B0F17] pointer-events-none">
-            Загрузка графика TradingView…
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-4 text-center text-xs text-slate-400 bg-[#0B0F17]">
+            {!loadTimedOut ? (
+              <span>Загрузка графика TradingView…</span>
+            ) : (
+              <>
+                <span className="text-slate-300 max-w-sm leading-relaxed">
+                  Не удалось загрузить встроенный виджет TradingView. Возможно, внешний домен заблокирован сетью или блокировщиком рекламы.
+                </span>
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setReloadNonce((n) => n + 1)}
+                    className="min-h-[38px] px-3.5 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 inline-flex items-center gap-1.5"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Повторить</span>
+                  </button>
+                  <a
+                    href={externalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="min-h-[38px] px-3.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold inline-flex items-center gap-1.5"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Открыть в TradingView</span>
+                  </a>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

@@ -50,7 +50,7 @@ interface PushPayload {
 
 self.addEventListener('push', (event: PushEvent) => {
   let payload: PushPayload = {
-    title: 'AegisQuant · Рыночный сигнал',
+    title: 'Vernier · Рыночный сигнал',
     body: 'Зафиксировано важное движение рынка или новый торговый сигнал.',
     tag: 'aegisquant-alert',
     url: '/?tab=market',
@@ -81,7 +81,7 @@ self.addEventListener('push', (event: PushEvent) => {
   };
 
   event.waitUntil(
-    self.registration.showNotification(payload.title || 'AegisQuant', options)
+    self.registration.showNotification(payload.title || 'Vernier', options)
   );
 });
 

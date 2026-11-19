@@ -8,12 +8,47 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { EconomicCalendarEvent } from '../types/domain';
+import { decodeHtmlEntities, formatEventTimeToLocal } from '../utils/htmlEntities';
 import { safeFetchJson } from '../utils/safeFetchJson';
 
 type CategoryFilter = 'all' | 'macro' | 'crypto' | 'derivatives';
 
-export const EconomicCalendarWidget: React.FC = () => {
+interface EconomicCalendarWidgetProps {
+  lang?: 'ru' | 'en';
+}
+
+const CAL_RU_CACHE_KEY = 'vernier_calendar_ru_cache_v1';
+
+function readCalRuCache(): Record<string, { title: string; summary: string }> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(CAL_RU_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, { title: string; summary: string }>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCalRuCache(cache: Record<string, { title: string; summary: string }>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const entries = Object.entries(cache).slice(-80);
+    window.localStorage.setItem(CAL_RU_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // ignore storage limits
+  }
+}
+
+function hasCyrillic(str: string): boolean {
+  return /[А-Яа-яЁё]/.test(str);
+}
+
+export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ lang = 'ru' }) => {
+  const isEn = lang === 'en';
   const [events, setEvents] = useState<EconomicCalendarEvent[]>([]);
+  const [ruMap, setRuMap] = useState<Record<string, { title: string; summary: string }>>(() => readCalRuCache());
   const [grounded, setGrounded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -68,13 +103,60 @@ export const EconomicCalendarWidget: React.FC = () => {
     };
   }, [loadCalendar]);
 
+  useEffect(() => {
+    if (isEn || events.length === 0) return;
+    const untranslated = events
+      .filter((ev) => {
+        const cached = ruMap[ev.id];
+        if (cached && hasCyrillic(cached.title)) return false;
+        const cleanTitle = decodeHtmlEntities(ev.title);
+        const cleanDesc = decodeHtmlEntities(ev.description || '');
+        return !hasCyrillic(cleanTitle) || (Boolean(cleanDesc) && !hasCyrillic(cleanDesc));
+      })
+      .slice(0, 20);
+    if (untranslated.length === 0) return;
+    let cancelled = false;
+    fetch('/api/news/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        items: untranslated.map((ev) => ({
+          id: ev.id,
+          title: decodeHtmlEntities(ev.title),
+          summary: decodeHtmlEntities(ev.description || ''),
+        })),
+      }),
+    })
+      .then((res) => (res.ok ? (res.json() as Promise<{ translations?: Record<string, { title: string; summary: string }> }>) : null))
+      .then((data) => {
+        if (cancelled || !data?.translations || Object.keys(data.translations).length === 0) return;
+        setRuMap((prev) => {
+          const next = { ...prev, ...data.translations };
+          writeCalRuCache(next);
+          return next;
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [events, isEn, ruMap]);
+
   const filteredEvents = useMemo(() => {
-    return events.filter((ev) => {
-      if (categoryFilter !== 'all' && ev.category !== categoryFilter) return false;
-      if (highImpactOnly && ev.impact !== 'HIGH') return false;
-      return true;
-    });
-  }, [events, categoryFilter, highImpactOnly]);
+    return events
+      .filter((ev) => {
+        if (categoryFilter !== 'all' && ev.category !== categoryFilter) return false;
+        if (highImpactOnly && ev.impact !== 'HIGH') return false;
+        return true;
+      })
+      .map((ev) => {
+        const cached = !isEn ? ruMap[ev.id] : undefined;
+        const title = decodeHtmlEntities(cached?.title || ev.title);
+        const description = decodeHtmlEntities(cached?.summary || ev.description || '');
+        const { localTimeLabel } = formatEventTimeToLocal(ev.dateLabel, ev.timeUtcLabel, lang);
+        return { ...ev, title, description, localTimeLabel };
+      });
+  }, [events, categoryFilter, highImpactOnly, isEn, ruMap, lang]);
 
   const highCount = useMemo(
     () => events.filter((e) => e.impact === 'HIGH').length,
@@ -86,7 +168,7 @@ export const EconomicCalendarWidget: React.FC = () => {
       return (
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-300 whitespace-nowrap">
           <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-          <span>Высокая</span>
+          <span>{isEn ? 'High' : 'Высокая'}</span>
         </span>
       );
     }
@@ -94,14 +176,14 @@ export const EconomicCalendarWidget: React.FC = () => {
       return (
         <span className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-300 whitespace-nowrap">
           <AlertTriangle className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-          <span>Средняя</span>
+          <span>{isEn ? 'Medium' : 'Средняя'}</span>
         </span>
       );
     }
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 whitespace-nowrap">
         <Info className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-        <span>Умеренная</span>
+        <span>{isEn ? 'Low' : 'Умеренная'}</span>
       </span>
     );
   };
@@ -109,13 +191,13 @@ export const EconomicCalendarWidget: React.FC = () => {
   const renderBiasText = (bias: EconomicCalendarEvent['marketBias']) => {
     switch (bias) {
       case 'BULLISH':
-        return <span className="text-emerald-400">Бычий драйвер</span>;
+        return <span className="text-emerald-400">{isEn ? 'Bullish catalyst' : 'Бычий драйвер'}</span>;
       case 'BEARISH':
-        return <span className="text-rose-400">Риск давления</span>;
+        return <span className="text-rose-400">{isEn ? 'Downside risk' : 'Риск давления'}</span>;
       case 'VOLATILITY':
-        return <span className="text-amber-300">Всплеск волатильности</span>;
+        return <span className="text-amber-300">{isEn ? 'Volatility spike' : 'Всплеск волатильности'}</span>;
       default:
-        return <span className="text-slate-400">Нейтрально</span>;
+        return <span className="text-slate-400">{isEn ? 'Neutral' : 'Нейтрально'}</span>;
     }
   };
 
@@ -144,19 +226,19 @@ export const EconomicCalendarWidget: React.FC = () => {
           </div>
           <h2 className="mt-1 text-lg sm:text-xl font-bold text-white flex items-center gap-2">
             <CalendarClock className="w-5 h-5 text-amber-400 shrink-0" />
-            <span>Экономический календарь крипто-рынка</span>
+            <span>{isEn ? 'Crypto Economic Calendar' : 'Экономический календарь крипто-рынка'}</span>
           </h2>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           {/* Category Segmented Filter */}
-          <div className="inline-flex flex-wrap items-center p-1 rounded-xl bg-[#0B0F17] border border-white/8">
+          <div className="grid grid-cols-2 sm:inline-flex items-center p-1 rounded-xl bg-[#0B0F17] border border-white/8 w-full sm:w-auto gap-1 sm:gap-0">
             {(
               [
-                { id: 'all', label: 'Все' },
-                { id: 'macro', label: 'Макро' },
-                { id: 'crypto', label: 'Крипто' },
-                { id: 'derivatives', label: 'Деривативы' },
+                { id: 'all', label: isEn ? 'All' : 'Все' },
+                { id: 'macro', label: isEn ? 'Macro' : 'Макро' },
+                { id: 'crypto', label: isEn ? 'Crypto' : 'Крипто' },
+                { id: 'derivatives', label: isEn ? 'Derivatives' : 'Деривативы' },
               ] as const
             ).map((tab) => (
               <button
@@ -186,7 +268,7 @@ export const EconomicCalendarWidget: React.FC = () => {
             }`}
           >
             <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-            <span>Только High ({highCount})</span>
+            <span>{isEn ? `High only (${highCount})` : `Только High (${highCount})`}</span>
           </button>
 
           <button
@@ -248,7 +330,9 @@ export const EconomicCalendarWidget: React.FC = () => {
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-white/8 text-slate-400">
-                  <th className="py-3 pr-4 font-medium whitespace-nowrap">Дата · UTC</th>
+                  <th className="py-3 pr-4 font-medium whitespace-nowrap">
+                    {isEn ? 'Date · Local time' : 'Дата · Лок. время'}
+                  </th>
                   <th className="py-3 px-3 font-medium whitespace-nowrap">Актив / Сектор</th>
                   <th className="py-3 px-3 font-medium">Ключевое событие и влияние</th>
                   <th className="py-3 px-3 font-medium whitespace-nowrap">Важность</th>
@@ -262,7 +346,9 @@ export const EconomicCalendarWidget: React.FC = () => {
                   <tr key={ev.id} className="hover:bg-white/[0.02] transition-colors align-top">
                     <td className="py-3.5 pr-4 font-mono tabular-nums whitespace-nowrap">
                       <div className="text-white font-semibold">{ev.dateLabel}</div>
-                      <div className="mt-0.5 text-[11px] text-slate-400">{ev.timeUtcLabel}</div>
+                      <div className="mt-0.5 text-[11px] text-cyan-300/90" title={ev.timeUtcLabel}>
+                        {ev.localTimeLabel}
+                      </div>
                     </td>
                     <td className="py-3.5 px-3 font-mono whitespace-nowrap">
                       <div className="text-slate-200 font-semibold">{ev.regionOrAsset}</div>
@@ -319,7 +405,7 @@ export const EconomicCalendarWidget: React.FC = () => {
                   <div className="font-mono tabular-nums text-slate-300">
                     <span className="text-white font-semibold">{ev.dateLabel}</span>
                     <span aria-hidden="true"> · </span>
-                    <span>{ev.timeUtcLabel}</span>
+                    <span className="text-cyan-300">{ev.localTimeLabel}</span>
                     <span aria-hidden="true"> · </span>
                     <span className="text-slate-400">{ev.regionOrAsset}</span>
                   </div>

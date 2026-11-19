@@ -92,7 +92,7 @@ export const SplashIntro: React.FC<{ imageSrc: string }> = ({ imageSrc }) => {
             transition={{ delay: 0.25, duration: 0.5, ease: TERMINAL_EASE }}
             className="mt-5 font-display text-2xl font-bold text-white tracking-tight"
           >
-            AegisQuant
+            Vernier
           </motion.div>
           <motion.div
             initial={{ scaleX: 0 }}

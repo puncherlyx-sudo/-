@@ -15,6 +15,8 @@ import { FieldValue, getFirestore, type Firestore } from 'firebase-admin/firesto
  */
 
 export type BillingPeriod = 'month' | 'year';
+export type SubscriptionTier = 'pro' | 'max';
+export type MaxMultiplier = 10 | 20;
 
 const PERIOD_DAYS: Record<BillingPeriod, number> = { month: 30, year: 365 };
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -30,6 +32,36 @@ export function getPlanPrices(): Record<BillingPeriod, { priceUsd: number; days:
   return {
     month: { priceUsd: readPrice('PRO_PRICE_MONTH_USD', 29), days: PERIOD_DAYS.month },
     year: { priceUsd: readPrice('PRO_PRICE_YEAR_USD', 264), days: PERIOD_DAYS.year },
+  };
+}
+
+export function getMaxMultiplierPlans(): Record<
+  MaxMultiplier,
+  Record<BillingPeriod, { priceUsd: number; days: number; credits: number }>
+> {
+  return {
+    10: {
+      month: { priceUsd: readPrice('MAX_X10_PRICE_MONTH_USD', readPrice('MAX_PRICE_MONTH_USD', 79)), days: PERIOD_DAYS.month, credits: 1000 },
+      year: { priceUsd: readPrice('MAX_X10_PRICE_YEAR_USD', readPrice('MAX_PRICE_YEAR_USD', 744)), days: PERIOD_DAYS.year, credits: 1000 },
+    },
+    20: {
+      month: { priceUsd: readPrice('MAX_X20_PRICE_MONTH_USD', 129), days: PERIOD_DAYS.month, credits: 2000 },
+      year: { priceUsd: readPrice('MAX_X20_PRICE_YEAR_USD', 1188), days: PERIOD_DAYS.year, credits: 2000 },
+    },
+  };
+}
+
+export function getTieredPlanPrices(): Record<
+  SubscriptionTier,
+  Record<BillingPeriod, { priceUsd: number; days: number; credits: number }>
+> {
+  const maxPlans = getMaxMultiplierPlans();
+  return {
+    pro: {
+      month: { priceUsd: readPrice('PRO_PRICE_MONTH_USD', 29), days: PERIOD_DAYS.month, credits: 100 },
+      year: { priceUsd: readPrice('PRO_PRICE_YEAR_USD', 264), days: PERIOD_DAYS.year, credits: 100 },
+    },
+    max: maxPlans[10],
   };
 }
 
@@ -87,22 +119,37 @@ function getDb(): Firestore | null {
 export async function createCheckout(
   uid: string,
   period: BillingPeriod,
+  tier: SubscriptionTier = 'pro',
+  maxMultiplier: MaxMultiplier = 10,
 ): Promise<{ invoiceUrl: string; orderId: string }> {
   const db = getDb();
   if (!isBillingConfigured() || !db) {
     throw new Error('Оплата ещё не настроена владельцем приложения.');
   }
-  const plan = getPlanPrices()[period];
+  const safeTier: SubscriptionTier = tier === 'max' ? 'max' : 'pro';
+  const safeMultiplier: MaxMultiplier = maxMultiplier === 20 ? 20 : 10;
+  const plan =
+    safeTier === 'max'
+      ? getMaxMultiplierPlans()[safeMultiplier][period]
+      : getTieredPlanPrices().pro[period];
   const orderId = `aq-${crypto.randomUUID()}`;
   const appUrl = getAppUrl();
 
   await db.collection('payments').doc(orderId).set({
     uid,
+    tier: safeTier,
+    ...(safeTier === 'max' ? { maxMultiplier: safeMultiplier } : {}),
     period,
     priceUsd: plan.priceUsd,
+    credits: plan.credits,
     status: 'pending',
     createdAt: FieldValue.serverTimestamp(),
   });
+
+  const orderLabel =
+    safeTier === 'max'
+      ? `Vernier MAX ×${safeMultiplier} (${plan.credits} кр.)`
+      : 'Vernier PRO (100 кр.)';
 
   const res = await fetch(NOWPAYMENTS_INVOICE_URL, {
     method: 'POST',
@@ -114,7 +161,7 @@ export async function createCheckout(
       price_amount: plan.priceUsd,
       price_currency: 'usd',
       order_id: orderId,
-      order_description: `AegisQuant PRO (${period === 'year' ? '1 год' : '1 месяц'})`,
+      order_description: `${orderLabel} — ${period === 'year' ? '1 год' : '1 месяц'}`,
       ipn_callback_url: `${appUrl}/api/billing/ipn`,
       success_url: `${appUrl}/?payment=success`,
       cancel_url: `${appUrl}/?payment=cancel`,
@@ -171,7 +218,14 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
   await db.runTransaction(async (tx) => {
     const orderSnap = await tx.get(orderRef);
     if (!orderSnap.exists) return;
-    const order = orderSnap.data() as { uid: string; period: BillingPeriod; priceUsd: number; status: string };
+    const order = orderSnap.data() as {
+      uid: string;
+      tier?: SubscriptionTier;
+      maxMultiplier?: MaxMultiplier;
+      period: BillingPeriod;
+      priceUsd: number;
+      status: string;
+    };
     if (order.status === 'paid') return; // идемпотентность
 
     if (status !== 'finished') {
@@ -196,14 +250,18 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
       tx.update(orderRef, { status: 'user_missing', updatedAt: FieldValue.serverTimestamp() });
       return;
     }
+    const targetTier: SubscriptionTier = order.tier === 'max' ? 'max' : 'pro';
+    const multiplier: MaxMultiplier = order.maxMultiplier === 20 ? 20 : 10;
+    const creditsGrant = targetTier === 'max' ? (multiplier === 20 ? 2000 : 1000) : 100;
     const currentUntil = Number((userSnap.data() as { proUntil?: unknown }).proUntil) || 0;
     const base = Math.max(Date.now(), currentUntil);
     const proUntil = base + PERIOD_DAYS[order.period] * DAY_MS;
 
     tx.update(userRef, {
-      plan: 'pro',
+      plan: targetTier,
       proUntil,
-      creditsRemaining: 100,
+      creditsRemaining: creditsGrant,
+      ...(targetTier === 'max' ? { maxMultiplier: multiplier } : {}),
       updatedAt: FieldValue.serverTimestamp(),
     });
     tx.update(orderRef, { status: 'paid', paidAt: FieldValue.serverTimestamp() });
@@ -212,15 +270,15 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
 
 // ---------- Чтение тарифа пользователя ----------
 
-export async function getUserPlanTier(uid: string): Promise<'free' | 'pro' | null> {
+export async function getUserPlanTier(uid: string): Promise<'free' | 'pro' | 'max' | null> {
   const db = getDb();
   if (!db) return null;
   try {
     const snap = await db.collection('users').doc(uid).get();
     if (!snap.exists) return null;
     const data = snap.data() as { plan?: unknown; proUntil?: unknown };
-    if (data.plan === 'pro' && Number(data.proUntil || 0) > Date.now()) {
-      return 'pro';
+    if ((data.plan === 'pro' || data.plan === 'max') && Number(data.proUntil || 0) > Date.now()) {
+      return data.plan;
     }
     return 'free';
   } catch {
@@ -231,13 +289,13 @@ export async function getUserPlanTier(uid: string): Promise<'free' | 'pro' | nul
 // ---------- Истечение подписки ----------
 
 /**
- * Возвращает на бесплатный тариф всех, у кого PRO истёк или не подтверждён оплатой
- * (в том числе тех, кто включил PRO вручную до появления оплаты).
+ * Возвращает на бесплатный тариф всех, у кого PRO/MAX истёк или не подтверждён оплатой
+ * (в том числе тех, кто включил тариф вручную до появления оплаты).
  */
 export async function downgradeExpiredPro(): Promise<number> {
   const db = getDb();
   if (!db) return 0;
-  const snap = await db.collection('users').where('plan', '==', 'pro').get();
+  const snap = await db.collection('users').where('plan', 'in', ['pro', 'max']).get();
   const now = Date.now();
   const expired = snap.docs.filter((d) => (Number((d.data() as { proUntil?: unknown }).proUntil) || 0) <= now);
   // Firestore: не более 500 операций в одном пакете
@@ -247,7 +305,7 @@ export async function downgradeExpiredPro(): Promise<number> {
       const credits = Number((docSnap.data() as { creditsRemaining?: unknown }).creditsRemaining) || 0;
       batch.update(docSnap.ref, {
         plan: 'free',
-        creditsRemaining: Math.min(15, credits),
+        creditsRemaining: Math.min(25, credits),
         updatedAt: FieldValue.serverTimestamp(),
       });
     }

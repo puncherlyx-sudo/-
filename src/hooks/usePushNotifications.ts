@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PushSubscriptionRecord } from '../types/domain';
 import { authFetch } from '../lib/authFetch';
 
@@ -7,11 +7,51 @@ export interface PushPreferences {
   notifyMarketMoves: boolean;
   notifyVolatilitySpikes: boolean;
   volatilityThresholdPct: number;
+  notifyPortfolioPnl: boolean;
+  portfolioPnlThresholdPct: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
   notifySignalLimits: boolean;
 }
+
+export interface PortfolioPnlCheckInput {
+  dailyPnlPct: number;
+  dailyPnlUsdt: number;
+  totalValue: number;
+  hasLive24hData: boolean;
+  thresholdPct?: number;
+}
+
+export interface PortfolioPnlCheckResult {
+  triggered: boolean;
+  notified: boolean;
+  direction?: 'gain' | 'loss';
+  thresholdPct: number;
+  reason?: 'disabled' | 'no_live_data' | 'below_threshold' | 'not_subscribed' | 'cooldown' | 'sent' | 'error';
+}
+
+export interface PortfolioTargetCheckInput {
+  targetId: string;
+  portfolioId: string;
+  portfolioLabel: string;
+  targetBalanceUsdt: number;
+  baselineBalanceUsdt: number;
+  targetPnlPct: number;
+  currentBalanceUsdt: number;
+  hasLive24hData: boolean;
+}
+
+export interface PortfolioTargetCheckResult {
+  triggered: boolean;
+  notified: boolean;
+  reason?: 'no_live_data' | 'below_target' | 'disabled' | 'not_subscribed' | 'cooldown' | 'sent' | 'error';
+}
+
+const PORTFOLIO_PNL_COOLDOWN_MS = 60 * 60_000;
+const PORTFOLIO_PNL_COOLDOWN_KEY = 'aegisquant_portfolio_pnl_push_v1';
+const PORTFOLIO_TARGET_COOLDOWN_MS = 5 * 60_000;
+const PORTFOLIO_TARGET_COOLDOWN_KEY = 'aegisquant_portfolio_target_push_v1';
 
 interface UsePushNotificationsParams {
   uid: string | undefined;
@@ -25,6 +65,8 @@ interface UsePushNotificationsParams {
     notifyMarketMoves: boolean;
     notifyVolatilitySpikes: boolean;
     volatilityThresholdPct: number;
+    notifyPortfolioPnl: boolean;
+    portfolioPnlThresholdPct: number;
     notifyNews: boolean;
     notifyAuthLogins: boolean;
     notifyStrategyChanges: boolean;
@@ -76,11 +118,15 @@ export function usePushNotifications({
   const [loading, setLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const portfolioCooldownRef = useRef<Map<string, number>>(new Map());
+  const portfolioTargetCooldownRef = useRef<Map<string, number>>(new Map());
   const [preferences, setPreferences] = useState<PushPreferences>({
     notifySignals: true,
     notifyMarketMoves: true,
     notifyVolatilitySpikes: true,
     volatilityThresholdPct: 5,
+    notifyPortfolioPnl: true,
+    portfolioPnlThresholdPct: 5,
     notifyNews: true,
     notifyAuthLogins: true,
     notifyStrategyChanges: true,
@@ -99,6 +145,11 @@ export function usePushNotifications({
         volatilityThresholdPct:
           typeof matched.volatilityThresholdPct === 'number' && matched.volatilityThresholdPct >= 1
             ? matched.volatilityThresholdPct
+            : 5,
+        notifyPortfolioPnl: matched.notifyPortfolioPnl !== false,
+        portfolioPnlThresholdPct:
+          typeof matched.portfolioPnlThresholdPct === 'number' && matched.portfolioPnlThresholdPct >= 1
+            ? matched.portfolioPnlThresholdPct
             : 5,
         notifyNews: matched.notifyNews !== false,
         notifyAuthLogins: matched.notifyAuthLogins !== false,
@@ -142,6 +193,11 @@ export function usePushNotifications({
                 volatilityThresholdPct:
                   typeof saved.volatilityThresholdPct === 'number' && saved.volatilityThresholdPct >= 1
                     ? saved.volatilityThresholdPct
+                    : 5,
+                notifyPortfolioPnl: saved.notifyPortfolioPnl !== false,
+                portfolioPnlThresholdPct:
+                  typeof saved.portfolioPnlThresholdPct === 'number' && saved.portfolioPnlThresholdPct >= 1
+                    ? saved.portfolioPnlThresholdPct
                     : 5,
                 notifyNews: saved.notifyNews !== false,
                 notifyAuthLogins: saved.notifyAuthLogins !== false,
@@ -414,6 +470,183 @@ export function usePushNotifications({
     [uid, isSubscribed, preferences]
   );
 
+  const checkAndNotifyPortfolioPnl = useCallback(
+    async (params: PortfolioPnlCheckInput): Promise<PortfolioPnlCheckResult> => {
+      const rawThreshold =
+        typeof params.thresholdPct === 'number' && Number.isFinite(params.thresholdPct)
+          ? params.thresholdPct
+          : preferences.portfolioPnlThresholdPct;
+      const thresholdPct = Math.max(1, Math.min(50, Math.round(rawThreshold * 10) / 10));
+
+      if (!preferences.notifyPortfolioPnl) {
+        return { triggered: false, notified: false, thresholdPct, reason: 'disabled' };
+      }
+
+      if (
+        !params.hasLive24hData ||
+        !Number.isFinite(params.dailyPnlPct) ||
+        !Number.isFinite(params.dailyPnlUsdt) ||
+        !Number.isFinite(params.totalValue) ||
+        params.totalValue <= 0
+      ) {
+        return { triggered: false, notified: false, thresholdPct, reason: 'no_live_data' };
+      }
+
+      if (Math.abs(params.dailyPnlPct) < thresholdPct) {
+        return { triggered: false, notified: false, thresholdPct, reason: 'below_threshold' };
+      }
+
+      const direction: 'gain' | 'loss' = params.dailyPnlPct >= 0 ? 'gain' : 'loss';
+
+      if (!uid || !isSignedIn || !isSubscribed) {
+        return { triggered: true, notified: false, direction, thresholdPct, reason: 'not_subscribed' };
+      }
+
+      const cooldownKey = `${uid}:${direction}`;
+      const now = Date.now();
+      let lastSentAt = portfolioCooldownRef.current.get(cooldownKey) ?? 0;
+
+      if (typeof window !== 'undefined') {
+        try {
+          const rawStored = window.sessionStorage.getItem(`${PORTFOLIO_PNL_COOLDOWN_KEY}:${cooldownKey}`);
+          const parsedStored = rawStored ? Number(rawStored) : 0;
+          if (Number.isFinite(parsedStored) && parsedStored > lastSentAt) {
+            lastSentAt = parsedStored;
+          }
+        } catch {
+          // Ignore sessionStorage restrictions
+        }
+      }
+
+      if (now - lastSentAt < PORTFOLIO_PNL_COOLDOWN_MS) {
+        return { triggered: true, notified: false, direction, thresholdPct, reason: 'cooldown' };
+      }
+
+      // Mark optimistically to prevent duplicate dispatches across rapid/StrictMode effects
+      portfolioCooldownRef.current.set(cooldownKey, now);
+
+      try {
+        const res = await authFetch('/api/push/portfolio-pnl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dailyPnlPct: params.dailyPnlPct,
+            dailyPnlUsdt: params.dailyPnlUsdt,
+            totalValue: params.totalValue,
+            thresholdPct,
+          }),
+        });
+        if (!res.ok) {
+          portfolioCooldownRef.current.delete(cooldownKey);
+          return { triggered: true, notified: false, direction, thresholdPct, reason: 'error' };
+        }
+        const data = (await res.json()) as { sent?: number; skipped?: boolean };
+        if (typeof window !== 'undefined' && (data.sent ?? 0) > 0) {
+          try {
+            window.sessionStorage.setItem(`${PORTFOLIO_PNL_COOLDOWN_KEY}:${cooldownKey}`, String(now));
+          } catch {
+            // Ignore sessionStorage restrictions
+          }
+        }
+        return {
+          triggered: true,
+          notified: (data.sent ?? 0) > 0,
+          direction,
+          thresholdPct,
+          reason: (data.sent ?? 0) > 0 ? 'sent' : 'cooldown',
+        };
+      } catch {
+        portfolioCooldownRef.current.delete(cooldownKey);
+        return { triggered: true, notified: false, direction, thresholdPct, reason: 'error' };
+      }
+    },
+    [uid, isSignedIn, isSubscribed, preferences.notifyPortfolioPnl, preferences.portfolioPnlThresholdPct]
+  );
+
+  const checkAndNotifyPortfolioTarget = useCallback(
+    async (params: PortfolioTargetCheckInput): Promise<PortfolioTargetCheckResult> => {
+      if (
+        !params.hasLive24hData ||
+        !Number.isFinite(params.currentBalanceUsdt) ||
+        !Number.isFinite(params.targetBalanceUsdt) ||
+        params.currentBalanceUsdt <= 0 ||
+        params.targetBalanceUsdt <= 0
+      ) {
+        return { triggered: false, notified: false, reason: 'no_live_data' };
+      }
+
+      if (params.currentBalanceUsdt < params.targetBalanceUsdt) {
+        return { triggered: false, notified: false, reason: 'below_target' };
+      }
+
+      const dedupeKey = `${uid || 'guest'}:${params.portfolioId}:${params.targetBalanceUsdt.toFixed(2)}`;
+      const now = Date.now();
+      let lastSentAt = portfolioTargetCooldownRef.current.get(dedupeKey) ?? 0;
+
+      if (typeof window !== 'undefined') {
+        try {
+          const rawStored = window.sessionStorage.getItem(`${PORTFOLIO_TARGET_COOLDOWN_KEY}:${dedupeKey}`);
+          const parsedStored = rawStored ? Number(rawStored) : 0;
+          if (Number.isFinite(parsedStored) && parsedStored > lastSentAt) {
+            lastSentAt = parsedStored;
+          }
+        } catch {
+          // Ignore sessionStorage restrictions
+        }
+      }
+
+      if (now - lastSentAt < PORTFOLIO_TARGET_COOLDOWN_MS) {
+        return { triggered: true, notified: false, reason: 'cooldown' };
+      }
+
+      portfolioTargetCooldownRef.current.set(dedupeKey, now);
+
+      if (!preferences.notifyPortfolioPnl) {
+        return { triggered: true, notified: false, reason: 'disabled' };
+      }
+
+      if (!uid || !isSignedIn || !isSubscribed) {
+        return { triggered: true, notified: false, reason: 'not_subscribed' };
+      }
+
+      try {
+        const res = await authFetch('/api/push/portfolio-target', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            portfolioId: params.portfolioId,
+            portfolioLabel: params.portfolioLabel,
+            targetBalanceUsdt: params.targetBalanceUsdt,
+            currentBalanceUsdt: params.currentBalanceUsdt,
+            baselineBalanceUsdt: params.baselineBalanceUsdt,
+            targetPnlPct: params.targetPnlPct,
+          }),
+        });
+        if (!res.ok) {
+          portfolioTargetCooldownRef.current.delete(dedupeKey);
+          return { triggered: true, notified: false, reason: 'error' };
+        }
+        const data = (await res.json()) as { sent?: number };
+        if (typeof window !== 'undefined' && (data.sent ?? 0) > 0) {
+          try {
+            window.sessionStorage.setItem(`${PORTFOLIO_TARGET_COOLDOWN_KEY}:${dedupeKey}`, String(now));
+          } catch {
+            // Ignore sessionStorage restrictions
+          }
+        }
+        return {
+          triggered: true,
+          notified: (data.sent ?? 0) > 0,
+          reason: (data.sent ?? 0) > 0 ? 'sent' : 'cooldown',
+        };
+      } catch {
+        portfolioTargetCooldownRef.current.delete(dedupeKey);
+        return { triggered: true, notified: false, reason: 'error' };
+      }
+    },
+    [uid, isSignedIn, isSubscribed, preferences.notifyPortfolioPnl]
+  );
+
   return {
     isSupported,
     permission,
@@ -428,5 +661,7 @@ export function usePushNotifications({
     sendTestPush,
     scanMarketNow,
     triggerSecurityPush,
+    checkAndNotifyPortfolioPnl,
+    checkAndNotifyPortfolioTarget,
   };
 }

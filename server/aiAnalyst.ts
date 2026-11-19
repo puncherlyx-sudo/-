@@ -258,18 +258,50 @@ const newsCache = new Map<string, { expiresAt: number; updatedAt: string; items:
 const newsInFlight = new Map<string, Promise<GroundedNewsResponse>>();
 let rssNewsCache: { expiresAt: number; updatedAt: string; items: Array<GroundedNewsItem & { publishedAtMs: number }> } | null = null;
 
+const SERVER_NAMED_ENTITIES: Record<string, string> = {
+  quot: '"',
+  amp: '&',
+  apos: "'",
+  lt: '<',
+  gt: '>',
+  nbsp: ' ',
+  ndash: '–',
+  mdash: '—',
+  hellip: '…',
+  lsquo: '‘',
+  rsquo: '’',
+  ldquo: '“',
+  rdquo: '”',
+  laquo: '«',
+  raquo: '»',
+};
+
+function decodeHtmlEntitiesServer(str: string): string {
+  const once = (s: string) =>
+    s.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (match, ent: string) => {
+      if (ent.startsWith('#x') || ent.startsWith('#X')) {
+        const code = parseInt(ent.slice(2), 16);
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : match;
+      }
+      if (ent.startsWith('#')) {
+        const code = parseInt(ent.slice(1), 10);
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : match;
+      }
+      const mapped = SERVER_NAMED_ENTITIES[ent.toLowerCase()];
+      return mapped !== undefined ? mapped : match;
+    });
+  return once(once(str));
+}
+
 function stripHtmlAndCdata(input: string): string {
-  return input
+  const stripped = input
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/<[^>]+>/g, ' ');
+  return decodeHtmlEntitiesServer(stripped).replace(/\s+/g, ' ').trim();
 }
 
 function inferAssetFromText(text: string): string {
@@ -349,7 +381,7 @@ async function fetchSingleRssFeed(
       signal: controller.signal,
       headers: {
         Accept: 'application/rss+xml, application/xml, text/xml, */*',
-        'User-Agent': 'AegisQuant-Terminal/1.0',
+        'User-Agent': 'Vernier-Terminal/1.0',
       },
     });
     if (!res.ok) return [];
@@ -537,8 +569,8 @@ export async function fetchGroundedCryptoNews(
           source: 'rss',
           updatedAt: liveRss.updatedAt,
           notice: isQuotaOrKey
-            ? 'AI-перевод заголовков временно на паузе — показана прямая живая лента CoinDesk, Cointelegraph и Decrypt.'
-            : 'Показана прямая живая лента CoinDesk, Cointelegraph и Decrypt.',
+            ? 'Прямая лента CoinDesk, Cointelegraph и Decrypt с мгновенным локальным RU/EN переводом.'
+            : 'Прямая лента CoinDesk, Cointelegraph и Decrypt.',
         };
       }
 
@@ -617,7 +649,7 @@ async function fetchJsonSafe<T>(url: string, timeoutMs = 4500): Promise<T | null
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'AegisQuant-Terminal/1.0',
+        'User-Agent': 'Vernier-Terminal/1.0',
       },
     });
     if (!res.ok) return null;
@@ -637,7 +669,7 @@ async function fetchXmlTextSafe(url: string, timeoutMs = 4500): Promise<string |
       signal: controller.signal,
       headers: {
         Accept: 'application/rss+xml, application/xml, text/xml, */*',
-        'User-Agent': 'AegisQuant-Terminal/1.0',
+        'User-Agent': 'Vernier-Terminal/1.0',
       },
     });
     if (!res.ok) return null;
@@ -984,6 +1016,7 @@ export interface StrategyAnalysisRequest {
   riskPerTradePct: number;
   leverage: number;
   isPro: boolean;
+  planTier?: 'free' | 'pro' | 'max';
 }
 
 export interface StrategyAnalysisResult {
@@ -1013,8 +1046,9 @@ function formatPrice(val: number): string {
 }
 
 export async function runStrategyAnalysis(req: StrategyAnalysisRequest): Promise<StrategyAnalysisResult> {
-  const { indicators, marketType, symbol, timeframe, strategyName, strategyRules, depositUsdt, riskPerTradePct, leverage, isPro } =
+  const { indicators, marketType, symbol, timeframe, strategyName, strategyRules, depositUsdt, riskPerTradePct, leverage, isPro, planTier } =
     req;
+  const isMax = planTier === 'max';
 
   // Reuse cached Gemini news or multi-source live RSS digest to avoid making 2 Gemini calls per analysis
   const cachedNews = newsCache.get(`news:${symbol}`) ?? newsCache.get('news:ALL');
@@ -1022,7 +1056,7 @@ export async function runStrategyAnalysis(req: StrategyAnalysisRequest): Promise
     cachedNews && cachedNews.expiresAt > Date.now()
       ? cachedNews.items
       : (await fetchMultiSourceCryptoNews(symbol)).items;
-  const relevantNews = newsItems.slice(0, isPro ? 4 : 2);
+  const relevantNews = newsItems.slice(0, isMax ? 6 : isPro ? 4 : 2);
   const newsDigest =
     relevantNews.length > 0
       ? relevantNews.map((n) => `- [${n.sentiment}] ${n.title}: ${n.summary}`).join('\n')
@@ -1034,6 +1068,12 @@ export async function runStrategyAnalysis(req: StrategyAnalysisRequest): Promise
   const rawPositionUsdt = (riskAmountUsdt * 100) / slDistancePct;
   const maxNotional = depositUsdt * safeLeverage;
   const positionSizeUsdt = Number(Math.min(rawPositionUsdt, maxNotional).toFixed(2));
+
+  const depthLabel = isMax
+    ? 'ИНСТИТУЦИОНАЛЬНЫЙ MAX (глубокий мульти-факторный и макро-разбор по 6 источникам, три цели TP1-TP3 с распределением фиксации, оценка волатильности и хеджирования риска)'
+    : isPro
+      ? 'ПОЛНЫЙ PRO (детальный мульти-факторный разбор, три цели TP1-TP3, катализаторы и условия отмены)'
+      : 'БАЗОВЫЙ (сдержанный разбор по основной структуре)';
 
   const prompt = `Проведи институциональный торговый анализ криптовалютной пары ${symbol} на рынке ${
     marketType === 'futures' ? 'ФЬЮЧЕРСЫ' : 'СПОТ'
@@ -1059,7 +1099,7 @@ ${
 Новостной фон:
 ${newsDigest}
 
-Уровень глубины анализа: ${isPro ? 'ПОЛНЫЙ PRO (детальный мульти-факторный разбор, три цели TP1-TP3, катализаторы и условия отмены)' : 'БАЗОВЫЙ (сдержанный разбор по основной структуре)'}.
+Уровень глубины анализа: ${depthLabel}.
 Помни: для СПОТ рынка направление не может быть SHORT — только LONG или WAIT. Для ФЬЮЧЕРСОВ допустимы LONG, SHORT или WAIT.`;
 
   const response = await callGeminiWithBackoff('analyze', (ai) =>
@@ -1068,7 +1108,7 @@ ${newsDigest}
       contents: prompt,
       config: {
         systemInstruction:
-          'Ты риск-аналитик криптовалютного терминала AegisQuant. Давай строгий, взвешенный технический и новостной разбор на русском языке без гарантий доходности.',
+          'Ты риск-аналитик криптовалютного терминала Vernier. Давай строгий, взвешенный технический и новостной разбор на русском языке без гарантий доходности.',
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -1176,9 +1216,9 @@ export interface TerminalChatTurn {
   text: string;
 }
 
-const TERMINAL_ASSISTANT_INSTRUCTION = `Ты — встроенный справочный ассистент криптотерминала AegisQuant. Отвечай строго на русском языке, кратко, чётко и по делу (обычно 2–5 предложений или компактный список шагов).
+const TERMINAL_ASSISTANT_INSTRUCTION = `Ты — встроенный справочный ассистент криптотерминала Vernier. Отвечай строго на русском языке, кратко, чётко и по делу (обычно 2–5 предложений или компактный список шагов).
 
-Реальные возможности терминала AegisQuant (используй только эти факты, ничего не выдумывай):
+Реальные возможности терминала Vernier (используй только эти факты, ничего не выдумывай):
 1. Раздел «Рынок» (главный экран):
    - 44 ликвидные пары в режимах «Спот» и «Фьючерсы USDT-M» (BTC, ETH, SOL, ADA, DOT, LINK, UNI, POL с поиском по алиасу MATIC, RENDER/RNDR, TON, XRP, AVAX, NEAR, ARB, OP, SUI, APT и др.).
    - Строка быстрого поиска сверху мгновенно находит пары по тикеру, названию, алиасу или категории (DeFi, L1, L2, AI).
@@ -1267,3 +1307,188 @@ export async function askTerminalAssistant(params: {
   }
   return reply.slice(0, 2400);
 }
+
+const newsTranslationCache = new Map<string, { title: string; summary: string; ts: number }>();
+const NEWS_TRANSLATION_TTL_MS = 6 * 60 * 60 * 1000;
+
+export interface NewsTranslateInput {
+  id: string;
+  title: string;
+  summary: string;
+}
+
+const FALLBACK_CRYPTO_PHRASE_DICT: Array<[RegExp, string]> = [
+  [/\bUS CPI\b/gi, 'Индекс инфляции США (CPI)'],
+  [/\bCore CPI\b/gi, 'Базовая инфляция США (Core CPI)'],
+  [/\bFOMC Interest Rate Decision\b/gi, 'Решение ФРС США по процентной ставке'],
+  [/\bFed Interest Rate Decision\b/gi, 'Решение ФРС по процентной ставке'],
+  [/\bFOMC Minutes\b/gi, 'Протоколы заседания ФРС (FOMC)'],
+  [/\bNon-?Farm Payrolls\b/gi, 'Занятость вне сельского хозяйства США (NFP)'],
+  [/\bInitial Jobless Claims\b/gi, 'Первичные заявки по безработице США'],
+  [/\bCore PCE Price Index\b/gi, 'Базовый индекс расходов PCE США'],
+  [/\bPCE Price Index\b/gi, 'Индекс инфляции PCE США'],
+  [/\bProducer Price Index\b|\bUS PPI\b/gi, 'Индекс цен производителей США (PPI)'],
+  [/\bGDP Growth Rate\b/gi, 'Темпы роста ВВП'],
+  [/\bOptions Expiry\b/gi, 'Экспирация опционов'],
+  [/\bToken Unlock\b/gi, 'Разблокировка токенов'],
+  [/\bSpot Bitcoin ETF\b/gi, 'Спотовый Bitcoin ETF'],
+  [/\bSpot Ethereum ETF\b/gi, 'Спотовый Ethereum ETF'],
+  [/\bBitcoin ETF\b/gi, 'Bitcoin ETF'],
+  [/\bEthereum ETF\b/gi, 'Ethereum ETF'],
+  [/\bnet inflows?\b/gi, 'чистый приток капитала'],
+  [/\bnet outflows?\b/gi, 'чистый отток капитала'],
+  [/\ball[- ]time high\b/gi, 'исторический максимум'],
+  [/\bprice surges?\b/gi, 'цена резко растёт'],
+  [/\bprice drops?\b/gi, 'цена снижается'],
+  [/\binterest rates?\b/gi, 'процентные ставки'],
+  [/\bfederal reserve\b/gi, 'ФРС США'],
+  [/\bmarket cap\b/gi, 'рыночная капитализация'],
+  [/\bopen interest\b/gi, 'открытый интерес (OI)'],
+  [/\bfunding rate\b/gi, 'ставка финансирования'],
+  [/\bliquidations?\b/gi, 'ликвидации'],
+  [/\bwhale(s)?\b/gi, 'крупные держатели (киты)'],
+  [/\bexchange(s)?\b/gi, 'криптобиржа'],
+  [/\bregulation\b/gi, 'регулирование'],
+  [/\bstablecoin(s)?\b/gi, 'стейблкоины'],
+  [/\bmining\b/gi, 'майнинг'],
+  [/\bstaking\b/gi, 'стейкинг'],
+  [/\bapproval\b/gi, 'одобрение'],
+  [/\blaunches?\b/gi, 'запускает'],
+  [/\bannounces?\b/gi, 'объявляет'],
+  [/\bpartners with\b/gi, 'заключает партнёрство с'],
+  [/\braises?\b/gi, 'привлекает'],
+  [/\brallies\b|\brally\b/gi, 'ралли'],
+  [/\bplunge(s)?\b|\bcrash(es)?\b/gi, 'резкое падение'],
+  [/\bbreakout\b/gi, 'пробой уровня'],
+  [/\bvolatility\b/gi, 'волатильность'],
+  [/\binflation\b/gi, 'инфляция'],
+  [/\bBitcoin\b/g, 'Биткоин (BTC)'],
+  [/\bEthereum\b/g, 'Эфириум (ETH)'],
+  [/\bSolana\b/g, 'Solana (SOL)'],
+];
+
+function fallbackTranslateCryptoTextToRu(text: string): string {
+  let out = decodeHtmlEntitiesServer(text);
+  if (!out || /[А-Яа-яЁё]/.test(out)) return out;
+  for (const [pattern, replacement] of FALLBACK_CRYPTO_PHRASE_DICT) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
+/**
+ * Translates full English crypto news headlines, summaries, and economic calendar events
+ * into natural Russian using Gemini structured output with in-memory caching + fallback dictionary.
+ */
+export async function translateNewsBatchToRussian(
+  items: NewsTranslateInput[]
+): Promise<Record<string, { title: string; summary: string }>> {
+  const now = Date.now();
+  const result: Record<string, { title: string; summary: string }> = {};
+  const toTranslate: NewsTranslateInput[] = [];
+
+  for (const item of items.slice(0, 24)) {
+    const id = String(item.id || '').slice(0, 120);
+    const title = decodeHtmlEntitiesServer(String(item.title || '')).trim().slice(0, 260);
+    const summary = decodeHtmlEntitiesServer(String(item.summary || '')).trim().slice(0, 600);
+    if (!id || !title) continue;
+
+    const cached = newsTranslationCache.get(id);
+    if (cached && now - cached.ts < NEWS_TRANSLATION_TTL_MS) {
+      result[id] = { title: cached.title, summary: cached.summary };
+      continue;
+    }
+
+    // Already Russian — keep verbatim (with decoded entities)
+    if (/[А-Яа-яЁё]/.test(title) && (!summary || /[А-Яа-яЁё]/.test(summary))) {
+      result[id] = { title, summary };
+      newsTranslationCache.set(id, { title, summary, ts: now });
+      continue;
+    }
+
+    toTranslate.push({ id, title, summary });
+  }
+
+  if (toTranslate.length === 0) {
+    return result;
+  }
+
+  const applyFallback = () => {
+    for (const item of toTranslate) {
+      if (result[item.id]) continue;
+      const fbTitle = fallbackTranslateCryptoTextToRu(item.title);
+      const fbSummary = item.summary ? fallbackTranslateCryptoTextToRu(item.summary) : '';
+      result[item.id] = { title: fbTitle, summary: fbSummary };
+    }
+  };
+
+  const ai = getAiClient();
+  if (!ai || now < geminiQuotaCooldownUntil) {
+    applyFallback();
+    return result;
+  }
+
+  try {
+    const prompt = [
+      'Переведи каждый заголовок (title) и краткое описание (summary) криптоновостей или событий экономического календаря целиком на естественный, грамотный деловой русский язык.',
+      'Сохраняй тикеры и аббревиатуры (BTC, ETH, SOL, USDT, ETF, DeFi, SEC, FOMC, CPI, PPI, NFP, PCE, Deribit, OKX) в оригинале, не оставляй непереведённых английских фраз внутри русского предложения.',
+      'Верни JSON-массив объектов с полями id, title, summary в точном соответствии с переданными id.',
+      '',
+      JSON.stringify(toTranslate),
+    ].join('\n');
+
+    const response = await callGeminiWithBackoff(
+      'news-translate',
+      (client) =>
+        client.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  summary: { type: Type.STRING },
+                },
+                required: ['id', 'title', 'summary'],
+              },
+            },
+          },
+        }),
+      { maxAttempts: 1, timeoutMs: 12000 }
+    );
+
+    const parsed = JSON.parse(response.text || '[]') as Array<{
+      id?: string;
+      title?: string;
+      summary?: string;
+    }>;
+
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed) {
+        if (!entry?.id || !entry?.title) continue;
+        const cleanTitle = decodeHtmlEntitiesServer(String(entry.title)).trim();
+        const cleanSummary = decodeHtmlEntitiesServer(String(entry.summary ?? '')).trim();
+        if (cleanTitle) {
+          result[entry.id] = { title: cleanTitle, summary: cleanSummary };
+          newsTranslationCache.set(entry.id, {
+            title: cleanTitle,
+            summary: cleanSummary,
+            ts: now,
+          });
+        }
+      }
+    }
+  } catch {
+    // Graceful fallback dictionary when Gemini is momentarily unavailable
+  }
+
+  applyFallback();
+  return result;
+}
+

@@ -37,7 +37,7 @@ service cloud.firestore {
     }
 
     function isActiveProUser(userId) {
-      return get(/databases/$(database)/documents/users/$(userId)).data.plan == 'pro'
+      return get(/databases/$(database)/documents/users/$(userId)).data.plan in ['pro', 'max']
         && ('proUntil' in get(/databases/$(database)/documents/users/$(userId)).data)
         && get(/databases/$(database)/documents/users/$(userId)).data.proUntil is int
         && get(/databases/$(database)/documents/users/$(userId)).data.proUntil > request.time.toMillis();
@@ -52,15 +52,16 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'uid', 'displayName', 'plan', 'creditsRemaining', 'weeklyQuota',
           'nextResetAt', 'twoFactorEnabled', 'autoLockMinutes', 'createdAt', 'updatedAt',
-          'proUntil'
+          'proUntil', 'maxMultiplier'
         ])
         && (!('proUntil' in data) || data.proUntil is int)
+        && (!('maxMultiplier' in data) || (data.maxMultiplier is int && data.maxMultiplier in [10, 20]))
         && data.uid is string && data.uid == userId && isValidId(data.uid)
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
-        && data.plan in ['free', 'pro']
-        && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 100
-        && (data.plan == 'pro' || data.creditsRemaining <= 15)
-        && data.weeklyQuota is int && data.weeklyQuota in [10, 15]
+        && data.plan in ['free', 'pro', 'max']
+        && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 2000
+        && (data.plan == 'max' || (data.plan == 'pro' && data.creditsRemaining <= 100) || (data.plan == 'free' && data.creditsRemaining <= 25))
+        && data.weeklyQuota is int && data.weeklyQuota in [10, 15, 25]
         && data.nextResetAt is string && data.nextResetAt.size() >= 10 && data.nextResetAt.size() <= 64
         && data.twoFactorEnabled is bool
         && data.autoLockMinutes is int && data.autoLockMinutes >= 1 && data.autoLockMinutes <= 60
@@ -178,6 +179,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'userId', 'endpoint', 'p256dh', 'auth', 'notifySignals',
           'notifyMarketMoves', 'notifyVolatilitySpikes', 'volatilityThresholdPct',
+          'notifyPortfolioPnl', 'portfolioPnlThresholdPct',
           'notifyNews', 'notifyAuthLogins',
           'notifyStrategyChanges', 'notifySignalLimits', 'enabled', 'deviceLabel',
           'createdAt', 'updatedAt'
@@ -191,6 +193,8 @@ service cloud.firestore {
         && data.notifyMarketMoves is bool
         && (!('notifyVolatilitySpikes' in data) || data.notifyVolatilitySpikes is bool)
         && (!('volatilityThresholdPct' in data) || ((data.volatilityThresholdPct is int || data.volatilityThresholdPct is float) && data.volatilityThresholdPct >= 1 && data.volatilityThresholdPct <= 25))
+        && (!('notifyPortfolioPnl' in data) || data.notifyPortfolioPnl is bool)
+        && (!('portfolioPnlThresholdPct' in data) || ((data.portfolioPnlThresholdPct is int || data.portfolioPnlThresholdPct is float) && data.portfolioPnlThresholdPct >= 1 && data.portfolioPnlThresholdPct <= 50))
         && data.notifyNews is bool
         && data.notifyAuthLogins is bool
         && data.notifyStrategyChanges is bool
@@ -301,6 +305,64 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    // Validation Blueprint: ExchangeKeyRecord (Encrypted Exchange API Credentials)
+    function isValidExchangeKey(data, userId, keyId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'exchange', 'label', 'apiKeyPreview',
+          'encryptedApiKey', 'encryptedApiSecret', 'encryptedPassphrase',
+          'permissions', 'testnet', 'enabled', 'lastSyncedAt',
+          'lastBalanceUsdt', 'lastSyncError', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'exchange', 'label', 'apiKeyPreview',
+          'encryptedApiKey', 'encryptedApiSecret', 'encryptedPassphrase',
+          'permissions', 'testnet', 'enabled', 'lastSyncedAt',
+          'lastBalanceUsdt', 'lastSyncError', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == keyId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.exchange in ['binance', 'bybit', 'okx']
+        && data.label is string && data.label.size() >= 2 && data.label.size() <= 64
+        && data.apiKeyPreview is string && data.apiKeyPreview.size() >= 4 && data.apiKeyPreview.size() <= 24
+        && data.encryptedApiKey is string && data.encryptedApiKey.size() >= 10 && data.encryptedApiKey.size() <= 512
+        && data.encryptedApiSecret is string && data.encryptedApiSecret.size() >= 10 && data.encryptedApiSecret.size() <= 512
+        && data.encryptedPassphrase is string && data.encryptedPassphrase.size() <= 512
+        && data.permissions in ['read_only', 'trade']
+        && data.testnet is bool
+        && data.enabled is bool
+        && data.lastSyncedAt is string && data.lastSyncedAt.size() <= 64
+        && (data.lastBalanceUsdt is int || data.lastBalanceUsdt is float) && data.lastBalanceUsdt >= 0 && data.lastBalanceUsdt <= 1000000000
+        && data.lastSyncError is string && data.lastSyncError.size() <= 240
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: PortfolioTargetRecord (Per-Portfolio Target PnL Goal)
+    function isValidPortfolioTarget(data, userId, targetId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'portfolioId', 'portfolioLabel',
+          'targetBalanceUsdt', 'baselineBalanceUsdt', 'targetPnlPct',
+          'active', 'triggeredAt', 'triggeredBalanceUsdt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'portfolioId', 'portfolioLabel',
+          'targetBalanceUsdt', 'baselineBalanceUsdt', 'targetPnlPct',
+          'active', 'triggeredAt', 'triggeredBalanceUsdt', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == targetId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.portfolioId is string && isShortId(data.portfolioId)
+        && data.portfolioLabel is string && data.portfolioLabel.size() >= 1 && data.portfolioLabel.size() <= 80
+        && (data.targetBalanceUsdt is int || data.targetBalanceUsdt is float) && data.targetBalanceUsdt > 0 && data.targetBalanceUsdt <= 1000000000
+        && (data.baselineBalanceUsdt is int || data.baselineBalanceUsdt is float) && data.baselineBalanceUsdt >= 0 && data.baselineBalanceUsdt <= 1000000000
+        && (data.targetPnlPct is int || data.targetPnlPct is float) && data.targetPnlPct >= -99 && data.targetPnlPct <= 10000
+        && data.active is bool
+        && data.triggeredAt is string && data.triggeredAt.size() <= 64
+        && (data.triggeredBalanceUsdt is int || data.triggeredBalanceUsdt is float) && data.triggeredBalanceUsdt >= 0 && data.triggeredBalanceUsdt <= 1000000000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Master Gate: /users/{userId}
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwnerRead(userId);
@@ -310,8 +372,8 @@ service cloud.firestore {
         && isVerifiedOwner(userId)
         && isValidUserProfile(incoming(), userId)
         && incoming().plan == 'free'
-        && incoming().creditsRemaining == 15
-        && incoming().weeklyQuota == 15
+        && incoming().creditsRemaining == 25
+        && incoming().weeklyQuota == 25
         && incoming().twoFactorEnabled == false
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -325,8 +387,8 @@ service cloud.firestore {
         && (
           // Action 1: Consume or Reset Weekly Credits
           (incoming().plan == existing().plan && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
-          // Action 1b: Migrate legacy Free weeklyQuota (10 -> 15) or weekly reset
-          (existing().plan == 'free' && incoming().plan == 'free' && incoming().weeklyQuota == 15 && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'weeklyQuota', 'nextResetAt', 'updatedAt'])) ||
+          // Action 1b: Migrate legacy Free weeklyQuota (10/15 -> 25) or weekly reset
+          (existing().plan == 'free' && incoming().plan == 'free' && incoming().weeklyQuota == 25 && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'weeklyQuota', 'nextResetAt', 'updatedAt'])) ||
           // Action 2: Toggle 2FA or Auto-Lock Timeout
           (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
           // Action 3 УДАЛЁН: тариф (plan) и срок (proUntil) меняет только сервер после оплаты.
@@ -379,7 +441,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && (
             isActiveProUser(userId)
-            || (incoming().dailySignalLimit == 1 && incoming().leverage <= 5)
+            || (incoming().dailySignalLimit == 1 && incoming().leverage <= 3)
           );
 
         allow update: if isValidId(userId)
@@ -393,7 +455,7 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && (
             isActiveProUser(userId)
-            || (incoming().dailySignalLimit == 1 && incoming().leverage <= 5)
+            || (incoming().dailySignalLimit == 1 && (incoming().leverage <= 3 || (incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt']) && incoming().leverage <= 5)))
           )
           && (
             (incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt'])) ||
@@ -461,6 +523,7 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly([
               'endpoint', 'p256dh', 'auth', 'notifySignals', 'notifyMarketMoves',
               'notifyVolatilitySpikes', 'volatilityThresholdPct',
+              'notifyPortfolioPnl', 'portfolioPnlThresholdPct',
               'notifyNews', 'notifyAuthLogins', 'notifyStrategyChanges', 'notifySignalLimits',
               'enabled', 'deviceLabel', 'updatedAt'
             ])
@@ -596,6 +659,69 @@ service cloud.firestore {
 
         allow update: if false;
         allow delete: if isValidId(userId) && isShortId(ticketId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: Encrypted Exchange API Integrations
+      match /exchangeKeys/{keyId} {
+        allow get: if isValidId(userId) && isShortId(keyId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(keyId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidExchangeKey(incoming(), userId, keyId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(keyId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidExchangeKey(incoming(), userId, keyId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().exchange == existing().exchange
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'label', 'apiKeyPreview', 'encryptedApiKey', 'encryptedApiSecret',
+            'encryptedPassphrase', 'permissions', 'testnet', 'enabled',
+            'lastSyncedAt', 'lastBalanceUsdt', 'lastSyncError', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(userId) && isShortId(keyId) && isVerifiedOwner(userId);
+      }
+
+      // Subcollection: Per-Portfolio Target PnL & Balance Alerts
+      match /portfolioTargets/{targetId} {
+        allow get: if isValidId(userId) && isShortId(targetId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(targetId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPortfolioTarget(incoming(), userId, targetId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId)
+          && isShortId(targetId)
+          && isVerifiedOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPortfolioTarget(incoming(), userId, targetId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().portfolioId == existing().portfolioId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'portfolioLabel', 'targetBalanceUsdt', 'baselineBalanceUsdt',
+            'targetPnlPct', 'active', 'triggeredAt', 'triggeredBalanceUsdt', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(userId) && isShortId(targetId) && isVerifiedOwner(userId);
       }
     }
   }

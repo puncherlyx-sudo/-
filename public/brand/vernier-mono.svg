@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 280" width="320" height="280" role="img" aria-label="Vernier">
+  <g transform="translate(-96 -126)" fill="currentColor">
+    <!-- Left Arm Inner Ticks -->
+    <rect x="170" y="189" width="32" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="197" y="236" width="29" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="224" y="283" width="21" height="7.5" rx="3.75" opacity="0.55"/>
+
+    <!-- Right Arm Inner Ticks -->
+    <rect x="314" y="179.6" width="34" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="293" y="217.2" width="33" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="275" y="254.8" width="29" height="7.5" rx="3.75" opacity="0.55"/>
+    <rect x="263" y="292.4" width="19" height="7.5" rx="3.75" opacity="0.55"/>
+
+    <!-- Coincident Top Caliper Jaws -->
+    <rect x="138" y="146" width="48" height="12" rx="4" opacity="0.88"/>
+    <rect x="326" y="146" width="48" height="12" rx="4" opacity="0.88"/>
+
+    <!-- Primary Architectural V Caliper Silhouette -->
+    <path d="M 116 146 L 146 146 L 256 334 L 366 146 L 396 146 L 260 382 Q 256 388 252 382 Z"/>
+  </g>
+</svg>

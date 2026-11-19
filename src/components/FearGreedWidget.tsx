@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Flame, RefreshCw } from 'lucide-react';
-import { motion } from 'motion/react';
-import type { FearAndGreedSnapshot } from '../types/domain';
+import { motion, useMotionValue, useMotionValueEvent, useSpring } from 'motion/react';
+import { useFearGreed } from '../contexts/FearGreedContext';
+import { FeatureGuide } from './FeatureGuide';
 
 type HorizonKey = 'today' | 'yesterday' | 'week' | 'month';
 
@@ -92,46 +93,11 @@ function describeGaugeArc(cx: number, cy: number, r: number, startVal: number, e
 }
 
 export const FearGreedWidget: React.FC = () => {
-  const [data, setData] = useState<FearAndGreedSnapshot | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { data, loading, refresh } = useFearGreed();
   const [horizon, setHorizon] = useState<HorizonKey>('today');
   const [hoveredZone, setHoveredZone] = useState<SentimentZone | null>(null);
   const [hoveredBarIdx, setHoveredBarIdx] = useState<number | null>(null);
-
-  const loadSentiment = useCallback(async (forceRefresh = false) => {
-    setLoading(true);
-    try {
-      const url = forceRefresh ? '/api/market/fear-greed?refresh=1' : '/api/market/fear-greed';
-      const res = await fetch(url, { cache: 'no-store' });
-      if (res.ok) {
-        const json = (await res.json()) as FearAndGreedSnapshot;
-        setData(json);
-      }
-    } catch {
-      // Keep prior state on transient offline glitch
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadSentiment(false);
-    const timer = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
-        void loadSentiment(false);
-      }
-    }, 5 * 60_000);
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        void loadSentiment(false);
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener('visibilitychange', handleVisibility);
-    };
-  }, [loadSentiment]);
+  const needleGroupRef = useRef<SVGGElement | null>(null);
 
   const baseHorizonValue = useMemo(() => {
     if (!data) return 50;
@@ -158,6 +124,22 @@ export const FearGreedWidget: React.FC = () => {
     const clamped = Math.max(0, Math.min(100, displayValue));
     return -90 + (clamped / 100) * 180;
   }, [displayValue]);
+
+  const angleMv = useMotionValue(needleRotationDeg);
+  const springAngle = useSpring(angleMv, { stiffness: 190, damping: 22 });
+
+  useMotionValueEvent(springAngle, 'change', (deg) => {
+    if (needleGroupRef.current) {
+      needleGroupRef.current.setAttribute('transform', `rotate(${deg.toFixed(2)} 140 134)`);
+    }
+  });
+
+  useEffect(() => {
+    angleMv.set(needleRotationDeg);
+    if (needleGroupRef.current) {
+      needleGroupRef.current.setAttribute('transform', `rotate(${springAngle.get().toFixed(2)} 140 134)`);
+    }
+  }, [angleMv, needleRotationDeg, springAngle]);
 
   const deltaFromYesterday = data ? data.value - data.yesterdayValue : 0;
 
@@ -207,7 +189,7 @@ export const FearGreedWidget: React.FC = () => {
         <motion.button
           type="button"
           whileTap={{ scale: 0.94 }}
-          onClick={() => void loadSentiment(true)}
+          onClick={() => void refresh(true)}
           disabled={loading}
           aria-label="Обновить индекс страха и жадности"
           className="min-h-[38px] min-w-[38px] rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 flex items-center justify-center transition-colors shrink-0"
@@ -218,7 +200,7 @@ export const FearGreedWidget: React.FC = () => {
 
       {/* Interactive Semicircular SVG Gauge */}
       <div className="relative flex flex-col items-center">
-        <svg viewBox="0 0 280 160" className="w-full max-w-[300px] h-auto select-none overflow-visible">
+        <svg viewBox="0 0 280 154" className="w-full max-w-[300px] h-auto select-none overflow-hidden">
           {/* Segmented Arcs (Clickable & Hoverable Zones) */}
           {SENTIMENT_ZONES.map((zone, idx) => {
             const gapStart = idx === 0 ? zone.min : zone.min + 0.8;
@@ -243,7 +225,7 @@ export const FearGreedWidget: React.FC = () => {
 
           {/* Scale Tick Marks 0, 25, 50, 75, 100 */}
           {[0, 25, 50, 75, 100].map((tick) => {
-            const pt = valueToPoint(140, 134, 80, tick);
+            const pt = valueToPoint(140, 134, 76, tick);
             return (
               <text
                 key={tick}
@@ -259,16 +241,14 @@ export const FearGreedWidget: React.FC = () => {
             );
           })}
 
-          {/* Animated Needle */}
-          <motion.g
-            initial={false}
-            animate={{ rotate: needleRotationDeg }}
-            transition={{ type: 'spring', stiffness: 210, damping: 24 }}
-            style={{ originX: '140px', originY: '134px' }}
+          {/* Animated Needle rotated strictly in SVG user-space around hub (140, 134) */}
+          <g
+            ref={needleGroupRef}
+            transform={`rotate(${needleRotationDeg.toFixed(2)} 140 134)`}
           >
-            <polygon points="136.5,134 140,42 143.5,134" fill="#F8FAFC" fillOpacity="0.92" />
-            <circle cx="140" cy="134" r="7" fill="#0B0F17" stroke={activeZone.color} strokeWidth="3" />
-          </motion.g>
+            <polygon points="136.8,134 140,48 143.2,134" fill="#F8FAFC" fillOpacity="0.95" />
+          </g>
+          <circle cx="140" cy="134" r="7" fill="#0B0F17" stroke={activeZone.color} strokeWidth="3" />
         </svg>
 
         {/* Central Numeric Score & Classification */}
@@ -372,6 +352,15 @@ export const FearGreedWidget: React.FC = () => {
         </strong>
         {activeZone.hint}
       </p>
+
+      <FeatureGuide
+        title="Индекс страха и жадности"
+        summary="Шкала от 0 до 100 отражает эмоции крипторынка. Нажимайте на сегменты дуги, кнопки горизонтов («Сегодня», «Вчера», «7 дн.», «30 дн.») или столбцы истории за 14 дней — стрелка сразу перейдёт к выбранному значению."
+        steps={[
+          '0–24 (Экстремальный страх): паника, часто зона для осторожного поэтапного накопления на споте.',
+          '75–100 (Экстремальная жадность): перегретый рынок — повышайте осторожность и подтягивайте Stop-Loss.',
+        ]}
+      />
     </section>
   );
 };

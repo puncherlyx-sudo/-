@@ -63,7 +63,7 @@ export const LockScreenOverlay: React.FC<LockScreenOverlayProps> = ({
         <div className="w-14 h-14 rounded-2xl border border-emerald-500/30 bg-[#0B0F17] overflow-hidden mx-auto shadow-lg">
           <img
             src="/src/assets/images/terminal_icon_vault_1794855844198.jpg"
-            alt="2FA Защита AegisQuant"
+            alt="2FA Защита Vernier"
             referrerPolicy="no-referrer"
             className="w-full h-full object-cover"
           />

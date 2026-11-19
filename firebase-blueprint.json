@@ -7,10 +7,11 @@
       "properties": {
         "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
-        "plan": { "type": "string", "enum": ["free", "pro"] },
-        "proUntil": { "type": "integer", "description": "PRO subscription expiration timestamp in Unix ms (set by billing server)." },
-        "creditsRemaining": { "type": "integer", "description": "Remaining analysis/backtest credits (Free max 15/week, PRO max 100/month)." },
-        "weeklyQuota": { "type": "integer", "description": "Weekly Free credit allowance (15 credits every 7 days)." },
+        "plan": { "type": "string", "enum": ["free", "pro", "max"] },
+        "proUntil": { "type": "integer", "description": "PRO/MAX subscription expiration timestamp in Unix ms (set by billing server)." },
+        "maxMultiplier": { "type": "integer", "description": "MAX credit multiplier (10 = 1000/month, 20 = 2000/month), set by billing server." },
+        "creditsRemaining": { "type": "integer", "description": "Remaining analysis/backtest credits (Free max 25/week, PRO max 100/month, MAX x10 max 1000/month, MAX x20 max 2000/month)." },
+        "weeklyQuota": { "type": "integer", "description": "Weekly Free credit allowance (25 credits every 7 days)." },
         "nextResetAt": { "type": "string", "minLength": 10, "maxLength": 64 },
         "twoFactorEnabled": { "type": "boolean" },
         "autoLockMinutes": { "type": "integer" },
@@ -109,6 +110,8 @@
         "notifyMarketMoves": { "type": "boolean" },
         "notifyVolatilitySpikes": { "type": "boolean" },
         "volatilityThresholdPct": { "type": "number" },
+        "notifyPortfolioPnl": { "type": "boolean" },
+        "portfolioPnlThresholdPct": { "type": "number" },
         "notifyNews": { "type": "boolean" },
         "notifyAuthLogins": { "type": "boolean" },
         "notifyStrategyChanges": { "type": "boolean" },
@@ -201,6 +204,50 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "symbol", "marketType", "side", "entryPrice", "stopPrice", "exitPrice", "status", "note", "closedAt", "createdAt", "updatedAt"]
+    },
+    "ExchangeKeyRecord": {
+      "title": "ExchangeKeyRecord",
+      "description": "User-linked external exchange API key metadata with AES-256-GCM encrypted credentials for portfolio balance sync and order execution.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "exchange": { "type": "string", "enum": ["binance", "bybit", "okx"] },
+        "label": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "apiKeyPreview": { "type": "string", "minLength": 4, "maxLength": 24 },
+        "encryptedApiKey": { "type": "string", "minLength": 10, "maxLength": 512 },
+        "encryptedApiSecret": { "type": "string", "minLength": 10, "maxLength": 512 },
+        "encryptedPassphrase": { "type": "string", "maxLength": 512 },
+        "permissions": { "type": "string", "enum": ["read_only", "trade"] },
+        "testnet": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "lastSyncedAt": { "type": "string", "maxLength": 64 },
+        "lastBalanceUsdt": { "type": "number" },
+        "lastSyncError": { "type": "string", "maxLength": 240 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "exchange", "label", "apiKeyPreview", "encryptedApiKey", "encryptedApiSecret", "encryptedPassphrase", "permissions", "testnet", "enabled", "lastSyncedAt", "lastBalanceUsdt", "lastSyncError", "createdAt", "updatedAt"]
+    },
+    "PortfolioTargetRecord": {
+      "title": "PortfolioTargetRecord",
+      "description": "User-configured target PnL / target balance goal for a specific portfolio (manual or exchange-synced) triggering push notification upon reach.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "portfolioId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "portfolioLabel": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "targetBalanceUsdt": { "type": "number" },
+        "baselineBalanceUsdt": { "type": "number" },
+        "targetPnlPct": { "type": "number" },
+        "active": { "type": "boolean" },
+        "triggeredAt": { "type": "string", "maxLength": 64 },
+        "triggeredBalanceUsdt": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "portfolioId", "portfolioLabel", "targetBalanceUsdt", "baselineBalanceUsdt", "targetPnlPct", "active", "triggeredAt", "triggeredBalanceUsdt", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -243,6 +290,14 @@
     "/users/{userId}/trades/{tradeId}": {
       "schema": { "$ref": "#/entities/TradeRecord" },
       "description": "Personal trade journal entries persisted per user."
+    },
+    "/users/{userId}/exchangeKeys/{keyId}": {
+      "schema": { "$ref": "#/entities/ExchangeKeyRecord" },
+      "description": "Encrypted third-party exchange API keys for portfolio sync and order execution."
+    },
+    "/users/{userId}/portfolioTargets/{targetId}": {
+      "schema": { "$ref": "#/entities/PortfolioTargetRecord" },
+      "description": "Per-portfolio Target PnL / target balance goals for push alert notifications."
     }
   }
 }

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  BookOpen,
   Bot,
   ChevronDown,
   Compass,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import type { SupportTicketCategory, SupportTicketRecord } from '../types/domain';
+import { PermanentFeaturesManual } from './FeatureGuide';
 import { NATIVE_PILL_SPRING, NATIVE_SPRING, TERMINAL_EASE } from './MotionPrimitives';
 import { SupportContactModal } from './SupportContactModal';
 import { safeFetchJson } from '../utils/safeFetchJson';
@@ -67,7 +69,7 @@ const QUICK_ANSWERS: QuickAnswerItem[] = [
     topic: 'Безопасность средств',
     question: 'Имеет ли терминал доступ к балансу на бирже?',
     answer:
-      'Нет. AegisQuant работает по Non-Custodial модели на публичных рыночных данных Spot и Futures, без запроса API-ключей на торговлю или вывод. Доступ к настройкам можно защитить TOTP 2FA и автоблокировкой.',
+      'Нет. Vernier работает по Non-Custodial модели на публичных рыночных данных Spot и Futures, без запроса API-ключей на торговлю или вывод. Доступ к настройкам можно защитить TOTP 2FA и автоблокировкой.',
     actionId: 'faq',
     actionLabel: 'Все вопросы по 2FA и защите',
   },
@@ -99,7 +101,7 @@ const STARTER_PROMPTS = [
 const WELCOME_MESSAGE: ChatMessage = {
   id: 'welcome',
   role: 'model',
-  text: 'Здравствуйте! Я помощник терминала AegisQuant на базе Gemini. Спросите о поиске и фильтрах пар, настройке колонок, ценовых алертах, кредитах Free/PRO, 2FA или установке PWA.',
+  text: 'Здравствуйте! Я помощник терминала Vernier на базе Gemini. Спросите о поиске и фильтрах пар, настройке колонок, ценовых алертах, кредитах Free/PRO, 2FA или установке PWA.',
   timestamp: formatMessageTime(),
 };
 
@@ -121,6 +123,7 @@ interface QuickAnswersCardProps {
   onUpgradePro: () => void;
   onOpenFullFaq?: () => void;
   onStartTour?: () => void;
+  inSheet?: boolean;
 }
 
 export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
@@ -134,9 +137,10 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
   onUpgradePro,
   onOpenFullFaq,
   onStartTour,
+  inSheet = false,
 }) => {
   const prefersReducedMotion = useReducedMotion();
-  const [mode, setMode] = useState<'chat' | 'faq'>('chat');
+  const [mode, setMode] = useState<'chat' | 'manual' | 'faq'>('manual');
   const [openId, setOpenId] = useState<string | null>(null);
   const [supportModalOpen, setSupportModalOpen] = useState(false);
 
@@ -253,7 +257,11 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
     <>
       <section
         aria-labelledby="quick-answers-heading"
-        className="mt-4 rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5 space-y-3.5"
+        className={
+          inSheet
+            ? 'space-y-3.5'
+            : 'mt-4 rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5 space-y-3.5'
+        }
       >
         {/* Header Bar */}
         <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-white/8">
@@ -264,16 +272,16 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
                 id="quick-answers-heading"
                 className="text-sm sm:text-base font-semibold text-white font-display"
               >
-                Помощник терминала и быстрые ответы
+                Помощник и Справочник функций
               </h2>
               <p className="text-xs text-slate-400">
-                Чат-бот на базе Gemini · подсказки по поиску, колонкам, алертам, 2FA и PRO
+                Постоянная инструкция по всем модулям, AI-чат Gemini и быстрый FAQ
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
-            {/* Segmented Switch: Gemini Chat | Static FAQ */}
+            {/* Segmented Switch: Permanent Manual | Gemini Chat | Static FAQ */}
             <div
               role="tablist"
               aria-label="Режим справки"
@@ -282,9 +290,28 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
               <button
                 type="button"
                 role="tab"
+                aria-selected={mode === 'manual'}
+                onClick={() => setMode('manual')}
+                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                  mode === 'manual' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {mode === 'manual' && (
+                  <motion.span
+                    layoutId="quick-help-mode-pill"
+                    transition={NATIVE_PILL_SPRING}
+                    className="absolute inset-0 rounded-lg bg-emerald-600/90"
+                  />
+                )}
+                <BookOpen className="w-3.5 h-3.5 relative z-10 shrink-0" />
+                <span className="relative z-10">Справочник</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
                 aria-selected={mode === 'chat'}
                 onClick={() => setMode('chat')}
-                className={`relative min-h-[32px] px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
                   mode === 'chat' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
@@ -296,14 +323,14 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
                   />
                 )}
                 <Bot className="w-3.5 h-3.5 relative z-10 shrink-0" />
-                <span className="relative z-10">Чат Gemini</span>
+                <span className="relative z-10">Чат</span>
               </button>
               <button
                 type="button"
                 role="tab"
                 aria-selected={mode === 'faq'}
                 onClick={() => setMode('faq')}
-                className={`relative min-h-[32px] px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
                   mode === 'faq' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
@@ -352,7 +379,17 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
 
         {/* Mode Content */}
         <AnimatePresence mode="wait" initial={false}>
-        {mode === 'chat' ? (
+        {mode === 'manual' ? (
+          <motion.div
+            key="quick-mode-manual"
+            initial={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -4 }}
+            transition={{ duration: 0.16, ease: TERMINAL_EASE }}
+          >
+            <PermanentFeaturesManual />
+          </motion.div>
+        ) : mode === 'chat' ? (
           <motion.div
             key="quick-mode-chat"
             initial={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: 6 }}

@@ -1,23 +1,50 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
+  ArrowLeft,
   Bell,
   BellOff,
   BellRing,
   CheckCircle2,
+  ChevronRight,
+  Clock,
   Copy,
+  Crown,
+  Download,
+  Eye,
+  EyeOff,
   FileClock,
+  FileText,
   Flame,
   Globe2,
   KeyRound,
+  Link2,
   Lock,
+  Moon,
+  Palette,
+  PauseCircle,
+  RefreshCw,
+  Repeat,
+  Scale,
   Send,
   ShieldAlert,
   ShieldCheck,
+  Sliders,
+  Trash2,
+  TrendingUp,
+  Webhook,
+  Wrench,
 } from 'lucide-react';
 import { motion } from 'motion/react';
+import type { PortfolioSourceMeta } from '../hooks/usePaperPortfolio';
 import type { PushPreferences } from '../hooks/usePushNotifications';
 import type {
+  ExchangeId,
+  ExchangeKeyPermissions,
+  ExchangeKeyRecord,
+  ExchangeOrderResult,
+  ExchangeSyncResult,
   MarketType,
   PriceAlertCondition,
   PriceAlertRecord,
@@ -27,15 +54,56 @@ import type {
   UserSessionRecord,
 } from '../types/domain';
 import { ActiveSessionsPanel } from './ActiveSessionsPanel';
-import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
+import { EditExchangeKeyModal } from './EditExchangeKeyModal';
+import { ExchangeIntegrationPanel } from './ExchangeIntegrationPanel';
+import { FeatureGuide } from './FeatureGuide';
+import { StaggerDeck } from './MotionPrimitives';
 import { PriceAlertsPanel } from './PriceAlertsPanel';
 import { SecurityAuditActivityChart } from './SecurityAuditActivityChart';
 import { SecurityFaqSection } from './SecurityFaqSection';
 import { SecurityStrengthIndicator } from './SecurityStrengthIndicator';
 import { SessionGeoMapPanel } from './SessionGeoMapPanel';
+import { TiltGuardPanel } from './TiltGuardPanel';
+import { WebhookBuilderModal } from './WebhookBuilderModal';
 import { authFetch } from '../lib/authFetch';
+import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
+import {
+  getExchangeSyncQuickFix,
+  groupConsecutiveBackgroundSyncErrors,
+  type ExchangeSyncErrorCategory,
+  type ExchangeSyncErrorLogEntry,
+  type ExchangeSyncQuickFixActionType,
+  type ExchangeSyncSeverity,
+} from '../lib/exchangeSyncErrorLog';
+import {
+  exportAllUserDataJson,
+  readLocalReadOnlyKeys,
+  writeLocalReadOnlyKeys,
+  type DemoPlanOverride,
+  type LegalConsentRecord,
+  type LocalReadOnlyExchangeKey,
+  type ThemeMode,
+} from '../lib/localDemoStore';
+import {
+  DLP_WARNING_MESSAGE,
+  detectSensitiveWalletInput,
+  encryptLocalSecret,
+  sanitizePlainText,
+  triggerHaptic,
+} from '../lib/securityDlp';
+import type { LegalDocKind } from './LegalConsentModal';
 
-export type SecuritySection = 'meter' | '2fa' | 'push' | 'alerts' | 'sessions' | 'audit';
+export type SecuritySection =
+  | 'meter'
+  | 'settings'
+  | '2fa'
+  | 'exchanges'
+  | 'push'
+  | 'alerts'
+  | 'sessions'
+  | 'legal'
+  | 'audit'
+  | 'tilt';
 
 export interface PushControlState {
   isSupported: boolean;
@@ -88,7 +156,64 @@ interface SecurityCenterViewProps {
     alertsSent: number;
     triggeredCount: number;
   }>;
+  exchangeKeys: ExchangeKeyRecord[];
+  exchangeSyncCache?: ExchangeSyncCacheMap;
+  backgroundSyncingKeyIds?: string[];
+  exchangeSyncErrorLogs?: ExchangeSyncErrorLogEntry[];
+  onClearExchangeSyncErrorLogs?: () => void;
+  portfolioSource: PortfolioSourceMeta;
+  onConnectExchange: (params: {
+    exchange: ExchangeId;
+    label: string;
+    apiKey: string;
+    apiSecret: string;
+    passphrase?: string;
+    permissions: ExchangeKeyPermissions;
+    testnet: boolean;
+  }) => Promise<{ key: ExchangeKeyRecord; sync: ExchangeSyncResult }>;
+  onSyncExchange: (key: ExchangeKeyRecord, applyToPortfolio: boolean) => Promise<ExchangeSyncResult>;
+  onUpdateExchange: (
+    existingKey: ExchangeKeyRecord,
+    params: {
+      label: string;
+      apiKey: string;
+      apiSecret: string;
+      passphrase?: string;
+      permissions: ExchangeKeyPermissions;
+      testnet: boolean;
+    }
+  ) => Promise<{ key: ExchangeKeyRecord; sync: ExchangeSyncResult }>;
+  onToggleExchange: (keyId: string, nextEnabled: boolean) => Promise<void>;
+  onDeleteExchange: (keyId: string) => Promise<void>;
+  onPlaceExchangeOrder: (
+    key: ExchangeKeyRecord,
+    orderParams: {
+      symbol: string;
+      marketType: MarketType;
+      side: 'BUY' | 'SELL';
+      orderType: 'MARKET' | 'LIMIT';
+      quantity: number;
+      limitPrice?: number;
+    }
+  ) => Promise<ExchangeOrderResult>;
   onStartTour?: () => void;
+  themeMode?: ThemeMode;
+  onChangeThemeMode?: (mode: ThemeMode) => void;
+  privacyMode?: boolean;
+  onTogglePrivacyMode?: () => void;
+  demoPlanOverride?: DemoPlanOverride | null;
+  onChangeDemoPlan?: (override: DemoPlanOverride | null) => void;
+  pinEnabled?: boolean;
+  pinTimeoutMin?: 0 | 1 | 5 | 15;
+  onSavePin?: (pin: string) => Promise<void>;
+  onDisablePin?: () => void;
+  onChangePinTimeout?: (mins: 0 | 1 | 5 | 15) => void;
+  antiPhishingCode?: string;
+  onSaveAntiPhishingCode?: (code: string) => void;
+  legalConsent?: LegalConsentRecord | null;
+  onRevokeConsent?: () => void;
+  onOpenLegalDoc?: (doc: LegalDocKind) => void;
+  onDeleteAccountAndAllData?: () => Promise<void>;
 }
 
 export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
@@ -114,11 +239,68 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   onTogglePriceAlert,
   onDeletePriceAlert,
   onCheckPriceAlertsNow,
+  exchangeKeys,
+  exchangeSyncCache,
+  backgroundSyncingKeyIds,
+  exchangeSyncErrorLogs = [],
+  onClearExchangeSyncErrorLogs,
+  portfolioSource,
+  onConnectExchange,
+  onSyncExchange,
+  onUpdateExchange,
+  onToggleExchange,
+  onDeleteExchange,
+  onPlaceExchangeOrder,
   onStartTour,
+  themeMode = 'emerald',
+  onChangeThemeMode,
+  privacyMode = false,
+  onTogglePrivacyMode,
+  demoPlanOverride = null,
+  onChangeDemoPlan,
+  pinEnabled = false,
+  pinTimeoutMin = 5,
+  onSavePin,
+  onDisablePin,
+  onChangePinTimeout,
+  antiPhishingCode = '',
+  onSaveAntiPhishingCode,
+  legalConsent = null,
+  onRevokeConsent,
+  onOpenLegalDoc,
+  onDeleteAccountAndAllData,
 }) => {
-  const [section, setSection] = useState<SecuritySection>('meter');
+  const [section, setSection] = useState<'hub' | SecuritySection>('hub');
   const [sessionsSub, setSessionsSub] = useState<'map' | 'list'>('map');
   const [auditSub, setAuditSub] = useState<'chart' | 'log' | 'faq'>('chart');
+  const [syncLogFilter, setSyncLogFilter] = useState<'all' | ExchangeSyncSeverity>('all');
+  const [editingExchangeKey, setEditingExchangeKey] = useState<ExchangeKeyRecord | null>(null);
+  const [quickFixBusyId, setQuickFixBusyId] = useState<string | null>(null);
+  const [quickFixNotice, setQuickFixNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
+
+  // Local PIN, Anti-Phishing, Local AES-GCM Read-Only Keys & 2-Step Account Deletion state
+  const [newPinInput, setNewPinInput] = useState('');
+  const [pinConfirmInput, setPinConfirmInput] = useState('');
+  const [pinStatusMsg, setPinStatusMsg] = useState<string | null>(null);
+  const [antiPhishingDraft, setAntiPhishingDraft] = useState(antiPhishingCode);
+  const [antiPhishingMsg, setAntiPhishingMsg] = useState<string | null>(null);
+  const [localKeys, setLocalKeys] = useState<LocalReadOnlyExchangeKey[]>(() => readLocalReadOnlyKeys());
+  const [localExch, setLocalExch] = useState<'binance' | 'bybit' | 'okx'>('binance');
+  const [localKeyLabel, setLocalKeyLabel] = useState('');
+  const [localApiKey, setLocalApiKey] = useState('');
+  const [localApiSecret, setLocalApiSecret] = useState('');
+  const [localKeyDlpError, setLocalKeyDlpError] = useState<string | null>(null);
+  const [localKeySavedNotice, setLocalKeySavedNotice] = useState<string | null>(null);
+  const [deleteStepOpen, setDeleteStepOpen] = useState(false);
+  const [deleteConfirmWord, setDeleteConfirmWord] = useState('');
+  const [deletingAll, setDeletingAll] = useState(false);
+  const [dataExportMsg, setDataExportMsg] = useState<string | null>(null);
+  const [webhookModalOpen, setWebhookModalOpen] = useState(false);
+
+  useEffect(() => {
+    setAntiPhishingDraft(antiPhishingCode);
+  }, [antiPhishingCode]);
 
   const [setupQr, setSetupQr] = useState<string | null>(null);
   const [manualKey, setManualKey] = useState<string | null>(null);
@@ -128,6 +310,13 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const [copiedCodes, setCopiedCodes] = useState(false);
   const [loadingSetup, setLoadingSetup] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (section !== 'audit' || auditSub !== 'log') return;
+    setNowTickMs(Date.now());
+    const id = window.setInterval(() => setNowTickMs(Date.now()), 15000);
+    return () => window.clearInterval(id);
+  }, [section, auditSub]);
 
   useEffect(() => {
     if (externalSection) {
@@ -239,49 +428,146 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
     setSection('2fa');
   };
 
-  const sectionTabs = useMemo(
-    () => [
-      { id: 'meter' as const, label: 'Индекс защиты', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" /> },
-      { id: '2fa' as const, label: '2FA и блокировка', icon: <KeyRound className="w-3.5 h-3.5 text-amber-400" /> },
-      { id: 'push' as const, label: 'Push-уведомления', icon: <Bell className="w-3.5 h-3.5 text-cyan-400" /> },
-      {
-        id: 'alerts' as const,
-        label: 'Ценовые алерты',
-        icon: <BellRing className="w-3.5 h-3.5 text-emerald-400" />,
-        meta: priceAlerts.filter((a) => a.active).length || undefined,
-      },
-      {
-        id: 'sessions' as const,
-        label: 'Сессии и карта',
-        icon: <Globe2 className="w-3.5 h-3.5 text-cyan-400" />,
-        meta: sessions.length || undefined,
-      },
-      {
-        id: 'audit' as const,
-        label: 'Журнал и справка',
-        icon: <FileClock className="w-3.5 h-3.5 text-slate-300" />,
-      },
-    ],
-    [priceAlerts, sessions.length]
+  const syncLogStats = useMemo(() => {
+    let success = 0;
+    let warning = 0;
+    let critical = 0;
+    for (const entry of exchangeSyncErrorLogs) {
+      if (entry.severity === 'success') success += 1;
+      else if (entry.severity === 'warning') warning += 1;
+      else critical += 1;
+    }
+    const groupedAll = groupConsecutiveBackgroundSyncErrors(exchangeSyncErrorLogs);
+    const total = exchangeSyncErrorLogs.length;
+    const groupedTotal = groupedAll.length;
+    const successPct = total > 0 ? (success / total) * 100 : 0;
+    const warningPct = total > 0 ? (warning / total) * 100 : 0;
+    const criticalPct = total > 0 ? (critical / total) * 100 : 0;
+    const filtered =
+      syncLogFilter === 'all'
+        ? groupedAll
+        : groupedAll.filter((group) => group.entry.severity === syncLogFilter);
+    const timeline = exchangeSyncErrorLogs.slice(0, 24).reverse();
+
+    return {
+      total,
+      groupedTotal,
+      success,
+      warning,
+      critical,
+      issues: warning + critical,
+      successPct,
+      warningPct,
+      criticalPct,
+      filtered,
+      timeline,
+    };
+  }, [exchangeSyncErrorLogs, syncLogFilter]);
+
+  // Компактный расчёт Индекса защиты (0–100%) и первого невыполненного шага для Hero-карточки
+  const securityHeroSummary = useMemo(() => {
+    const backupCount = privateSecurity?.backupCodeHashes?.length ?? 0;
+    const is2faOn = Boolean(isSignedIn && profile?.twoFactorEnabled);
+    const autoLockMins = profile?.autoLockMinutes ?? 15;
+    const criticalPushCount = [
+      pushState.preferences.notifyAuthLogins,
+      pushState.preferences.notifyStrategyChanges,
+      pushState.preferences.notifySignalLimits,
+    ].filter(Boolean).length;
+
+    let score = 0;
+    if (isSignedIn) score += 20;
+    if (is2faOn) score += 30;
+    if (is2faOn && backupCount > 0) score += 15;
+    if (is2faOn) score += autoLockMins <= 15 ? 15 : 7;
+    if (isSignedIn && pushState.isSubscribed) {
+      if (criticalPushCount === 3) score += 20;
+      else if (criticalPushCount > 0) score += 12;
+      else score += 6;
+    }
+
+    let nextActionLabel = 'Проверить индекс';
+    let nextSection: SecuritySection = 'meter';
+    let needsLogin = false;
+
+    if (!isSignedIn) {
+      nextActionLabel = 'Войти через Google';
+      needsLogin = true;
+    } else if (!is2faOn) {
+      nextActionLabel = 'Усилить защиту: 2FA';
+      nextSection = '2fa';
+    } else if (backupCount === 0) {
+      nextActionLabel = 'Усилить защиту: Коды';
+      nextSection = '2fa';
+    } else if (!pushState.isSubscribed || criticalPushCount < 3) {
+      nextActionLabel = 'Усилить защиту: Push';
+      nextSection = 'push';
+    } else if (!pinEnabled) {
+      nextActionLabel = 'Усилить защиту: PIN';
+      nextSection = 'settings';
+    } else {
+      nextActionLabel = 'Индекс защиты 100%';
+      nextSection = 'meter';
+    }
+
+    const levelLabel =
+      score >= 90
+        ? 'Максимальный'
+        : score >= 65
+          ? 'Высокий'
+          : score >= 35
+            ? 'Средний'
+            : 'Базовый';
+
+    const barClass =
+      score >= 65 ? 'bg-emerald-500' : score >= 35 ? 'bg-amber-400' : 'bg-rose-500';
+    const textClass =
+      score >= 65 ? 'text-emerald-400' : score >= 35 ? 'text-amber-300' : 'text-rose-400';
+
+    return { score, levelLabel, barClass, textClass, nextActionLabel, nextSection, needsLogin };
+  }, [isSignedIn, pinEnabled, privateSecurity, profile, pushState.isSubscribed, pushState.preferences]);
+
+  const connectedExchangeMeta = useMemo(() => {
+    const activeCloud = isSignedIn ? exchangeKeys.filter((k) => k.enabled) : [];
+    const totalCount = isSignedIn ? exchangeKeys.length : localKeys.length;
+    if (totalCount === 0) {
+      return { connected: false, label: 'Не подключено' };
+    }
+    const names = Array.from(
+      new Set(
+        isSignedIn
+          ? (activeCloud.length > 0 ? activeCloud : exchangeKeys).map((k) =>
+              k.exchange.toUpperCase()
+            )
+          : localKeys.map((k) => k.exchange.toUpperCase())
+      )
+    );
+    return {
+      connected: true,
+      label: names.slice(0, 2).join(' · ') + (names.length > 2 ? ` +${names.length - 2}` : ''),
+    };
+  }, [exchangeKeys, isSignedIn, localKeys]);
+
+  const activeAlertsCount = useMemo(
+    () => priceAlerts.filter((a) => a.active).length,
+    [priceAlerts]
   );
 
-  const sidebarBottom = (
-    <div className="space-y-1.5 text-xs font-mono tabular-nums">
-      <div className="flex items-center justify-between">
-        <span className="font-sans text-slate-400">2FA защита</span>
-        <span className={profile?.twoFactorEnabled ? 'text-emerald-400' : 'text-amber-300'}>
-          {profile?.twoFactorEnabled ? 'Вкл' : 'Выкл'}
-        </span>
-      </div>
-      <div className="flex items-center justify-between">
-        <span className="font-sans text-slate-400">Резерв. коды</span>
-        <span className="text-white">{privateSecurity?.backupCodeHashes?.length ?? 0} / 8</span>
-      </div>
-    </div>
-  );
+  const sectionMetaMap: Record<SecuritySection, { title: string; subtitle: string }> = {
+    meter: { title: 'Индекс защиты', subtitle: 'Детальный чек-лист безопасности профиля' },
+    exchanges: { title: 'Интеграция бирж', subtitle: 'Read-Only API · Шифрование AES-GCM' },
+    alerts: { title: 'Ценовые алерты и Webhook', subtitle: 'Триггеры цены, индикаторов и Telegram' },
+    tilt: { title: 'Анти-FOMO / Tilt-Guard', subtitle: 'Контроль лимитов потерь и дисциплины (MAX)' },
+    '2fa': { title: '2FA и резервные коды', subtitle: 'TOTP Google Authenticator и автоблокировка' },
+    settings: { title: 'PIN-код и антифишинг', subtitle: 'Локальный PIN SHA-256 и защита от фишинга' },
+    sessions: { title: 'Сессии и карта входов', subtitle: 'Активные устройства и геолокация' },
+    push: { title: 'Push-уведомления PWA', subtitle: 'Критические оповещения в реальном времени' },
+    legal: { title: 'Данные и Закон', subtitle: 'GDPR · Google Play · Закон Украины № 2297-VI' },
+    audit: { title: 'Логи, FAQ и обучение', subtitle: 'Журнал синхронизации, справка и тур' },
+  };
 
   const requireLoginCard = (title: string, desc: string) => (
-    <div className="rounded-2xl border border-white/8 bg-[#111827] p-8 text-center space-y-4">
+    <div className="rounded-2xl border border-white/8 bg-[#111827] p-6 sm:p-8 text-center space-y-4">
       <ShieldAlert className="w-10 h-10 text-amber-400 mx-auto" />
       <h2 className="text-lg font-semibold text-white">{title}</h2>
       <p className="text-sm text-slate-400 max-w-md mx-auto">{desc}</p>
@@ -295,26 +581,563 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
     </div>
   );
 
+  const openInnerSection = (target: SecuritySection) => {
+    triggerHaptic(8);
+    setSection(target);
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
   return (
     <StaggerDeck>
-      <WorkspaceShell
-        title="Безопасность"
-        subtitle={profile?.twoFactorEnabled ? 'TOTP 2FA активна' : 'Non-Custodial сейф'}
-        icon={
-          <img
-            src="/src/assets/images/terminal_icon_vault_1794855844198.jpg"
-            alt="Безопасность AegisQuant"
-            referrerPolicy="no-referrer"
-            className="w-8 h-8 rounded-lg object-cover border border-emerald-500/25"
+      {section === 'hub' ? (
+        <div className="max-w-3xl mx-auto space-y-4">
+          <FeatureGuide
+            title="Как работает Центр защиты (Non-Custodial)"
+            summary="VERNIER не принимает и не хранит ваши деньги. Здесь вы подключаете Read-Only/торговые API-ключи с шифрованием AES-GCM, настраиваете 2FA, PIN, Tilt-Guard и переключаете Demo Tier Switcher."
+            steps={[
+              'Интеграция бирж: добавляйте ключи строго без права вывода (No Withdraw). Каждая сделка через API требует ручного подтверждения ответственности.',
+              'Demo Tier Switcher: переключайте Free / PRO / MAX ×10 / MAX ×20 для бесплатного тестирования всех стратегий и модулей.',
+              'Безопасность доступа: включите 2FA, PIN-код и антифишинговый код для защиты вашего профиля.',
+            ]}
+            compact
           />
-        }
-        items={sectionTabs}
-        activeId={section}
-        onChange={setSection}
-        layoutId="security-workspace-nav"
-        accent="emerald"
-        sidebarBottomSlot={sidebarBottom}
-      >
+          {/* Top Compact Hero Card — Индекс защиты */}
+          <section
+            data-tour-id="tour-security-meter"
+            className="rounded-2xl border border-emerald-500/25 bg-[var(--surface-1)] card-surface-glow p-4 sm:p-5 space-y-3.5"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <img
+                  src="/src/assets/images/terminal_icon_vault_1794855844198.jpg"
+                  alt="Центр защиты VERNIER"
+                  referrerPolicy="no-referrer"
+                  className="w-11 h-11 rounded-xl object-cover border border-emerald-500/30 shrink-0"
+                />
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <h2 className="text-base sm:text-lg font-bold text-white leading-tight">
+                      Индекс защиты
+                    </h2>
+                    <span className={`text-xs font-semibold ${securityHeroSummary.textClass}`}>
+                      · {securityHeroSummary.levelLabel}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-xs text-slate-400 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={`inline-block w-2 h-2 rounded-full ${
+                        isSignedIn ? 'bg-emerald-400' : 'bg-amber-400'
+                      }`}
+                    />
+                    <span>
+                      {isSignedIn
+                        ? 'Google OAuth подключён · Non-Custodial'
+                        : 'Гостевой режим · Войдите через Google OAuth'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => openInnerSection('meter')}
+                className="text-right shrink-0 group"
+                aria-label="Открыть подробный чек-лист индекса защиты"
+              >
+                <div className={`text-2xl sm:text-3xl font-bold font-mono tabular-nums leading-none ${securityHeroSummary.textClass}`}>
+                  {securityHeroSummary.score}%
+                </div>
+                <div className="mt-1 text-[10px] text-slate-400 group-hover:text-emerald-300 transition-colors">
+                  Детали →
+                </div>
+              </button>
+            </div>
+
+            {/* Clean Progress Bar 0-100% */}
+            <div
+              role="progressbar"
+              aria-valuenow={securityHeroSummary.score}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label={`Индекс защиты: ${securityHeroSummary.score}%`}
+              className="h-2 w-full rounded-full bg-[var(--surface-0)] border border-white/8 overflow-hidden"
+            >
+              <div
+                style={{ width: `${Math.max(4, securityHeroSummary.score)}%` }}
+                className={`progress-bar-shine h-full rounded-full transition-all duration-500 ${securityHeroSummary.barClass}`}
+              />
+            </div>
+
+            {/* Single Primary Action CTA */}
+            <motion.button
+              type="button"
+              whileHover={{ scale: 1.01 }}
+              whileTap={{ scale: 0.97 }}
+              onClick={() => {
+                triggerHaptic(10);
+                if (securityHeroSummary.needsLogin) {
+                  onRequireLogin();
+                } else {
+                  openInnerSection(securityHeroSummary.nextSection);
+                }
+              }}
+              className="cta-shimmer w-full min-h-[42px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors"
+            >
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <span>{securityHeroSummary.nextActionLabel}</span>
+            </motion.button>
+          </section>
+
+          {/* SECTION 1 — Торговля и интеграции (самый верхний приоритет) */}
+          <section className="space-y-2">
+            <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-emerald-300/90">
+              Торговля и интеграции
+            </h3>
+            <div className="rounded-2xl border border-emerald-500/20 bg-[var(--surface-1)] divide-y divide-white/8 overflow-hidden">
+              {/* 1. Интеграция бирж — заметная карточка с акцентом */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('exchanges')}
+                className="w-full min-h-[64px] px-4 py-3.5 text-left flex items-center justify-between gap-3 bg-emerald-500/[0.06] hover:bg-emerald-500/[0.11] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-10 h-10 rounded-xl border border-emerald-500/35 bg-emerald-500/15 text-emerald-300 flex items-center justify-center shrink-0">
+                    <Link2 className="w-5 h-5" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-white leading-snug">
+                      Интеграция бирж
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Read-Only API · AES-GCM · Binance, OKX, Bybit
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-[11px] font-mono font-semibold border whitespace-nowrap ${
+                      connectedExchangeMeta.connected
+                        ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                        : 'border-white/12 bg-[var(--surface-0)] text-slate-400'
+                    }`}
+                  >
+                    {connectedExchangeMeta.label}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 2. Ценовые алерты и Webhook / Telegram */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('alerts')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-cyan-500/25 bg-cyan-500/10 text-cyan-300 flex items-center justify-center shrink-0">
+                    <BellRing className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Ценовые алерты и Webhook / Telegram
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Триггеры цены, Smart Alerts и JSON-вебхуки
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="px-2 py-0.5 rounded-lg text-[11px] font-mono tabular-nums border border-white/10 bg-[var(--surface-0)] text-slate-300">
+                    {activeAlertsCount > 0 ? `${activeAlertsCount} акт.` : '0 акт.'}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 3. Анти-FOMO / Tilt-Guard (MAX) */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('tilt')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-amber-500/25 bg-amber-500/10 text-amber-300 flex items-center justify-center shrink-0">
+                    <Flame className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Анти-FOMO / Tilt-Guard
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Дневной лимит потерь и таймер охлаждения
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-mono font-bold border border-cyan-400/35 bg-cyan-500/12 text-cyan-300">
+                    MAX
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+            </div>
+          </section>
+
+          {/* SECTION 2 — Безопасность доступа */}
+          <section className="space-y-2">
+            <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              Безопасность доступа
+            </h3>
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface-1)] divide-y divide-white/8 overflow-hidden">
+              {/* 1. 2FA и резервные коды */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('2fa')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-amber-500/25 bg-amber-500/10 text-amber-300 flex items-center justify-center shrink-0">
+                    <KeyRound className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      2FA и резервные коды
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      TOTP Google Authenticator · {privateSecurity?.backupCodeHashes?.length ?? 0}/8 кодов
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-[11px] font-mono font-semibold border ${
+                      profile?.twoFactorEnabled
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-white/10 bg-[var(--surface-0)] text-slate-400'
+                    }`}
+                  >
+                    {profile?.twoFactorEnabled ? 'Вкл' : 'Выкл'}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 2. PIN-код, автоблокировка и антифишинг */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('settings')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-emerald-500/25 bg-emerald-500/10 text-emerald-300 flex items-center justify-center shrink-0">
+                    <Lock className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      PIN-код, автоблокировка и антифишинг
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      {antiPhishingCode ? `Код: ${antiPhishingCode}` : '4-значный PIN SHA-256 и секретный код'}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-[11px] font-mono font-semibold border whitespace-nowrap ${
+                      pinEnabled
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-white/10 bg-[var(--surface-0)] text-slate-400'
+                    }`}
+                  >
+                    {pinEnabled ? (pinTimeoutMin > 0 ? `${pinTimeoutMin} мин` : 'Вкл') : 'Выкл'}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 3. Сессии и карта входов */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('sessions')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-cyan-500/25 bg-cyan-500/10 text-cyan-300 flex items-center justify-center shrink-0">
+                    <Globe2 className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Сессии и карта входов
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Контроль устройств и завершение чужих сессий
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="px-2 py-0.5 rounded-lg text-[11px] font-mono tabular-nums border border-white/10 bg-[var(--surface-0)] text-slate-300">
+                    {sessions.length || 1} устр.
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 4. Push-уведомления PWA */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('push')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-emerald-500/25 bg-emerald-500/10 text-emerald-300 flex items-center justify-center shrink-0">
+                    <Bell className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Push-уведомления PWA
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Оповещения о входах, сигналах и лимитах
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-[11px] font-mono font-semibold border ${
+                      pushState.isSubscribed
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-white/10 bg-[var(--surface-0)] text-slate-400'
+                    }`}
+                  >
+                    {pushState.isSubscribed ? 'Вкл' : 'Выкл'}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+            </div>
+          </section>
+
+          {/* SECTION 3 — Интерфейс и демо-режим (прямо в Хабе, без лишних экранов) */}
+          <section className="space-y-2">
+            <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              Интерфейс и демо-режим
+            </h3>
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface-1)] divide-y divide-white/8 overflow-hidden">
+              {/* Quick Toggle: Режим приватности */}
+              <div className="px-4 py-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-amber-500/25 bg-amber-500/10 text-amber-300 flex items-center justify-center shrink-0">
+                    {privacyMode ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Режим приватности
+                    </div>
+                    <div className="text-xs text-slate-400">
+                      Скрывает суммы и PnL маской •••••
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={privacyMode}
+                  aria-label="Переключить режим приватности"
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onTogglePrivacyMode?.();
+                  }}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                    privacyMode ? 'border-amber-400/60 bg-amber-500' : 'border-white/15 bg-white/10'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                      privacyMode ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Quick Toggle: Pure OLED Black */}
+              <div className="px-4 py-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-emerald-500/25 bg-emerald-500/10 text-emerald-300 flex items-center justify-center shrink-0">
+                    <Moon className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Тема Pure OLED Black
+                    </div>
+                    <div className="text-xs text-slate-400">
+                      {themeMode === 'oled'
+                        ? 'Активен #000000 (максимум контраста)'
+                        : 'Активна фирменная Emerald Dark'}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={themeMode === 'oled'}
+                  aria-label="Переключить тему Pure OLED Black"
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onChangeThemeMode?.(themeMode === 'oled' ? 'emerald' : 'oled');
+                  }}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                    themeMode === 'oled'
+                      ? 'border-emerald-400/60 bg-emerald-500'
+                      : 'border-white/15 bg-white/10'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                      themeMode === 'oled' ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Inline Demo Tier Switcher */}
+              {onChangeDemoPlan && (
+                <div className="px-4 py-3.5 space-y-2.5 bg-amber-500/[0.03]">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                      <Crown className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>Тест-режим тарифа</span>
+                    </div>
+                    {demoPlanOverride && (
+                      <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-400/40">
+                        ДЕМО: {demoPlanOverride.tier.toUpperCase()}
+                        {demoPlanOverride.tier === 'max' ? ` ×${demoPlanOverride.maxMultiplier}` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5">
+                    {(
+                      [
+                        { id: 'real', label: 'Реальный', override: null as DemoPlanOverride | null },
+                        { id: 'free', label: 'Free', override: { tier: 'free', maxMultiplier: 10 } as DemoPlanOverride },
+                        { id: 'pro', label: 'PRO', override: { tier: 'pro', maxMultiplier: 10 } as DemoPlanOverride },
+                        { id: 'max10', label: 'MAX ×10', override: { tier: 'max', maxMultiplier: 10 } as DemoPlanOverride },
+                        { id: 'max20', label: 'MAX ×20', override: { tier: 'max', maxMultiplier: 20 } as DemoPlanOverride },
+                      ] as const
+                    ).map((opt) => {
+                      const isActive =
+                        opt.override === null
+                          ? demoPlanOverride === null
+                          : demoPlanOverride?.tier === opt.override.tier &&
+                            (opt.override.tier !== 'max' ||
+                              demoPlanOverride.maxMultiplier === opt.override.maxMultiplier);
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic(10);
+                            onChangeDemoPlan(opt.override);
+                          }}
+                          className={`min-h-[36px] px-2 rounded-xl border text-[11px] font-semibold transition-all whitespace-nowrap ${
+                            isActive
+                              ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                              : 'border-white/10 bg-[var(--surface-0)] text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* SECTION 4 — Данные, закон и логи */}
+          <section className="space-y-2">
+            <h3 className="px-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              Данные, закон и логи
+            </h3>
+            <div className="rounded-2xl border border-white/10 bg-[var(--surface-1)] divide-y divide-white/8 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => openInnerSection('legal')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-emerald-500/25 bg-emerald-500/10 text-emerald-300 flex items-center justify-center shrink-0">
+                    <Scale className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Данные и Закон
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      GDPR · Google Play · Закон Украины № 2297-VI
+                    </div>
+                  </div>
+                </div>
+                <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openInnerSection('audit')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-white/12 bg-white/5 text-slate-300 flex items-center justify-center shrink-0">
+                    <FileClock className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Логи активности, FAQ и обучение
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Журнал безопасности, ответы и интерактивный тур
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {syncLogStats.issues > 0 && (
+                    <span className="px-2 py-0.5 rounded-lg text-[11px] font-mono tabular-nums border border-amber-500/35 bg-amber-500/15 text-amber-300">
+                      {syncLogStats.issues}
+                    </span>
+                  )}
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : (
+        <div className="max-w-4xl mx-auto space-y-4">
+          {/* Sticky Inner Sub-Screen Header */}
+          <div className="sticky top-[56px] z-20 -mx-1 px-3 py-2.5 rounded-2xl border border-emerald-500/20 bg-[var(--surface-1)]/95 backdrop-blur-md flex items-center justify-between gap-3 shadow-lg shadow-black/30">
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setSection('hub');
+              }}
+              className="min-h-[38px] px-3 rounded-xl border border-white/10 bg-[var(--surface-0)] hover:border-emerald-500/40 text-xs font-semibold text-emerald-300 inline-flex items-center gap-1.5 shrink-0 transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4 shrink-0" />
+              <span>Назад к Защите</span>
+            </button>
+            <div className="min-w-0 text-right">
+              <div className="text-xs sm:text-sm font-bold text-white truncate">
+                {sectionMetaMap[section].title}
+              </div>
+              <div className="text-[11px] text-slate-400 truncate hidden sm:block">
+                {sectionMetaMap[section].subtitle}
+              </div>
+            </div>
+          </div>
+
         {section === 'meter' && (
           <SecurityStrengthIndicator
             isSignedIn={isSignedIn}
@@ -325,6 +1148,326 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             onRequireLogin={onRequireLogin}
             onJumpToSection={handleJumpToSection}
           />
+        )}
+
+        {section === 'tilt' && <TiltGuardPanel />}
+
+        {section === 'settings' && (
+          <div className="space-y-4">
+            {/* Theme & Privacy Mode */}
+            <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                    <Palette className="w-4 h-4 text-emerald-400" />
+                    <span>Оформление и Приватность</span>
+                  </h2>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    3-уровневая изумрудная палитра или Pure OLED Black для экономии батареи.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onChangeThemeMode?.('emerald');
+                  }}
+                  className={`min-h-[54px] px-3.5 py-2.5 rounded-xl border text-left flex items-center justify-between transition-colors ${
+                    themeMode === 'emerald'
+                      ? 'border-emerald-400/50 bg-emerald-500/12 text-white'
+                      : 'border-white/10 bg-[#0B0F17] text-slate-300 hover:border-white/20'
+                  }`}
+                >
+                  <div>
+                    <div className="text-xs font-semibold">Emerald Dark (Фирменная)</div>
+                    <div className="text-[11px] font-mono text-slate-400">#071010 / #0E1C1C / #152828</div>
+                  </div>
+                  <span className="w-4 h-4 rounded-full bg-emerald-500 border border-emerald-200/40 shrink-0" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onChangeThemeMode?.('oled');
+                  }}
+                  className={`min-h-[54px] px-3.5 py-2.5 rounded-xl border text-left flex items-center justify-between transition-colors ${
+                    themeMode === 'oled'
+                      ? 'border-emerald-400/50 bg-black text-white'
+                      : 'border-white/10 bg-[#0B0F17] text-slate-300 hover:border-white/20'
+                  }`}
+                >
+                  <div>
+                    <div className="text-xs font-semibold flex items-center gap-1.5">
+                      <Moon className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Pure OLED Black</span>
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-400">#000000 · Макс. контраст</div>
+                  </div>
+                  <span className="w-4 h-4 rounded-full bg-black border border-white/30 shrink-0" />
+                </button>
+              </div>
+
+              <div className="rounded-xl border border-white/8 bg-[#0B0F17] p-3.5 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-white flex items-center gap-1.5">
+                    {privacyMode ? (
+                      <EyeOff className="w-3.5 h-3.5 text-amber-400" />
+                    ) : (
+                      <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                    )}
+                    <span>Режим приватности (Privacy Mode)</span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-400">
+                    Мгновенно скрывает баланс портфеля и суммы сделок маской ••••• в общественных местах.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={privacyMode}
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onTogglePrivacyMode?.();
+                  }}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                    privacyMode ? 'border-amber-400/60 bg-amber-500' : 'border-white/15 bg-white/10'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                      privacyMode ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            {/* Demo Tier Switcher */}
+            {onChangeDemoPlan && (
+              <div className="rounded-2xl border border-amber-500/30 bg-gradient-to-b from-amber-500/[0.06] to-[#111827] p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                      <Crown className="w-4 h-4 text-amber-400" />
+                      <span>Тест-режим тарифа (Demo Tier Switcher)</span>
+                    </h3>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      Мгновенно переключайте уровень подписки для проверки всех функций Free, PRO, MAX X10 и MAX X20 без оплаты.
+                    </p>
+                  </div>
+                  {demoPlanOverride && (
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-mono font-bold bg-amber-500/20 text-amber-200 border border-amber-400/40">
+                      ДЕМО: {demoPlanOverride.tier.toUpperCase()}
+                      {demoPlanOverride.tier === 'max' ? ` ×${demoPlanOverride.maxMultiplier}` : ''}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  {(
+                    [
+                      { id: 'real', label: 'Реальный', override: null as DemoPlanOverride | null },
+                      { id: 'free', label: 'Free', override: { tier: 'free', maxMultiplier: 10 } as DemoPlanOverride },
+                      { id: 'pro', label: 'PRO', override: { tier: 'pro', maxMultiplier: 10 } as DemoPlanOverride },
+                      { id: 'max10', label: 'MAX X10', override: { tier: 'max', maxMultiplier: 10 } as DemoPlanOverride },
+                      { id: 'max20', label: 'MAX X20', override: { tier: 'max', maxMultiplier: 20 } as DemoPlanOverride },
+                    ] as const
+                  ).map((opt) => {
+                    const isActive =
+                      opt.override === null
+                        ? demoPlanOverride === null
+                        : demoPlanOverride?.tier === opt.override.tier &&
+                          (opt.override.tier !== 'max' ||
+                            demoPlanOverride.maxMultiplier === opt.override.maxMultiplier);
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic(12);
+                          onChangeDemoPlan(opt.override);
+                        }}
+                        className={`min-h-[38px] px-2.5 rounded-xl border text-xs font-semibold transition-all ${
+                          isActive
+                            ? 'border-emerald-400/60 bg-emerald-500/20 text-emerald-200'
+                            : 'border-white/10 bg-[#0B0F17] text-slate-300 hover:text-white'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* MAX #6: Анти-FOMO / Tilt-Guard */}
+            <TiltGuardPanel />
+
+            {/* 4-Digit PIN App Lock & Anti-Phishing Code */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="rounded-2xl border border-white/8 bg-[#111827] p-5 space-y-3.5">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                    <Lock className="w-4 h-4 text-emerald-400" />
+                    <span>PIN-блокировка терминала (4 цифры)</span>
+                  </h3>
+                  <span
+                    className={`text-[11px] font-mono font-semibold ${
+                      pinEnabled ? 'text-emerald-400' : 'text-slate-500'
+                    }`}
+                  >
+                    {pinEnabled ? 'Активен' : 'Выкл'}
+                  </span>
+                </div>
+
+                <p className="text-xs text-slate-400">
+                  Локальный 4-значный PIN-код (SHA-256) защищает доступ к терминалу при сворачивании или простое.
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={4}
+                    value={newPinInput}
+                    onChange={(e) => setNewPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="Новый PIN (4 цифры)"
+                    aria-label="Новый 4-значный PIN"
+                    className="w-full min-h-[42px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono tracking-widest placeholder:font-sans placeholder:tracking-normal text-white focus:border-emerald-500 focus:outline-none"
+                  />
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={4}
+                    value={pinConfirmInput}
+                    onChange={(e) => setPinConfirmInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="Повторите PIN"
+                    aria-label="Повторите 4-значный PIN"
+                    className="w-full min-h-[42px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono tracking-widest placeholder:font-sans placeholder:tracking-normal text-white focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
+
+                {pinStatusMsg && <div className="text-xs text-emerald-300">{pinStatusMsg}</div>}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (newPinInput.length !== 4) {
+                        setPinStatusMsg('PIN должен состоять ровно из 4 цифр.');
+                        return;
+                      }
+                      if (newPinInput !== pinConfirmInput) {
+                        setPinStatusMsg('Введённые PIN-коды не совпадают.');
+                        return;
+                      }
+                      triggerHaptic(12);
+                      await onSavePin?.(newPinInput);
+                      setNewPinInput('');
+                      setPinConfirmInput('');
+                      setPinStatusMsg('PIN-код успешно сохранён (SHA-256).');
+                    }}
+                    className="min-h-[36px] px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
+                  >
+                    {pinEnabled ? 'Обновить PIN' : 'Установить PIN'}
+                  </button>
+
+                  {pinEnabled && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic(10);
+                          onLockNow();
+                        }}
+                        className="min-h-[36px] px-3 rounded-xl border border-white/12 bg-white/5 hover:bg-white/10 text-xs text-white"
+                      >
+                        Заблокировать сейчас
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onDisablePin?.();
+                          setPinStatusMsg('PIN-блокировка отключена.');
+                        }}
+                        className="min-h-[36px] px-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-xs text-rose-300"
+                      >
+                        Сбросить
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <div className="pt-2 border-t border-white/8 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="text-slate-400">Таймер автоблокировки:</span>
+                  <div className="inline-flex items-center gap-1 rounded-lg bg-[#0B0F17] p-0.5 border border-white/10">
+                    {([0, 1, 5, 15] as const).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => onChangePinTimeout?.(m)}
+                        className={`min-h-[30px] px-2.5 rounded-md text-[11px] font-medium whitespace-nowrap transition-colors ${
+                          pinTimeoutMin === m ? 'bg-emerald-500/25 text-emerald-200' : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {m === 0 ? 'Выкл' : `${m} мин`}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Anti-Phishing Code */}
+              <div className="rounded-2xl border border-white/8 bg-[#111827] p-5 space-y-3.5">
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                  <span>Антифишинговый код</span>
+                </h3>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Задайте секретное слово — оно отображается в шапке терминала и на экране PIN-блокировки, подтверждая подлинность интерфейса VERNIER.
+                </p>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    maxLength={24}
+                    value={antiPhishingDraft}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const dlp = detectSensitiveWalletInput(val);
+                      if (dlp.blocked) {
+                        setAntiPhishingMsg(DLP_WARNING_MESSAGE);
+                        return;
+                      }
+                      setAntiPhishingMsg(null);
+                      setAntiPhishingDraft(val);
+                    }}
+                    placeholder="Например: KYIV-EMERALD-77"
+                    className="flex-1 min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-cyan-500 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const clean = sanitizePlainText(antiPhishingDraft, 24);
+                      onSaveAntiPhishingCode?.(clean);
+                      setAntiPhishingMsg(clean ? `Код «${clean}» активирован.` : 'Антифишинговый код очищен.');
+                      triggerHaptic(10);
+                    }}
+                    className="min-h-[38px] px-3.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shrink-0"
+                  >
+                    Сохранить
+                  </button>
+                </div>
+
+                {antiPhishingMsg && <div className="text-xs text-cyan-300">{antiPhishingMsg}</div>}
+              </div>
+            </div>
+          </div>
         )}
 
         {section === '2fa' && (
@@ -482,6 +1625,175 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             )
         )}
 
+        {section === 'exchanges' && (
+          !isSignedIn || !profile ? (
+            <div className="space-y-4">
+              <div className="rounded-2xl border border-emerald-500/30 bg-[#111827] p-5 space-y-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/35 text-emerald-300 text-[11px] font-semibold mb-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>Read-Only · Без прав Trade и Withdraw</span>
+                    </div>
+                    <h2 className="text-base font-semibold text-white">
+                      Локальное хранилище API-ключей (Web Crypto AES-GCM)
+                    </h2>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      Работает в локальном режиме без входа. Ключи шифруются на устройстве через AES-256-GCM; ввод Seed-фраз и приватных ключей заблокирован DLP-фильтром.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onRequireLogin}
+                    className="min-h-[36px] px-3 rounded-xl border border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-200 text-xs font-semibold shrink-0"
+                  >
+                    Войти для облачной синхронизации
+                  </button>
+                </div>
+
+                {localKeyDlpError && (
+                  <div className="rounded-xl border border-rose-500/45 bg-rose-500/15 p-3 text-xs text-rose-200 flex items-start gap-2">
+                    <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                    <span>{localKeyDlpError}</span>
+                  </div>
+                )}
+
+                {localKeySavedNotice && (
+                  <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/12 p-3 text-xs text-emerald-200">
+                    {localKeySavedNotice}
+                  </div>
+                )}
+
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    setLocalKeyDlpError(null);
+                    setLocalKeySavedNotice(null);
+                    const combined = `${localKeyLabel} ${localApiKey} ${localApiSecret}`;
+                    if (detectSensitiveWalletInput(combined).blocked) {
+                      setLocalKeyDlpError(DLP_WARNING_MESSAGE);
+                      setLocalApiKey('');
+                      setLocalApiSecret('');
+                      return;
+                    }
+                    if (!localApiKey.trim() || !localApiSecret.trim()) {
+                      setLocalKeyDlpError('Заполните API Key и API Secret (только Read-Only).');
+                      return;
+                    }
+                    const encryptedPayload = await encryptLocalSecret(
+                      JSON.stringify({ apiKey: localApiKey.trim(), apiSecret: localApiSecret.trim() })
+                    );
+                    const nextItem: LocalReadOnlyExchangeKey = {
+                      id: `lkey_${Date.now()}`,
+                      exchange: localExch,
+                      label: sanitizePlainText(localKeyLabel || `${localExch.toUpperCase()} Read-Only`, 40),
+                      maskedKey: `${localApiKey.trim().slice(0, 4)}••••${localApiKey.trim().slice(-4)}`,
+                      encryptedPayload,
+                      readOnlyVerified: true,
+                      createdAt: new Date().toISOString(),
+                    };
+                    const nextList = [nextItem, ...localKeys];
+                    setLocalKeys(nextList);
+                    writeLocalReadOnlyKeys(nextList);
+                    setLocalKeyLabel('');
+                    setLocalApiKey('');
+                    setLocalApiSecret('');
+                    setLocalKeySavedNotice('Ключ зашифрован AES-256-GCM и сохранён локально с меткой Read-Only.');
+                    triggerHaptic(12);
+                  }}
+                  className="grid grid-cols-1 sm:grid-cols-2 gap-2.5"
+                >
+                  <select
+                    value={localExch}
+                    onChange={(e) => setLocalExch(e.target.value as 'binance' | 'bybit' | 'okx')}
+                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
+                  >
+                    <option value="binance">Binance (Read-Only)</option>
+                    <option value="bybit">Bybit (Read-Only)</option>
+                    <option value="okx">OKX (Read-Only)</option>
+                  </select>
+                  <input
+                    type="text"
+                    value={localKeyLabel}
+                    onChange={(e) => setLocalKeyLabel(e.target.value)}
+                    placeholder="Название ключа (напр. Спот-аналитика)"
+                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
+                  />
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={localApiKey}
+                    onChange={(e) => setLocalApiKey(e.target.value)}
+                    placeholder="API Key (маскируется ••••)"
+                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
+                  />
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={localApiSecret}
+                    onChange={(e) => setLocalApiSecret(e.target.value)}
+                    placeholder="API Secret (маскируется ••••)"
+                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
+                  />
+                  <button
+                    type="submit"
+                    className="sm:col-span-2 min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
+                  >
+                    Зашифровать и сохранить локально (AES-GCM Read-Only)
+                  </button>
+                </form>
+
+                {localKeys.length > 0 && (
+                  <div className="space-y-2 pt-2 border-t border-white/8">
+                    {localKeys.map((k) => (
+                      <div
+                        key={k.id}
+                        className="rounded-xl border border-white/8 bg-[#0B0F17] px-3.5 py-2.5 flex items-center justify-between gap-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-semibold text-white flex items-center gap-2">
+                            <span className="uppercase text-emerald-300">{k.exchange}</span>
+                            <span className="truncate">{k.label}</span>
+                          </div>
+                          <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+                            {k.maskedKey} · AES-GCM · Read-Only
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const updated = localKeys.filter((item) => item.id !== k.id);
+                            setLocalKeys(updated);
+                            writeLocalReadOnlyKeys(updated);
+                          }}
+                          aria-label="Удалить локальный ключ"
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-500/10"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <ExchangeIntegrationPanel
+              exchangeKeys={exchangeKeys}
+              exchangeSyncCache={exchangeSyncCache}
+              backgroundSyncingKeyIds={backgroundSyncingKeyIds}
+              activePortfolioMode={portfolioSource.mode}
+              activePortfolioExchange={portfolioSource.exchange}
+              onConnectExchange={onConnectExchange}
+              onSyncExchange={onSyncExchange}
+              onEditKey={(key) => setEditingExchangeKey(key)}
+              onToggleExchange={onToggleExchange}
+              onDeleteExchange={onDeleteExchange}
+              onPlaceOrder={onPlaceExchangeOrder}
+            />
+          )
+        )}
+
         {section === 'push' && (
           !isSignedIn || !profile
             ? requireLoginCard(
@@ -612,6 +1924,89 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                   )}
                 </div>
 
+                {/* Dedicated Portfolio Daily PnL Threshold Toggle */}
+                <div
+                  className={`rounded-xl border p-3.5 transition-colors space-y-2.5 ${
+                    pushState.preferences.notifyPortfolioPnl
+                      ? 'border-emerald-500/40 bg-emerald-500/8'
+                      : 'border-white/8 bg-[#0B0F17]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <TrendingUp
+                        className={`w-4 h-4 mt-0.5 shrink-0 ${
+                          pushState.preferences.notifyPortfolioPnl ? 'text-emerald-400' : 'text-slate-500'
+                        }`}
+                      />
+                      <div className="min-w-0">
+                        <div className="text-xs sm:text-sm font-semibold text-white">
+                          PnL и цели доходности портфеля (±{pushState.preferences.portfolioPnlThresholdPct}% / Target PnL)
+                        </div>
+                        <p className="mt-0.5 text-[11px] text-slate-400 leading-relaxed">
+                          Push-оповещение при изменении баланса за 24 часа сверх порога и при достижении заданной целевой доходности портфеля.
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={pushState.preferences.notifyPortfolioPnl}
+                      aria-label="Переключить уведомления о дневном PnL портфеля"
+                      disabled={!pushState.isSupported || pushState.loading}
+                      onClick={() =>
+                        void pushState.updatePreferences({
+                          ...pushState.preferences,
+                          notifyPortfolioPnl: !pushState.preferences.notifyPortfolioPnl,
+                        })
+                      }
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors disabled:opacity-50 ${
+                        pushState.preferences.notifyPortfolioPnl
+                          ? 'border-emerald-400/60 bg-emerald-500'
+                          : 'border-white/15 bg-white/10'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                          pushState.preferences.notifyPortfolioPnl ? 'translate-x-5' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {pushState.preferences.notifyPortfolioPnl && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/8">
+                      <span className="text-[11px] text-slate-400">Порог дневного PnL:</span>
+                      <div className="inline-flex items-center gap-1 rounded-lg bg-[#0B0F17] p-0.5 border border-white/10">
+                        {[3, 5, 10].map((pct) => {
+                          const active = pushState.preferences.portfolioPnlThresholdPct === pct;
+                          return (
+                            <button
+                              key={pct}
+                              type="button"
+                              disabled={!pushState.isSupported || pushState.loading}
+                              onClick={() =>
+                                void pushState.updatePreferences({
+                                  ...pushState.preferences,
+                                  portfolioPnlThresholdPct: pct,
+                                })
+                              }
+                              className={`min-h-[28px] px-2.5 rounded-md text-[11px] font-mono font-semibold transition-colors whitespace-nowrap ${
+                                active
+                                  ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/40'
+                                  : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              ±{pct}%
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                   {(
                     [
@@ -708,22 +2103,53 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
         )}
 
         {section === 'alerts' && (
-          !isSignedIn || !profile
-            ? requireLoginCard(
-                'Авторизуйтесь для настройки ценовых алертов',
-                'Задавайте целевые уровни цены и получайте Push-оповещения при достижении цели.'
-              )
-            : (
-              <PriceAlertsPanel
-                alerts={priceAlerts}
-                pushSubscribed={pushState.isSubscribed}
-                onJumpToPushSettings={() => setSection('push')}
-                onCreateAlert={onCreatePriceAlert}
-                onToggleAlert={onTogglePriceAlert}
-                onDeleteAlert={onDeletePriceAlert}
-                onCheckNow={onCheckPriceAlertsNow}
-              />
-            )
+          <div className="space-y-3">
+            {(!isSignedIn || !profile) && (
+              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-100">
+                <span>
+                  <strong>Локальное хранение</strong> • Ценовые алерты работают в демо-режиме прямо в браузере. Войдите для облачной синхронизации и Push.
+                </span>
+                <button
+                  type="button"
+                  onClick={onRequireLogin}
+                  className="font-semibold text-emerald-300 hover:underline whitespace-nowrap"
+                >
+                  Войти через Google →
+                </button>
+              </div>
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-cyan-500/25 bg-cyan-500/[0.06] px-3.5 py-2.5 text-xs">
+              <span className="text-slate-200">
+                <strong className="text-cyan-200">Webhook / Telegram-сигналы (MAX):</strong> автоматическая отправка JSON-уведомлений в бота при срабатывании алертов.
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic(10);
+                  setWebhookModalOpen(true);
+                }}
+                className="min-h-[34px] px-3 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-200 font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+              >
+                <Webhook className="w-3.5 h-3.5 shrink-0" />
+                <span>Настроить Webhook / TG</span>
+              </button>
+            </div>
+            <PriceAlertsPanel
+              alerts={priceAlerts}
+              pushSubscribed={pushState.isSubscribed}
+              onJumpToPushSettings={() => setSection('push')}
+              onCreateAlert={onCreatePriceAlert}
+              onToggleAlert={onTogglePriceAlert}
+              onDeleteAlert={onDeletePriceAlert}
+              onCheckNow={onCheckPriceAlertsNow}
+            />
+            <WebhookBuilderModal
+              open={webhookModalOpen}
+              onClose={() => setWebhookModalOpen(false)}
+              sampleSymbol={priceAlerts[0]?.symbol ?? 'BTCUSDT'}
+              samplePrice={priceAlerts[0]?.targetPrice ?? 94250}
+            />
+          </div>
         )}
 
         {section === 'sessions' && (
@@ -773,6 +2199,174 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             )
         )}
 
+        {section === 'legal' && (
+          <div className="space-y-4">
+            {/* Legal Documents & UA Law / GDPR Consent Status */}
+            <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                  <Scale className="w-4 h-4 text-emerald-400" />
+                  <span>Центр управления данными и комплаенс (Украина / GDPR / Google Play)</span>
+                </h2>
+                <p className="mt-1 text-xs text-slate-400 leading-relaxed">
+                  Обработка персональных данных соответствует Закону Украины «Про захист персональних даних» № 2297-VI, регламенту GDPR и политике Google Play Data Safety.
+                </p>
+              </div>
+
+              <div className="rounded-xl border border-white/8 bg-[#0B0F17] p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div>
+                  <div className="font-semibold text-white">Статус юридических согласий (18+, ПДн, AI, Non-Custodial)</div>
+                  <div className="mt-0.5 text-slate-400">
+                    {legalConsent
+                      ? `Подтверждено ${new Date(legalConsent.acceptedAt).toLocaleString('ru-RU')} · Версия ${legalConsent.version}`
+                      : 'Согласие не зафиксировано'}
+                  </div>
+                </div>
+                {legalConsent && onRevokeConsent && (
+                  <button
+                    type="button"
+                    onClick={onRevokeConsent}
+                    className="min-h-[34px] px-3 rounded-lg border border-amber-500/35 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 font-semibold transition-colors"
+                  >
+                    Отозвать согласие
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                {(
+                  [
+                    { id: 'privacy' as const, label: 'Политика конфиденциальности' },
+                    { id: 'terms' as const, label: 'Условия использования' },
+                    { id: 'disclaimer' as const, label: 'Отказ от ответственности' },
+                  ] as const
+                ).map((doc) => (
+                  <button
+                    key={doc.id}
+                    type="button"
+                    onClick={() => onOpenLegalDoc?.(doc.id)}
+                    className="min-h-[42px] px-3 rounded-xl border border-white/10 bg-[#0B0F17] hover:border-emerald-500/40 text-xs font-medium text-slate-200 hover:text-white inline-flex items-center justify-center gap-1.5 transition-colors"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>{doc.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Export JSON & 2-Step Account Deletion (Google Play Account Deletion Policy) */}
+            <div className="rounded-2xl border border-white/8 bg-[#111827] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-white">Портируемость и удаление данных</h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    Скачайте полный архив своих данных в JSON или полностью удалите аккаунт и локальные ключи.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const json = exportAllUserDataJson({
+                      uid: profile?.uid,
+                      email: privateSecurity?.email,
+                      plan: profile?.plan,
+                    });
+                    const blob = new Blob([json], { type: 'application/json;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `vernier-user-data-${new Date().toISOString().slice(0, 10)}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    setDataExportMsg('Архив данных успешно сформирован и скачан (JSON).');
+                    triggerHaptic(10);
+                  }}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-emerald-500/35 bg-emerald-500/12 hover:bg-emerald-500/20 text-emerald-200 text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Экспортировать мои данные (JSON)</span>
+                </button>
+              </div>
+
+              {dataExportMsg && <div className="text-xs text-emerald-300">{dataExportMsg}</div>}
+
+              <div className="pt-3 border-t border-white/8 space-y-3">
+                {!deleteStepOpen ? (
+                  <button
+                    type="button"
+                    onClick={() => setDeleteStepOpen(true)}
+                    className="min-h-[38px] px-4 rounded-xl border border-rose-500/35 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs font-semibold inline-flex items-center gap-1.5"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Удалить аккаунт и все данные</span>
+                  </button>
+                ) : (
+                  <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 space-y-3">
+                    <div className="text-xs text-rose-100 leading-relaxed">
+                      <strong>2-шаговое подтверждение:</strong> будут удалены локальный дневник, алерты, PIN-код, зашифрованные Read-Only ключи, кэш и выполнен выход из аккаунта. Введите слово <code className="font-mono text-white">УДАЛИТЬ</code> для подтверждения.
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        value={deleteConfirmWord}
+                        onChange={(e) => setDeleteConfirmWord(e.target.value)}
+                        placeholder="Введите УДАЛИТЬ"
+                        className="min-h-[38px] px-3 rounded-xl border border-rose-500/40 bg-[#0B0F17] text-xs font-mono text-white"
+                      />
+                      <button
+                        type="button"
+                        disabled={deletingAll || deleteConfirmWord.trim().toUpperCase() !== 'УДАЛИТЬ'}
+                        onClick={async () => {
+                          setDeletingAll(true);
+                          try {
+                            await onDeleteAccountAndAllData?.();
+                            setDeleteStepOpen(false);
+                            setDeleteConfirmWord('');
+                          } finally {
+                            setDeletingAll(false);
+                          }
+                        }}
+                        className="min-h-[38px] px-4 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-45 text-white text-xs font-semibold"
+                      >
+                        {deletingAll ? 'Удаление...' : 'Подтвердить удаление'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDeleteStepOpen(false);
+                          setDeleteConfirmWord('');
+                        }}
+                        className="min-h-[38px] px-3 rounded-xl border border-white/10 text-xs text-slate-300"
+                      >
+                        Отмена
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="text-[11px] text-slate-500 leading-relaxed">
+                  Запрос на удаление данных также можно направить через веб-портал{' '}
+                  <span className="font-mono text-slate-400">vernier-terminal.app/data-deletion</span> или на email{' '}
+                  <span className="font-mono text-slate-400">privacy@vernier-terminal.app</span> (срок обработки — до 14 календарных дней).
+                </div>
+              </div>
+            </div>
+
+            {/* Exchange Trademarks & Public API Attribution */}
+            <div className="rounded-2xl border border-white/8 bg-[#0B0F17] p-4 space-y-1.5 text-[11px] text-slate-400 leading-relaxed">
+              <div className="font-semibold text-slate-200">Товарные знаки и источники рыночных данных</div>
+              <p>
+                Рыночные котировки, свечи и ставки финансирования предоставлены публичными API криптобирж и агрегаторов (Binance, Bybit, OKX, CoinGecko, TradingView).
+              </p>
+              <p>
+                VERNIER является независимым аналитическим Non-Custodial программным обеспечением, не хранит средства пользователей, не выступает финансовым посредником и не аффилирован с указанными торговыми площадками. Все торговые решения принимаются пользователем самостоятельно.
+              </p>
+            </div>
+          </div>
+        )}
+
         {section === 'audit' && (
           <div className="space-y-3">
             <div className="inline-flex items-center p-1 rounded-xl bg-[#111827] border border-white/8">
@@ -792,7 +2386,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                   auditSub === 'log' ? 'bg-cyan-600 text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Журнал ({auditLogs.length})
+                Логи ({auditLogs.length + exchangeSyncErrorLogs.length})
               </button>
               <button
                 type="button"
@@ -809,64 +2403,563 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
               <SecurityFaqSection onStartTour={onStartTour} />
             ) : !isSignedIn || !profile ? (
               requireLoginCard(
-                'Авторизуйтесь для доступа к журналу аудита',
-                'Все входы, проверки 2FA и изменения параметров фиксируются автоматически.'
+                'Авторизуйтесь для доступа к логам и журналу аудита',
+                'Все входы, проверки 2FA, сбои синхронизации бирж и изменения параметров фиксируются автоматически.'
               )
             ) : auditSub === 'chart' ? (
               <SecurityAuditActivityChart auditLogs={auditLogs} />
             ) : (
-              <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5">
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-base font-semibold text-white">Журнал аудита безопасности</h2>
-                  <span className="text-xs text-slate-500">Последние 20 событий</span>
-                </div>
+              <div className="space-y-4">
+                {/* Визуализация и журнал синхронизации бирж */}
+                <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                        {syncLogStats.critical > 0 ? (
+                          <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+                        ) : syncLogStats.warning > 0 ? (
+                          <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+                        ) : syncLogStats.success > 0 ? (
+                          <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+                        ) : (
+                          <Activity className="w-4 h-4 shrink-0 text-slate-400" />
+                        )}
+                        <span>Логи синхронизации бирж ({syncLogStats.total})</span>
+                      </h2>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        Цветовая индикация событий: успешные обновления (мягкий зелёный), предупреждения API/сети (мягкий оранжевый) и критические сбои (мягкий красный).
+                      </p>
+                    </div>
 
-                {auditLogs.length === 0 ? (
-                  <p className="text-xs text-slate-400">События безопасности будут фиксироваться здесь автоматически.</p>
-                ) : (
-                  <div className="divide-y divide-white/8">
-                    {auditLogs.slice(0, 20).map((log) => {
-                      const ts = (log.createdAt as { seconds?: number } | undefined)?.seconds;
-                      const dateLabel = ts
-                        ? new Date(ts * 1000).toLocaleString('ru-RU', {
-                            day: '2-digit',
-                            month: '2-digit',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })
-                        : 'Сейчас';
-                      return (
-                        <div key={log.id} className="py-2.5 flex items-start justify-between gap-4 text-xs">
-                          <div>
-                            <div className="font-medium text-white">{log.description}</div>
-                            <div className="mt-0.5 text-slate-400 font-mono">
-                              {log.eventType} · {log.deviceLabel}
-                            </div>
+                    {syncLogStats.total > 0 && onClearExchangeSyncErrorLogs && (
+                      <button
+                        type="button"
+                        onClick={onClearExchangeSyncErrorLogs}
+                        className="min-h-[32px] px-2.5 rounded-lg border border-rose-500/25 bg-rose-500/10 hover:bg-rose-500/20 text-xs font-medium text-rose-300 inline-flex items-center gap-1.5 transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Очистить</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Сводка 3 уровней + шкала распределения + лента последних событий */}
+                  {syncLogStats.total > 0 && (
+                    <div className="space-y-3 rounded-xl border border-white/8 bg-[#0B0F17]/80 p-3.5">
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/[0.11] px-3 py-2">
+                          <div className="flex items-center gap-1.5 text-[11px] text-emerald-300">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+                            <span>Успешно</span>
                           </div>
-                          <div className="text-right shrink-0 font-mono tabular-nums">
-                            <div
-                              className={
-                                log.status === 'SUCCESS'
-                                  ? 'text-emerald-400'
-                                  : log.status === 'BLOCKED'
-                                    ? 'text-rose-400'
-                                    : 'text-amber-300'
-                              }
-                            >
-                              {log.status}
-                            </div>
-                            <div className="mt-0.5 text-slate-500">{dateLabel}</div>
+                          <div className="mt-0.5 font-mono tabular-nums text-base font-bold text-white">
+                            {syncLogStats.success}
                           </div>
                         </div>
-                      );
-                    })}
+
+                        <div className="rounded-lg border border-orange-500/35 bg-orange-500/[0.12] px-3 py-2">
+                          <div className="flex items-center gap-1.5 text-[11px] text-orange-300">
+                            <span className="w-2 h-2 rounded-full bg-orange-400 shrink-0" />
+                            <span>Предупреждения</span>
+                          </div>
+                          <div className="mt-0.5 font-mono tabular-nums text-base font-bold text-white">
+                            {syncLogStats.warning}
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg border border-rose-500/40 bg-rose-500/[0.13] px-3 py-2">
+                          <div className="flex items-center gap-1.5 text-[11px] text-rose-300">
+                            <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" />
+                            <span>Критические</span>
+                          </div>
+                          <div className="mt-0.5 font-mono tabular-nums text-base font-bold text-white">
+                            {syncLogStats.critical}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Пропорциональная полоса статуса */}
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-400">
+                          <span>Соотношение событий синхронизации</span>
+                          <span className="text-emerald-400">
+                            Успешность: {syncLogStats.successPct.toFixed(0)}%
+                          </span>
+                        </div>
+                        <div
+                          className="h-2 w-full rounded-full bg-white/5 overflow-hidden flex"
+                          role="img"
+                          aria-label={`Успешно ${syncLogStats.success}, предупреждений ${syncLogStats.warning}, критических ${syncLogStats.critical}`}
+                        >
+                          {syncLogStats.successPct > 0 && (
+                            <div
+                              style={{ width: `${syncLogStats.successPct}%` }}
+                              className="h-full bg-emerald-500 transition-all"
+                              title={`Успешно: ${syncLogStats.success}`}
+                            />
+                          )}
+                          {syncLogStats.warningPct > 0 && (
+                            <div
+                              style={{ width: `${syncLogStats.warningPct}%` }}
+                              className="h-full bg-orange-400 transition-all"
+                              title={`Предупреждения: ${syncLogStats.warning}`}
+                            />
+                          )}
+                          {syncLogStats.criticalPct > 0 && (
+                            <div
+                              style={{ width: `${syncLogStats.criticalPct}%` }}
+                              className="h-full bg-rose-500 transition-all"
+                              title={`Критические: ${syncLogStats.critical}`}
+                            />
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Хронологическая лента последних событий */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[11px] text-slate-400">
+                          <span>Хронология последних проверок ({syncLogStats.timeline.length})</span>
+                          <span className="font-mono text-[10px] text-slate-500">Старые → Новые</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {syncLogStats.timeline.map((item) => {
+                            const barClass =
+                              item.severity === 'success'
+                                ? 'bg-emerald-500/85 hover:bg-emerald-400'
+                                : item.severity === 'warning'
+                                  ? 'bg-orange-400/90 hover:bg-orange-300'
+                                  : 'bg-rose-500/90 hover:bg-rose-400';
+                            const timeStr = new Date(item.occurredAtMs).toLocaleTimeString('ru-RU', {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            });
+                            return (
+                              <div
+                                key={`tl-${item.id}`}
+                                title={`${timeStr} · ${item.exchange.toUpperCase()} (${item.label}) — ${item.errorMessage}`}
+                                className={`h-5 flex-1 max-w-[20px] min-w-[6px] rounded-[3px] transition-colors ${barClass}`}
+                              />
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Фильтр по уровню события */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-white/8">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {(
+                            [
+                              { id: 'all', label: `Все (${syncLogStats.total})`, activeClass: 'bg-white/15 text-white border-white/25' },
+                              { id: 'success', label: `Успешные (${syncLogStats.success})`, activeClass: 'bg-emerald-500/20 text-emerald-200 border-emerald-500/40' },
+                              { id: 'warning', label: `Предупреждения (${syncLogStats.warning})`, activeClass: 'bg-orange-500/22 text-orange-200 border-orange-500/45' },
+                              { id: 'critical', label: `Критические (${syncLogStats.critical})`, activeClass: 'bg-rose-500/22 text-rose-200 border-rose-500/45' },
+                            ] as const
+                          ).map((f) => {
+                            const active = syncLogFilter === f.id;
+                            return (
+                              <button
+                                key={f.id}
+                                type="button"
+                                onClick={() => setSyncLogFilter(f.id)}
+                                className={`min-h-[28px] px-2.5 rounded-lg border text-[11px] font-medium transition-colors ${
+                                  active
+                                    ? f.activeClass
+                                    : 'border-white/8 bg-[#111827] text-slate-400 hover:text-slate-200'
+                                }`}
+                              >
+                                {f.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {syncLogStats.groupedTotal < syncLogStats.total && (
+                          <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+                            Записей в списке: {syncLogStats.groupedTotal} из {syncLogStats.total}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {quickFixNotice && (
+                    <div
+                      className={`rounded-xl border px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 ${
+                        quickFixNotice.tone === 'ok'
+                          ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
+                          : 'border-rose-500/35 bg-rose-500/10 text-rose-200'
+                      }`}
+                    >
+                      <span>{quickFixNotice.text}</span>
+                      <button
+                        type="button"
+                        onClick={() => setQuickFixNotice(null)}
+                        className="text-[11px] font-medium opacity-80 hover:opacity-100 shrink-0"
+                      >
+                        Скрыть
+                      </button>
+                    </div>
+                  )}
+
+                  {syncLogStats.total === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      Событий синхронизации бирж пока не зафиксировано. При подключении и фоновом обновлении здесь появятся статусы синхронизации.
+                    </p>
+                  ) : syncLogStats.filtered.length === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      В выбранной категории событий пока нет.
+                    </p>
+                  ) : (
+                    <div className="space-y-2 max-h-[28rem] overflow-y-auto pr-1">
+                      {syncLogStats.filtered.map((group) => {
+                        const { entry, repeatCount, firstOccurredAtMs, lastOccurredAtMs, entryIds } = group;
+                        const categoryMeta: Record<
+                          ExchangeSyncErrorCategory,
+                          { label: string }
+                        > = {
+                          success: { label: 'Успешно' },
+                          rate_limit: { label: 'Лимит API' },
+                          auth: { label: 'Ошибка ключа / прав' },
+                          network: { label: 'Сбой сети' },
+                          exchange_api: { label: 'Ошибка API биржи' },
+                          unknown: { label: 'Сбой синхронизации' },
+                        };
+                        const severityStyles: Record<
+                          ExchangeSyncSeverity,
+                          { rowClass: string; dotClass: string; badgeClass: string; badgeText: string }
+                        > = {
+                          success: {
+                            rowClass: 'border-emerald-500/30 border-l-4 border-l-emerald-400 bg-emerald-500/[0.10]',
+                            dotClass: 'bg-emerald-400',
+                            badgeClass: 'border-emerald-500/35 bg-emerald-500/20 text-emerald-200',
+                            badgeText: 'Успешно',
+                          },
+                          warning: {
+                            rowClass: 'border-orange-500/35 border-l-4 border-l-orange-400 bg-orange-500/[0.13]',
+                            dotClass: 'bg-orange-400',
+                            badgeClass: 'border-orange-500/40 bg-orange-500/20 text-orange-200',
+                            badgeText: categoryMeta[entry.category].label,
+                          },
+                          critical: {
+                            rowClass: 'border-rose-500/40 border-l-4 border-l-rose-500 bg-rose-500/[0.14]',
+                            dotClass: 'bg-rose-500',
+                            badgeClass: 'border-rose-500/45 bg-rose-500/22 text-rose-100',
+                            badgeText: categoryMeta[entry.category].label,
+                          },
+                        };
+                        const sev = severityStyles[entry.severity];
+                        const timeLabel = new Date(lastOccurredAtMs).toLocaleString('ru-RU', {
+                          day: '2-digit',
+                          month: '2-digit',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        });
+                        const firstTimeLabel = new Date(firstOccurredAtMs).toLocaleTimeString('ru-RU', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        });
+
+                        const linkedKey = exchangeKeys.find((k) => k.id === entry.keyId) ?? null;
+                        const quickFix = getExchangeSyncQuickFix(entry, nowTickMs);
+                        const isQuickFixBusy = quickFixBusyId !== null && entryIds.includes(quickFixBusyId);
+
+                        const handleQuickRetry = async () => {
+                          if (!linkedKey) return;
+                          setQuickFixBusyId(entry.id);
+                          setQuickFixNotice(null);
+                          try {
+                            if (!linkedKey.enabled) {
+                              await onToggleExchange(linkedKey.id, true);
+                            }
+                            const res = await onSyncExchange(linkedKey, true);
+                            setQuickFixNotice({
+                              tone: 'ok',
+                              text: `Синхронизация ${linkedKey.exchange.toUpperCase()} (${linkedKey.label}) выполнена: $${res.totalBalanceUsdt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.`,
+                            });
+                          } catch (err) {
+                            setQuickFixNotice({
+                              tone: 'err',
+                              text: err instanceof Error ? err.message : 'Повторная синхронизация завершилась ошибкой.',
+                            });
+                          } finally {
+                            setQuickFixBusyId(null);
+                          }
+                        };
+
+                        const handleQuickPause = async () => {
+                          if (!linkedKey || !linkedKey.enabled) return;
+                          setQuickFixBusyId(entry.id);
+                          setQuickFixNotice(null);
+                          try {
+                            await onToggleExchange(linkedKey.id, false);
+                            setQuickFixNotice({
+                              tone: 'ok',
+                              text: `Ключ «${linkedKey.label}» поставлен на паузу на время охлаждения лимитов API.`,
+                            });
+                          } catch (err) {
+                            setQuickFixNotice({
+                              tone: 'err',
+                              text: err instanceof Error ? err.message : 'Не удалось поставить ключ на паузу.',
+                            });
+                          } finally {
+                            setQuickFixBusyId(null);
+                          }
+                        };
+
+                        const renderQuickFixActionButton = (
+                          actionType: ExchangeSyncQuickFixActionType,
+                          label: string,
+                          isSecondary = false
+                        ) => {
+                          if (!linkedKey) return null;
+                          if (actionType === 'pause_key') {
+                            if (!linkedKey.enabled) return null;
+                            return (
+                              <button
+                                key={`${entry.id}-pause`}
+                                type="button"
+                                disabled={isQuickFixBusy}
+                                onClick={() => void handleQuickPause()}
+                                className="min-h-[30px] px-2.5 rounded-md border border-amber-500/35 bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 text-[11px] font-semibold text-amber-200 inline-flex items-center gap-1.5 transition-colors"
+                              >
+                                <PauseCircle className="w-3 h-3" />
+                                <span>{label}</span>
+                              </button>
+                            );
+                          }
+                          if (actionType === 'edit_key') {
+                            return (
+                              <button
+                                key={`${entry.id}-edit`}
+                                type="button"
+                                disabled={isQuickFixBusy}
+                                onClick={() => setEditingExchangeKey(linkedKey)}
+                                className="min-h-[30px] px-2.5 rounded-md border border-cyan-500/40 bg-cyan-500/15 hover:bg-cyan-500/25 disabled:opacity-50 text-[11px] font-semibold text-cyan-200 inline-flex items-center gap-1.5 transition-colors"
+                              >
+                                <KeyRound className="w-3 h-3" />
+                                <span>{label}</span>
+                              </button>
+                            );
+                          }
+                          return (
+                            <button
+                              key={`${entry.id}-retry`}
+                              type="button"
+                              disabled={isQuickFixBusy}
+                              onClick={() => void handleQuickRetry()}
+                              className={`min-h-[30px] px-2.5 rounded-md border disabled:opacity-50 text-[11px] font-semibold inline-flex items-center gap-1.5 transition-colors ${
+                                isSecondary
+                                  ? 'border-white/15 bg-white/5 hover:bg-white/10 text-slate-200'
+                                  : 'border-emerald-500/35 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200'
+                              }`}
+                            >
+                              <RefreshCw
+                                className={`w-3 h-3 ${isQuickFixBusy ? 'animate-spin' : ''}`}
+                              />
+                              <span>
+                                {isQuickFixBusy
+                                  ? 'Синхр...'
+                                  : !linkedKey.enabled
+                                    ? 'Включить и повторить'
+                                    : label}
+                              </span>
+                            </button>
+                          );
+                        };
+
+                        return (
+                          <div
+                            key={entry.id}
+                            className={`rounded-lg border px-3 py-2.5 space-y-2 text-xs ${sev.rowClass}`}
+                          >
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="flex items-start gap-2.5 min-w-0">
+                                <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${sev.dotClass}`} />
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-medium text-white break-words">
+                                      {entry.errorMessage}
+                                    </span>
+                                    {repeatCount > 1 && (
+                                      <span
+                                        title={`Повторялось подряд в фоновом режиме: ${repeatCount}`}
+                                        className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums shrink-0 ${
+                                          entry.severity === 'critical'
+                                            ? 'border-rose-500/45 bg-rose-500/25 text-rose-100'
+                                            : 'border-orange-500/45 bg-orange-500/25 text-orange-100'
+                                        }`}
+                                      >
+                                        <Repeat className="w-3 h-3" />
+                                        <span>×{repeatCount}</span>
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="mt-0.5 text-slate-300/80 font-mono text-[11px] flex flex-wrap items-center gap-2">
+                                    <span>
+                                      {entry.exchange.toUpperCase()} · {entry.label}
+                                      {entry.testnet ? ' (Testnet)' : ''}
+                                    </span>
+                                    <span aria-hidden="true">·</span>
+                                    <span>
+                                      {entry.source === 'manual' ? 'Ручная проверка' : 'Фоновое обновление'}
+                                    </span>
+                                    {repeatCount > 1 && (
+                                      <>
+                                        <span aria-hidden="true">·</span>
+                                        <span className="text-slate-200">
+                                          Повторов подряд: {repeatCount}
+                                        </span>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="text-right shrink-0 font-mono tabular-nums">
+                                <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${sev.badgeClass}`}>
+                                  {sev.badgeText}
+                                </span>
+                                <div className="mt-1 text-slate-400 text-[11px]">{timeLabel}</div>
+                                {repeatCount > 1 && firstOccurredAtMs < lastOccurredAtMs && (
+                                  <div className="text-[10px] text-slate-400/80">
+                                    с {firstTimeLabel}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+
+                            {quickFix && (
+                              <div className="ml-4.5 rounded-lg border border-white/10 bg-[#0B0F17]/75 px-3 py-2 flex flex-wrap items-center justify-between gap-2.5">
+                                <div className="flex items-start gap-2 min-w-0 flex-1">
+                                  <Wrench className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
+                                  <div className="text-[11px] text-slate-300 leading-relaxed">
+                                    <span className="font-semibold text-cyan-300">
+                                      Быстрое решение · {quickFix.title}:{' '}
+                                    </span>
+                                    <span>{quickFix.suggestion}</span>
+                                  </div>
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                                  {quickFix.cooldownLabel && (
+                                    <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 font-mono text-[11px] text-amber-200 tabular-nums">
+                                      <Clock className="w-3 h-3" />
+                                      <span>{quickFix.cooldownLabel}</span>
+                                    </span>
+                                  )}
+
+                                  {linkedKey ? (
+                                    <>
+                                      {renderQuickFixActionButton(
+                                        quickFix.recommendedAction,
+                                        quickFix.actionLabel
+                                      )}
+                                      {quickFix.secondaryAction &&
+                                        quickFix.secondaryActionLabel &&
+                                        renderQuickFixActionButton(
+                                          quickFix.secondaryAction,
+                                          quickFix.secondaryActionLabel,
+                                          true
+                                        )}
+                                    </>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setSection('exchanges')}
+                                      className="min-h-[30px] px-2.5 rounded-md border border-white/15 bg-white/5 hover:bg-white/10 text-[11px] font-medium text-slate-200 inline-flex items-center gap-1.5 transition-colors"
+                                    >
+                                      <Link2 className="w-3 h-3 text-emerald-400" />
+                                      <span>Ключ удалён — добавить новый</span>
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Облачный журнал аудита безопасности Firestore */}
+                <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-base font-semibold text-white">Журнал аудита безопасности</h2>
+                    <span className="text-xs text-slate-500">Последние 20 событий</span>
                   </div>
-                )}
+
+                  {auditLogs.length === 0 ? (
+                    <p className="text-xs text-slate-400">События безопасности будут фиксироваться здесь автоматически.</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {auditLogs.slice(0, 20).map((log) => {
+                        const ts = (log.createdAt as { seconds?: number } | undefined)?.seconds;
+                        const dateLabel = ts
+                          ? new Date(ts * 1000).toLocaleString('ru-RU', {
+                              day: '2-digit',
+                              month: '2-digit',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })
+                          : 'Сейчас';
+                        const statusStyle =
+                          log.status === 'SUCCESS'
+                            ? {
+                                row: 'border-emerald-500/25 border-l-4 border-l-emerald-400 bg-emerald-500/[0.09]',
+                                dot: 'bg-emerald-400',
+                                badge: 'border-emerald-500/35 bg-emerald-500/18 text-emerald-200',
+                              }
+                            : log.status === 'BLOCKED'
+                              ? {
+                                  row: 'border-rose-500/35 border-l-4 border-l-rose-500 bg-rose-500/[0.13]',
+                                  dot: 'bg-rose-500',
+                                  badge: 'border-rose-500/45 bg-rose-500/22 text-rose-100',
+                                }
+                              : {
+                                  row: 'border-orange-500/35 border-l-4 border-l-orange-400 bg-orange-500/[0.12]',
+                                  dot: 'bg-orange-400',
+                                  badge: 'border-orange-500/40 bg-orange-500/20 text-orange-200',
+                                };
+                        return (
+                          <div
+                            key={log.id}
+                            className={`rounded-lg border px-3 py-2.5 flex items-start justify-between gap-4 text-xs ${statusStyle.row}`}
+                          >
+                            <div className="flex items-start gap-2.5 min-w-0">
+                              <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${statusStyle.dot}`} />
+                              <div className="min-w-0">
+                                <div className="font-medium text-white">{log.description}</div>
+                                <div className="mt-0.5 text-slate-300/80 font-mono">
+                                  {log.eventType} · {log.deviceLabel}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="text-right shrink-0 font-mono tabular-nums">
+                              <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${statusStyle.badge}`}>
+                                {log.status}
+                              </span>
+                              <div className="mt-1 text-slate-400">{dateLabel}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
         )}
-      </WorkspaceShell>
+        </div>
+      )}
+
+      <EditExchangeKeyModal
+        keyRecord={editingExchangeKey}
+        onClose={() => setEditingExchangeKey(null)}
+        onSave={onUpdateExchange}
+      />
     </StaggerDeck>
   );
 };

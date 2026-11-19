@@ -1,236 +1,224 @@
-import React, { useState } from 'react';
+import React from 'react';
 import {
-  ArrowRight,
-  ChevronDown,
-  ChevronUp,
-  RotateCcw,
-  Trash2,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  Link2,
+  RefreshCw,
+  Target,
+  TrendingDown,
+  TrendingUp,
   Wallet,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
-import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
-import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
-import { AnimatedNumber } from './MotionExtras';
+import { motion } from 'motion/react';
+import type { DailyPnlSummary, PaperPortfolioReport } from '../hooks/usePaperPortfolio';
+import type { PortfolioTargetRecord } from '../types/domain';
+import { triggerHaptic } from '../lib/securityDlp';
 
 interface MiniPortfolioWidgetProps {
   holdingsCount: number;
   report: PaperPortfolioReport;
+  dailyPnl: DailyPnlSummary;
+  activeTarget?: PortfolioTargetRecord | null;
+  isBackgroundSyncingExchange?: boolean;
+  connectedExchangesCount?: number;
+  connectedExchangesLabel?: string;
+  onOpenExchangeIntegrations?: () => void;
+  privacyMode?: boolean;
+  onTogglePrivacyMode?: () => void;
+  onOpenDetails: () => void;
   onManageInScreener: () => void;
-  onClearPortfolio: () => void;
-  onResetDemo: () => void;
+  onClearPortfolio?: () => void;
+  onResetDemo?: () => void;
   rightActions?: React.ReactNode;
+  bottomSlot?: React.ReactNode;
 }
 
-export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = ({
+function formatUsdCompact(value: number): string {
+  const abs = Math.abs(value);
+  return `$${abs.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = React.memo(({
   holdingsCount,
   report,
+  dailyPnl,
+  activeTarget = null,
+  isBackgroundSyncingExchange = false,
+  connectedExchangesCount = 0,
+  connectedExchangesLabel,
+  onOpenExchangeIntegrations,
+  privacyMode = false,
+  onTogglePrivacyMode,
+  onOpenDetails,
   onManageInScreener,
-  onClearPortfolio,
-  onResetDemo,
   rightActions,
+  bottomSlot,
 }) => {
-  const [expanded, setExpanded] = useState(false);
-
-  if (holdingsCount === 0 || report.allocations.length === 0) {
-    return (
-      <div className="mb-3 rounded-xl border border-white/8 bg-[#111827]/90 px-3 py-2 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs text-slate-400">
-          <Wallet className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-          <span>Портфель пуст</span>
-          <button
-            type="button"
-            onClick={onResetDemo}
-            className="text-cyan-400 hover:text-cyan-300 font-medium inline-flex items-center gap-1 ml-1"
-          >
-            <RotateCcw className="w-3 h-3" />
-            <span>Демо</span>
-          </button>
-          <span className="text-slate-600">·</span>
-          <button
-            type="button"
-            onClick={onManageInScreener}
-            className="text-emerald-400 hover:text-emerald-300 font-medium inline-flex items-center gap-0.5"
-          >
-            <span>Добавить</span>
-            <ArrowRight className="w-3 h-3" />
-          </button>
-        </div>
-
-        {rightActions && <div className="flex items-center gap-1.5 shrink-0">{rightActions}</div>}
-      </div>
-    );
-  }
-
   const isPositive = report.totalPnl >= 0;
+  const isDailyPositive = dailyPnl.dailyPnlUsdt >= 0;
+  const mask = (text: string) => (privacyMode ? '•••••' : text);
+  const hasExchangeApi = connectedExchangesCount > 0;
 
   return (
-    <section
-      aria-label="Мини-виджет портфеля"
-      className="mb-3 rounded-xl border border-white/8 bg-[#111827]/95 card-surface-glow overflow-hidden"
+    <motion.section
+      data-tour-id="tour-mini-portfolio"
+      aria-label="Сводка портфеля, котировки и быстрые действия"
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
+      className="mb-3 rounded-2xl border border-emerald-500/18 bg-[var(--surface-1)]/92 backdrop-blur-md overflow-hidden"
     >
-      {/* Ultra-compact Single Row Summary Bar */}
-      <div className="px-3 py-1.5 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-7 h-7 shrink-0" aria-hidden="true">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={report.allocations}
-                  dataKey="valueUsdt"
-                  nameKey="baseAsset"
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={8}
-                  outerRadius={13}
-                  paddingAngle={2}
-                  stroke="none"
-                  isAnimationActive={false}
-                >
-                  {report.allocations.map((item) => (
-                    <Cell key={`mini-${item.symbol}`} fill={item.color} />
-                  ))}
-                </Pie>
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-
+      {/* Unified single-row horizontally scrollable balance + API status + utility bar */}
+      <div className="px-2.5 sm:px-3.5 py-1.5 flex items-center justify-between gap-2 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0 flex-1 overflow-x-auto no-scrollbar">
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
-            aria-expanded={expanded}
-            className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-left hover:opacity-90 transition-opacity"
+            onClick={() => {
+              triggerHaptic(8);
+              onOpenDetails();
+            }}
+            className="min-h-[36px] text-left inline-flex items-center gap-2 rounded-xl hover:bg-white/[0.04] px-1.5 py-0.5 transition-colors group whitespace-nowrap shrink-0"
+            aria-label="Открыть быструю сводку активов и PnL"
           >
-            <span className="text-xs font-bold font-mono tabular-nums text-white">
-              <AnimatedNumber
-                value={report.totalValue}
-                format={(n) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`}
-              />
+            <span className="inline-flex items-center gap-1.5 shrink-0">
+              <Wallet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-white">
+                {mask(formatUsdCompact(report.totalValue))}
+              </span>
             </span>
-            <span
-              className={`text-[11px] font-mono font-semibold tabular-nums ${
-                isPositive ? 'text-emerald-400' : 'text-rose-400'
+
+            {holdingsCount > 0 ? (
+              <span className="inline-flex items-center gap-2 text-[11px] font-mono tabular-nums shrink-0">
+                {/* Общий PnL с компактной подписью «Всего» */}
+                <span
+                  className={`inline-flex items-center gap-1 font-semibold ${
+                    isPositive ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  {isPositive ? (
+                    <TrendingUp className="w-3 h-3 shrink-0" />
+                  ) : (
+                    <TrendingDown className="w-3 h-3 shrink-0" />
+                  )}
+                  <span>
+                    {mask(`${isPositive ? '+' : ''}${report.totalPnlPct.toFixed(1)}%`)}
+                  </span>
+                  <span className="font-sans text-[10px] font-medium text-slate-400">Всего</span>
+                </span>
+
+                {/* Дневной PnL 24ч */}
+                {dailyPnl.hasLive24hData && (
+                  <span
+                    className={`inline-flex items-center gap-1 ${
+                      isDailyPositive ? 'text-emerald-300/90' : 'text-rose-300/90'
+                    }`}
+                  >
+                    <span className="text-slate-600" aria-hidden="true">·</span>
+                    <span>
+                      {mask(`${isDailyPositive ? '+' : ''}${dailyPnl.dailyPnlPct.toFixed(1)}%`)}
+                    </span>
+                    <span className="font-sans text-[10px] text-slate-500">24ч</span>
+                  </span>
+                )}
+
+                {activeTarget && (
+                  <span className="inline-flex items-center gap-1 text-cyan-300">
+                    <span className="text-slate-600" aria-hidden="true">·</span>
+                    <Target className="w-3 h-3 shrink-0" />
+                    <span>
+                      Цель {activeTarget.targetPnlPct >= 0 ? '+' : ''}
+                      {activeTarget.targetPnlPct}%
+                    </span>
+                  </span>
+                )}
+
+                {isBackgroundSyncingExchange && (
+                  <RefreshCw
+                    className="w-3 h-3 text-cyan-400 animate-spin shrink-0"
+                    aria-label="Синхронизация с биржей"
+                  />
+                )}
+              </span>
+            ) : (
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onManageInScreener();
+                }}
+                className="text-xs text-emerald-400 hover:text-emerald-300 font-medium"
+              >
+                + Добавить активы
+              </span>
+            )}
+
+            <ChevronRight className="w-3.5 h-3.5 text-slate-500 group-hover:text-emerald-300 transition-colors shrink-0" />
+          </button>
+
+          {/* Clickable API Exchange Status Mini-Badge -> jumps straight to Security > Exchange Integrations */}
+          {onOpenExchangeIntegrations && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                onOpenExchangeIntegrations();
+              }}
+              aria-label={
+                hasExchangeApi
+                  ? `Подключено бирж по API: ${connectedExchangesCount}. Открыть настройки бирж`
+                  : 'Подключить биржу по Read-Only API'
+              }
+              title={
+                hasExchangeApi
+                  ? `API бирж: ${connectedExchangesLabel || `${connectedExchangesCount} подкл.`}`
+                  : 'Подключить биржу (Read-Only API)'
+              }
+              className={`min-h-[28px] px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors ${
+                hasExchangeApi
+                  ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300 hover:bg-emerald-500/20'
+                  : 'border-white/10 bg-white/[0.04] text-slate-300 hover:border-emerald-500/35 hover:text-emerald-200'
               }`}
             >
-              {isPositive ? '+' : ''}
-              {report.totalPnlPct.toFixed(1)}%
-            </span>
-            <span className="hidden xl:inline-flex items-center gap-1.5 text-[11px] font-mono text-slate-400">
-              {report.allocations.slice(0, 3).map((item, idx) => (
-                <span key={item.symbol}>
-                  {idx > 0 && <span className="text-slate-600 mr-1.5">·</span>}
-                  {item.baseAsset} {item.sharePct.toFixed(0)}%
-                </span>
-              ))}
-            </span>
-            <span className="text-slate-400 inline-flex items-center">
-              {expanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-            </span>
-          </button>
+              <Link2 className={`w-3 h-3 shrink-0 ${hasExchangeApi ? 'text-emerald-400' : 'text-slate-400'}`} />
+              <span>
+                {hasExchangeApi
+                  ? connectedExchangesLabel || `API · ${connectedExchangesCount}`
+                  : 'API Биржи'}
+              </span>
+            </button>
+          )}
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        {/* Compact pinned-right action strip (Privacy Eye + Widgets/Tour) */}
+        <div className="flex items-center gap-1 shrink-0 pl-1 border-l border-white/8">
+          {onTogglePrivacyMode && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                onTogglePrivacyMode();
+              }}
+              aria-label={privacyMode ? 'Показать балансы и PnL' : 'Скрыть балансы и PnL (Режим приватности)'}
+              title={privacyMode ? 'Показать суммы' : 'Скрыть суммы (Приватность)'}
+              className={`min-h-[34px] min-w-[34px] rounded-lg border flex items-center justify-center shrink-0 transition-colors ${
+                privacyMode
+                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                  : 'border-white/10 bg-white/5 text-slate-400 hover:text-white'
+              }`}
+            >
+              {privacyMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            </button>
+          )}
           {rightActions}
         </div>
       </div>
 
-      {/* Expandable Recharts Distribution Chart + Holdings Summary */}
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="overflow-hidden border-t border-white/8 bg-[#0B0F17]/75"
-          >
-            <div className="p-4 grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
-              <div className="md:col-span-4 h-[155px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={report.allocations}
-                      dataKey="valueUsdt"
-                      nameKey="baseAsset"
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={40}
-                      outerRadius={64}
-                      paddingAngle={3}
-                      stroke="none"
-                    >
-                      {report.allocations.map((entry) => (
-                        <Cell key={`exp-${entry.symbol}`} fill={entry.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: '#0E1420',
-                        borderColor: 'rgba(255,255,255,0.12)',
-                        borderRadius: '10px',
-                        fontSize: '12px',
-                        color: '#F1F5F9',
-                      }}
-                      formatter={(value) => [`$${Number(value ?? 0).toFixed(2)}`, 'Стоимость']}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-
-              <div className="md:col-span-8 space-y-2.5">
-                <div className="divide-y divide-white/8 text-xs font-mono tabular-nums">
-                  {report.allocations.map((item) => (
-                    <div key={item.symbol} className="py-1.5 flex items-center justify-between gap-3">
-                      <div className="flex items-center gap-2 font-sans">
-                        <span
-                          className="w-2.5 h-2.5 rounded-full shrink-0"
-                          style={{ backgroundColor: item.color }}
-                        />
-                        <span className="font-semibold text-white">{item.baseAsset}</span>
-                        <span className="text-slate-500">·</span>
-                        <span className="font-mono text-slate-400">{item.sharePct.toFixed(1)}%</span>
-                      </div>
-
-                      <div className="flex items-center gap-4">
-                        <span className="text-slate-100">${item.valueUsdt.toFixed(2)}</span>
-                        <span
-                          className={`w-16 text-right font-semibold ${
-                            item.pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                          }`}
-                        >
-                          {item.pnlPct >= 0 ? '+' : ''}
-                          {item.pnlPct.toFixed(1)}%
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/8 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setExpanded(false);
-                      onManageInScreener();
-                    }}
-                    className="min-h-[32px] px-3 rounded-lg border border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium inline-flex items-center gap-1 transition-colors"
-                  >
-                    <span>Редактировать состав</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onClearPortfolio}
-                    className="min-h-[32px] px-2.5 rounded-lg border border-rose-500/25 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 inline-flex items-center gap-1.5 transition-colors"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Очистить</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </section>
+      {/* Seamlessly embedded live market ticker tape */}
+      {bottomSlot}
+    </motion.section>
   );
-};
+});
+MiniPortfolioWidget.displayName = 'MiniPortfolioWidget';

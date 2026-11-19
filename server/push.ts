@@ -21,6 +21,8 @@ export interface StoredPushEntry {
   notifyMarketMoves: boolean;
   notifyVolatilitySpikes: boolean;
   volatilityThresholdPct: number;
+  notifyPortfolioPnl: boolean;
+  portfolioPnlThresholdPct: number;
   notifyNews: boolean;
   notifyAuthLogins: boolean;
   notifyStrategyChanges: boolean;
@@ -39,6 +41,8 @@ export interface PushNotificationPayload {
     | 'signal'
     | 'market'
     | 'volatility_spike'
+    | 'portfolio_pnl'
+    | 'portfolio_target'
     | 'news'
     | 'auth_login'
     | 'strategy_change'
@@ -153,6 +157,9 @@ export async function dispatchPushToUser(
     if (payload.category === 'signal') return item.notifySignals;
     if (payload.category === 'market') return item.notifyMarketMoves;
     if (payload.category === 'volatility_spike') return item.notifyVolatilitySpikes;
+    if (payload.category === 'portfolio_pnl' || payload.category === 'portfolio_target') {
+      return item.notifyPortfolioPnl;
+    }
     if (payload.category === 'news') return item.notifyNews;
     if (payload.category === 'auth_login') return item.notifyAuthLogins;
     if (payload.category === 'strategy_change') return item.notifyStrategyChanges;
@@ -211,7 +218,7 @@ export async function scanMarketAndNotify(): Promise<{
           if (!volatilitySymbols.includes(shortSym)) volatilitySymbols.push(shortSym);
 
           const payload: PushNotificationPayload = {
-            title: `AegisQuant · Скачок волатильности ${t.baseAsset}/USDT (${spikePct >= 0 ? '+' : ''}${spikePct.toFixed(1)}% за 1ч)`,
+            title: `Vernier · Скачок волатильности ${t.baseAsset}/USDT (${spikePct >= 0 ? '+' : ''}${spikePct.toFixed(1)}% за 1ч)`,
             body: `Аномальное движение ${t.baseAsset} ($${t.price.toLocaleString('en-US')}) превысило порог ±${threshold}% за час. Проверьте уровни и риски.`,
             tag: `volatility-${t.symbol}`,
             url: '/?tab=market',
@@ -243,7 +250,7 @@ export async function scanMarketAndNotify(): Promise<{
         : `Движение ${t.change24hPct >= 0 ? '+' : ''}${t.change24hPct}% за 24ч`;
 
       const payload: PushNotificationPayload = {
-        title: `AegisQuant · Рыночный импульс ${t.baseAsset}/USDT`,
+        title: `Vernier · Рыночный импульс ${t.baseAsset}/USDT`,
         body: `Цена $${t.price.toLocaleString('en-US')} · ${reason}. Проверьте сигналы стратегий.`,
         tag: `market-${t.symbol}`,
         url: '/?tab=market',
@@ -293,7 +300,7 @@ export async function notifyHighImpactNews(item: {
   if (activeSubs.length === 0) return 0;
 
   const payload: PushNotificationPayload = {
-    title: `AegisQuant · Важная новость (${item.asset})`,
+    title: `Vernier · Важная новость (${item.asset})`,
     body: item.title,
     tag: `news-${item.asset}`,
     url: '/?tab=news',
@@ -307,6 +314,128 @@ export async function notifyHighImpactNews(item: {
     if (ok) sent += 1;
   }
   return sent;
+}
+
+export async function notifyPortfolioDailyPnl(
+  uid: string,
+  params: {
+    dailyPnlPct: number;
+    dailyPnlUsdt: number;
+    totalValue: number;
+    thresholdPct?: number;
+  }
+): Promise<{ sent: number; failed: number; skipped?: boolean }> {
+  const userSubs = Array.from(subscriptionRegistry.values()).filter(
+    (s) => s.uid === uid && s.enabled && s.notifyPortfolioPnl
+  );
+  if (userSubs.length === 0) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const rawThreshold =
+    typeof params.thresholdPct === 'number' && Number.isFinite(params.thresholdPct)
+      ? params.thresholdPct
+      : userSubs[0]?.portfolioPnlThresholdPct ?? 5;
+  const thresholdPct = Math.max(1, Math.min(50, Math.round(rawThreshold * 10) / 10));
+
+  if (Math.abs(params.dailyPnlPct) < thresholdPct) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const direction = params.dailyPnlPct >= 0 ? 'gain' : 'loss';
+  const cooldownKey = `portfolio:${uid}:${direction}`;
+  const lastAlert = alertCooldowns.get(cooldownKey) ?? 0;
+  if (Date.now() - lastAlert < 60 * 60_000) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const pctSign = params.dailyPnlPct >= 0 ? '+' : '-';
+  const usdtSign = params.dailyPnlUsdt >= 0 ? '+' : '-';
+  const absPct = Math.abs(params.dailyPnlPct).toFixed(2);
+  const absUsdt = Math.abs(params.dailyPnlUsdt).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const formattedTotal = params.totalValue.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+  const result = await dispatchPushToUser(uid, {
+    title: `Vernier · Дневной PnL портфеля ${pctSign}${absPct}%`,
+    body: `Изменение за 24ч: ${usdtSign}$${absUsdt} (порог ±${thresholdPct}%). Текущий баланс: $${formattedTotal}.`,
+    tag: `portfolio-pnl-${direction}`,
+    url: '/?tab=market',
+    impact: 'HIGH',
+    category: 'portfolio_pnl',
+  });
+
+  if (result.sent > 0) {
+    alertCooldowns.set(cooldownKey, Date.now());
+  }
+  return result;
+}
+
+export async function notifyPortfolioTargetReached(
+  uid: string,
+  params: {
+    portfolioId: string;
+    portfolioLabel: string;
+    targetBalanceUsdt: number;
+    currentBalanceUsdt: number;
+    baselineBalanceUsdt?: number;
+    targetPnlPct?: number;
+  }
+): Promise<{ sent: number; failed: number; skipped?: boolean }> {
+  const userSubs = Array.from(subscriptionRegistry.values()).filter(
+    (s) => s.uid === uid && s.enabled && s.notifyPortfolioPnl
+  );
+  if (userSubs.length === 0) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  if (
+    !Number.isFinite(params.targetBalanceUsdt) ||
+    !Number.isFinite(params.currentBalanceUsdt) ||
+    params.targetBalanceUsdt <= 0 ||
+    params.currentBalanceUsdt < params.targetBalanceUsdt
+  ) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const cleanPortfolioId = params.portfolioId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'manual';
+  const cooldownKey = `portfolio-target:${uid}:${cleanPortfolioId}`;
+  const lastAlert = alertCooldowns.get(cooldownKey) ?? 0;
+  if (Date.now() - lastAlert < 5 * 60_000) {
+    return { sent: 0, failed: 0, skipped: true };
+  }
+
+  const formattedCurrent = params.currentBalanceUsdt.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const formattedTarget = params.targetBalanceUsdt.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const pnlSuffix =
+    typeof params.targetPnlPct === 'number' && Number.isFinite(params.targetPnlPct) && params.targetPnlPct > 0
+      ? ` (+${params.targetPnlPct.toFixed(1)}% к цели)`
+      : '';
+
+  const result = await dispatchPushToUser(uid, {
+    title: `Vernier · Целевая доходность достигнута!`,
+    body: `Портфель «${params.portfolioLabel}» достиг $${formattedCurrent} (цель $${formattedTarget}${pnlSuffix}).`,
+    tag: `portfolio-target-${cleanPortfolioId}`,
+    url: '/?tab=market',
+    impact: 'HIGH',
+    category: 'portfolio_target',
+  });
+
+  if (result.sent > 0) {
+    alertCooldowns.set(cooldownKey, Date.now());
+  }
+  return result;
 }
 
 export function syncUserPriceAlerts(
@@ -423,7 +552,7 @@ export async function checkPriceAlertsForUser(targetUid?: string): Promise<{
     const marketLabel = alert.marketType === 'futures' ? 'Фьючерсы' : 'Спот';
 
     const pushRes = await dispatchPushToUser(alert.uid, {
-      title: `AegisQuant · Ценовой алерт ${alert.symbol}`,
+      title: `Vernier · Ценовой алерт ${alert.symbol}`,
       body: `Цена ${conditionLabel} $${alert.targetPrice.toLocaleString('en-US')} (текущая: $${livePrice.toLocaleString('en-US')} · ${marketLabel}).`,
       tag: `price-alert-${alert.id}`,
       url: '/?tab=market',
