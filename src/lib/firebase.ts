@@ -1,30 +1,61 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  type Firestore,
+} from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { OperationType } from '../types/domain';
+import { logger } from '../utils/logger';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+
+// Используем long-polling транспорт, чтобы избежать 10-секундных зависаний WebChannel
+// в мобильных сетях, VPN и прокси-средах (Android Chrome / встроенный предпросмотр).
+function createFirestoreInstance(): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalForceLongPolling: true,
+      },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+}
+
+export const db = createFirestoreInstance();
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+
+export function isFirestoreOfflineError(error: unknown): boolean {
+  if (!error) return false;
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code || '').toLowerCase()
+      : '';
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    code === 'unavailable' ||
+    code === 'failed-precondition' ||
+    msg.includes('client is offline') ||
+    msg.includes('could not reach cloud firestore') ||
+    msg.includes('network error') ||
+    msg.includes('failed to fetch')
+  );
+}
 
 export interface FirestoreErrorInfo {
   error: string;
   operationType: OperationType;
   path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  };
+  authenticated: boolean;
 }
 
 export function handleFirestoreError(
@@ -32,25 +63,21 @@ export function handleFirestoreError(
   operationType: OperationType,
   path: string | null
 ): never {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const sanitizedMessage = rawMessage.includes('Missing or insufficient permissions')
+    ? 'Недостаточно прав для выполнения операции в облачном хранилище.'
+    : isFirestoreOfflineError(error)
+      ? 'Нет стабильной связи с облаком Firestore. Приложение работает локально и синхронизируется автоматически.'
+      : 'Ошибка синхронизации с облачным хранилищем.';
+
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo:
-        auth.currentUser?.providerData?.map((provider) => ({
-          providerId: provider.providerId,
-          email: provider.email,
-        })) || [],
-    },
+    error: sanitizedMessage,
     operationType,
-    path,
+    path: path ? path.split('/').slice(0, 3).join('/') : null,
+    authenticated: Boolean(auth.currentUser),
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  logger.error('firestore', errInfo.operationType, errInfo.path ?? 'root', errInfo.error);
+  throw new Error(sanitizedMessage);
 }
 
 async function testConnection() {
@@ -58,7 +85,7 @@ async function testConnection() {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+      logger.error('firestore', 'Please check your Firebase configuration.');
     }
   }
 }

@@ -16,6 +16,8 @@ import type { SupportTicketCategory, SupportTicketRecord } from '../types/domain
 import { PermanentFeaturesManual } from './FeatureGuide';
 import { NATIVE_PILL_SPRING, NATIVE_SPRING, TERMINAL_EASE } from './MotionPrimitives';
 import { SupportContactModal } from './SupportContactModal';
+import { usePlan } from '../contexts/PlanContext';
+import { buildLocalVernierChatReply } from '../lib/localAnalyticsEngine';
 import { safeFetchJson } from '../utils/safeFetchJson';
 
 interface QuickAnswerItem {
@@ -140,6 +142,7 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
   inSheet = false,
 }) => {
   const prefersReducedMotion = useReducedMotion();
+  const planCtx = usePlan();
   const [mode, setMode] = useState<'chat' | 'manual' | 'faq'>('manual');
   const [openId, setOpenId] = useState<string | null>(null);
   const [supportModalOpen, setSupportModalOpen] = useState(false);
@@ -216,26 +219,34 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: clean, history: historyPayload }),
-        timeoutMs: 12000,
+        timeoutMs: 9000,
       });
 
-      if (!result.ok || !result.data?.reply) {
-        throw new Error(result.errorMessage || 'Не удалось получить ответ от Gemini.');
-      }
+      const replyText =
+        result.ok && result.data?.reply
+          ? result.data.reply
+          : buildLocalVernierChatReply(clean, { plan: planCtx.plan });
 
       setMessages((prev) => [
         ...prev,
         {
           id: `model_${Date.now()}`,
           role: 'model',
-          text: result.data!.reply!,
+          text: replyText,
           timestamp: formatMessageTime(),
         },
       ]);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Ошибка соединения с сервером.';
-      setChatError(msg);
-      setLastFailedPrompt(clean);
+    } catch {
+      const fallbackReply = buildLocalVernierChatReply(clean, { plan: planCtx.plan });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `model_${Date.now()}`,
+          role: 'model',
+          text: fallbackReply,
+          timestamp: formatMessageTime(),
+        },
+      ]);
     } finally {
       setSending(false);
     }
@@ -280,19 +291,19 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
-            {/* Segmented Switch: Permanent Manual | Gemini Chat | Static FAQ */}
+          <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2 w-full sm:w-auto">
+            {/* Compact Non-Clipping Grid on Mobile (360–430px): Гид | Чат | FAQ | Тур */}
             <div
               role="tablist"
               aria-label="Режим справки"
-              className="inline-flex items-center p-0.5 rounded-xl border border-white/10 bg-[#0B0F17]"
+              className={`grid ${onStartTour ? 'grid-cols-4' : 'grid-cols-3'} sm:inline-flex items-center gap-1 p-1 rounded-xl border border-white/10 bg-[#0B0F17] w-full sm:w-auto`}
             >
               <button
                 type="button"
                 role="tab"
                 aria-selected={mode === 'manual'}
                 onClick={() => setMode('manual')}
-                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`relative min-h-[34px] px-2 sm:px-3 rounded-lg text-[11px] sm:text-xs font-medium inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors ${
                   mode === 'manual' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
@@ -304,14 +315,14 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
                   />
                 )}
                 <BookOpen className="w-3.5 h-3.5 relative z-10 shrink-0" />
-                <span className="relative z-10">Справочник</span>
+                <span className="relative z-10">Гид</span>
               </button>
               <button
                 type="button"
                 role="tab"
                 aria-selected={mode === 'chat'}
                 onClick={() => setMode('chat')}
-                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`relative min-h-[34px] px-2 sm:px-3 rounded-lg text-[11px] sm:text-xs font-medium inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors ${
                   mode === 'chat' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
@@ -330,7 +341,7 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
                 role="tab"
                 aria-selected={mode === 'faq'}
                 onClick={() => setMode('faq')}
-                className={`relative min-h-[32px] px-2.5 sm:px-3 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`relative min-h-[34px] px-2 sm:px-3 rounded-lg text-[11px] sm:text-xs font-medium inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors ${
                   mode === 'faq' ? 'text-white' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
@@ -342,38 +353,40 @@ export const QuickAnswersCard: React.FC<QuickAnswersCardProps> = ({
                   />
                 )}
                 <HelpCircle className="w-3.5 h-3.5 relative z-10 shrink-0" />
-                <span className="relative z-10">FAQ ({QUICK_ANSWERS.length})</span>
+                <span className="relative z-10">FAQ</span>
               </button>
+              {onStartTour && (
+                <button
+                  type="button"
+                  onClick={onStartTour}
+                  className="min-h-[34px] px-2 sm:px-3 rounded-lg text-[11px] sm:text-xs font-medium text-emerald-300 hover:text-white hover:bg-white/[0.06] inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors"
+                >
+                  <Compass className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>Тур</span>
+                </button>
+              )}
             </div>
 
-            {onStartTour && (
+            <div className="flex flex-wrap items-center gap-2">
+              {onOpenFullFaq && (
+                <button
+                  type="button"
+                  onClick={onOpenFullFaq}
+                  className="min-h-[34px] px-3 rounded-lg border border-white/10 bg-[#0B0F17] hover:bg-white/[0.04] text-xs font-medium text-slate-300 hover:text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                >
+                  <span>Все вопросы</span>
+                  <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+                </button>
+              )}
               <button
                 type="button"
-                onClick={onStartTour}
-                className="min-h-[34px] px-3 rounded-lg border border-white/10 bg-[#0B0F17] hover:bg-white/[0.04] text-xs font-medium text-slate-300 hover:text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                onClick={() => setSupportModalOpen(true)}
+                className="min-h-[34px] px-3 rounded-lg border border-emerald-500/35 bg-emerald-500/12 hover:bg-emerald-500/20 text-xs font-medium text-emerald-200 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
               >
-                <Compass className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <span>Пройти тур</span>
+                <LifeBuoy className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>Поддержка</span>
               </button>
-            )}
-            {onOpenFullFaq && (
-              <button
-                type="button"
-                onClick={onOpenFullFaq}
-                className="min-h-[34px] px-3 rounded-lg border border-white/10 bg-[#0B0F17] hover:bg-white/[0.04] text-xs font-medium text-slate-300 hover:text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
-              >
-                <span>Все вопросы</span>
-                <ArrowRight className="w-3.5 h-3.5 shrink-0" />
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => setSupportModalOpen(true)}
-              className="min-h-[34px] px-3 rounded-lg border border-emerald-500/35 bg-emerald-500/12 hover:bg-emerald-500/20 text-xs font-medium text-emerald-200 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
-            >
-              <LifeBuoy className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span>Связаться с поддержкой</span>
-            </button>
+            </div>
           </div>
         </div>
 

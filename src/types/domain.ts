@@ -432,12 +432,28 @@ export interface LiveScannerOpportunity {
   change24hPct: number;
 }
 
+export interface StrategyLiveTelemetry {
+  strategyKey: string;
+  status: 'SIGNAL_READY' | 'BUILDING' | 'MONITORING';
+  readinessPct: number;
+  bestSymbol: string;
+  bestDirection: 'LONG' | 'SHORT' | 'WAIT';
+  bestConfidence: number;
+  minConfidence: number;
+  rsi14: number | null;
+  trendBias: 'BULLISH' | 'BEARISH' | 'RANGE';
+  matchedSignalsCount: number;
+  reasonRu: string;
+  evaluatedAt: string;
+}
+
 export interface LiveScannerReport {
   tier: PlanTier;
   scannedPairsCount: number;
   totalPairsAvailable: number;
   timeframe: '1h' | '4h';
   opportunities: LiveScannerOpportunity[];
+  strategyTelemetry?: Record<string, StrategyLiveTelemetry>;
   updatedAt: string;
 }
 

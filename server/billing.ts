@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { serverLogger } from './logger.ts';
 import fs from 'fs';
 import path from 'path';
 import { applicationDefault, cert, getApps, initializeApp, type App } from 'firebase-admin/app';
@@ -108,7 +109,7 @@ function getDb(): Firestore | null {
       ? getFirestore(app, config.firestoreDatabaseId)
       : getFirestore(app);
   } catch (err) {
-    console.error('[billing] Не удалось инициализировать Firebase Admin:', err instanceof Error ? err.message : err);
+    serverLogger.error('billing', 'Не удалось инициализировать Firebase Admin:', err instanceof Error ? err.message : err);
     cachedDb = null;
   }
   return cachedDb;
@@ -320,9 +321,9 @@ export function startProExpiryMonitor(): void {
   const run = () => {
     void downgradeExpiredPro()
       .then((n) => {
-        if (n > 0) console.log(`[billing] Возвращено на бесплатный тариф: ${n}`);
+        if (n > 0) serverLogger.info('billing', `Возвращено на бесплатный тариф: ${n}`);
       })
-      .catch((err) => console.error('[billing] Ошибка проверки истёкших подписок:', err instanceof Error ? err.message : err));
+      .catch((err) => serverLogger.error('billing', 'Ошибка проверки истёкших подписок:', err instanceof Error ? err.message : err));
   };
   run();
   setInterval(run, 60 * 60 * 1000);

@@ -1,25 +1,24 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownUp,
   ArrowRight,
   BarChart2,
-  Check,
   Download,
   Flame,
   Grid2x2,
+  Link2,
   ListChecks,
   Lock,
-  Pencil,
   PieChart as PieChartIcon,
   Plus,
   Radar,
   RefreshCw,
   Repeat,
   Search,
+  ShieldCheck,
   Star,
   Table2,
   Target,
-  Trash2,
   Wallet,
   X,
 } from 'lucide-react';
@@ -37,13 +36,15 @@ import {
   YAxis,
 } from 'recharts';
 import { TRADING_PAIRS } from '../data/strategies';
-import type { PaperPortfolioReport } from '../hooks/usePaperPortfolio';
+import type { PaperPortfolioReport, PortfolioSourceMeta } from '../hooks/usePaperPortfolio';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import {
-  fetchJsonWithBackoff,
   getCachedValue,
   setCachedValue,
-  shouldApplyThrottledUpdate,
 } from '../lib/marketCache';
+import { ingestLiveTickers } from '../stores/liveMarketStore';
+import { CACHE_TTL, fetchWithSWR, isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import { usePlan } from '../contexts/PlanContext';
 import { FeatureGuide } from './FeatureGuide';
 import {
@@ -51,8 +52,14 @@ import {
   writeCustomWatchlists,
   type CustomWatchlist,
 } from '../lib/proMaxStore';
-import { parseLocalePositiveNumber, sanitizePlainText, triggerHaptic } from '../lib/securityDlp';
-import type { MarketType, PortfolioHolding, PortfolioTargetRecord, TickerOverview } from '../types/domain';
+import { sanitizePlainText, triggerHaptic } from '../lib/securityDlp';
+import type {
+  ExchangeKeyRecord,
+  MarketType,
+  PortfolioHolding,
+  PortfolioTargetRecord,
+  TickerOverview,
+} from '../types/domain';
 import { FlashValue, StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { MiniSparkline } from './MiniSparkline';
 import { PortfolioStressTestCard } from './PortfolioStressTestCard';
@@ -120,7 +127,7 @@ const ScreenerTableRow: React.FC<ScreenerTableRowProps> = React.memo(
           }
         }}
         aria-label={`Открыть график ${t.symbol}`}
-        className="hover:bg-emerald-500/[0.06] active:bg-emerald-500/[0.1] cursor-pointer transition-colors"
+        className="cv-list-item hover:bg-emerald-500/[0.06] active:bg-emerald-500/[0.1] cursor-pointer transition-colors"
       >
         <td className="py-2.5 pl-2.5 pr-1.5 sm:px-4 font-sans">
           <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
@@ -228,8 +235,11 @@ interface MarketScreenerViewProps {
   onOpenPairOnMarket: (symbol: string, marketType: MarketType) => void;
   holdings: PortfolioHolding[];
   portfolioReport: PaperPortfolioReport;
+  portfolioSource?: PortfolioSourceMeta;
+  exchangeKeys?: ExchangeKeyRecord[];
   activeTarget?: PortfolioTargetRecord | null;
   onOpenPortfolioDetails?: () => void;
+  onOpenExchangeIntegrations?: () => void;
   onAddHolding: (symbol: string, amount: number, avgEntryPrice: number) => void;
   onUpdateHolding?: (id: string, amount: number, avgEntryPrice: number) => void;
   onRemoveHolding: (id: string) => void;
@@ -283,11 +293,14 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   onOpenPairOnMarket,
   holdings,
   portfolioReport,
+  portfolioSource,
+  exchangeKeys = [],
   activeTarget,
   onOpenPortfolioDetails,
-  onAddHolding,
-  onUpdateHolding,
-  onRemoveHolding,
+  onOpenExchangeIntegrations,
+  onAddHolding: _onAddHolding,
+  onUpdateHolding: _onUpdateHolding,
+  onRemoveHolding: _onRemoveHolding,
   externalSection,
 }) => {
   const planCtx = usePlan();
@@ -307,6 +320,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   });
 
   const [search, setSearch] = useState('');
+  const debouncedSearch = useDebouncedValue(search, 250);
   const [filter, setFilter] = useState<ScreenerFilter>('all');
   const [sortBy, setSortBy] = useState<SortField>('volume');
   const [sortAsc, setSortAsc] = useState(false);
@@ -317,6 +331,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   const [activeWatchlistId, setActiveWatchlistId] = useState<string | null>(null);
   const [creatingWl, setCreatingWl] = useState(false);
   const [newWlName, setNewWlName] = useState('');
+  const [selectedMomentumSymbol, setSelectedMomentumSymbol] = useState<string | null>(null);
 
   const [watchlist, setWatchlist] = useState<string[]>(() => {
     try {
@@ -331,17 +346,14 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
   });
 
-  const [newSymbol, setNewSymbol] = useState('BTCUSDT');
-  const [newAmount, setNewAmount] = useState('0.1');
-  const [newEntryPrice, setNewEntryPrice] = useState('90000');
-  const [portfolioError, setPortfolioError] = useState<string | null>(null);
-  const [editingHoldingId, setEditingHoldingId] = useState<string | null>(null);
-  const [editAmount, setEditAmount] = useState<string>('');
-  const [editEntryPrice, setEditEntryPrice] = useState<string>('');
+  const enabledExchangesCount = useMemo(
+    () => exchangeKeys.filter((k) => k.enabled).length,
+    [exchangeKeys]
+  );
 
   useEffect(() => {
     setVisibleCount(20);
-  }, [search, filter, marketType]);
+  }, [debouncedSearch, filter, marketType]);
 
   useEffect(() => {
     if (externalSection) {
@@ -368,6 +380,8 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     }
   }, [watchlist]);
 
+  const overviewAbortRef = useRef<AbortController | null>(null);
+
   const loadOverview = useCallback(
     async (forceRefresh = false) => {
       const cacheKey = `screener_overview_${marketType}`;
@@ -382,65 +396,104 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
       if (forceRefresh) {
         setLoading(true);
       }
+
+      overviewAbortRef.current?.abort();
+      const controller = new AbortController();
+      overviewAbortRef.current = controller;
+
       try {
         const refreshParam = forceRefresh ? '&refresh=1' : '';
-        const res = await fetchJsonWithBackoff<{ tickers: TickerOverview[]; updatedAt?: string }>(
-          `/api/market/overview?marketType=${marketType}${refreshParam}`,
-          { init: { cache: 'no-store' }, retries: 2 }
+        const data = await fetchWithSWR<{ tickers?: TickerOverview[]; updatedAt?: string }>(
+          `market:overview:${marketType}`,
+          async (signal) => {
+            const res = await fetch(`/api/market/overview?marketType=${marketType}${refreshParam}`, {
+              cache: 'no-store',
+              signal,
+            });
+            const parsed = await parseJsonResponse<{ tickers?: TickerOverview[]; updatedAt?: string }>(res);
+            if (!parsed.ok || !parsed.data) {
+              throw new Error(parsed.errorMessage || 'Failed to load overview');
+            }
+            return parsed.data;
+          },
+          {
+            ttlMs: CACHE_TTL.LIVE_OVERVIEW_MS,
+            forceRefresh,
+            signal: controller.signal,
+            onBackgroundUpdate: (fresh) => {
+              const list = fresh.tickers || [];
+              const updatedAt = fresh.updatedAt || new Date().toISOString();
+              if (list.length > 0) {
+                setTickers(list);
+                setLastUpdatedAt(updatedAt);
+                setCachedValue(cacheKey, { tickers: list, updatedAt }, 25_000);
+                ingestLiveTickers(marketType, list, true);
+              }
+            },
+          }
         );
-        if (res.ok && res.data && (forceRefresh || shouldApplyThrottledUpdate(cacheKey, 1000))) {
-          const list = res.data.tickers || [];
-          const updatedAt = res.data.updatedAt || new Date().toISOString();
+
+        if (!controller.signal.aborted) {
+          const list = data.tickers || [];
+          const updatedAt = data.updatedAt || new Date().toISOString();
           setTickers(list);
           setLastUpdatedAt(updatedAt);
           setCachedValue(cacheKey, { tickers: list, updatedAt }, 25_000);
+          if (list.length > 0) {
+            ingestLiveTickers(marketType, list, true);
+          }
         }
       } catch {
-        // Keep prior tickers if network glitch
+        // Keep prior tickers if network glitch or aborted
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
       }
     },
     [marketType]
   );
 
   useEffect(() => {
-    void loadOverview();
-    const intervalId = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+    void loadOverview(false);
+    const intervalId = window.setInterval(() => {
+      if (isPageVisible()) {
         void loadOverview(false);
       }
     }, 15_000);
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
         void loadOverview(false);
       }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
+    });
     return () => {
-      clearInterval(intervalId);
-      document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearInterval(intervalId);
+      unsubVis();
+      overviewAbortRef.current?.abort();
     };
   }, [loadOverview]);
 
-  const toggleWatchlist = (sym: string) => {
-    if (activeWatchlistId && effIsPro) {
-      setCustomWatchlists((prev) => {
-        const next = prev.map((wl) => {
-          if (wl.id !== activeWatchlistId) return wl;
-          const exists = wl.symbols.includes(sym);
-          return {
-            ...wl,
-            symbols: exists ? wl.symbols.filter((s) => s !== sym) : [...wl.symbols, sym],
-          };
+  const toggleWatchlist = useCallback(
+    (sym: string) => {
+      if (activeWatchlistId && effIsPro) {
+        setCustomWatchlists((prev) => {
+          const next = prev.map((wl) => {
+            if (wl.id !== activeWatchlistId) return wl;
+            const exists = wl.symbols.includes(sym);
+            return {
+              ...wl,
+              symbols: exists ? wl.symbols.filter((s) => s !== sym) : [...wl.symbols, sym],
+            };
+          });
+          writeCustomWatchlists(next);
+          return next;
         });
-        writeCustomWatchlists(next);
-        return next;
-      });
-      return;
-    }
-    setWatchlist((prev) => (prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]));
-  };
+        return;
+      }
+      setWatchlist((prev) => (prev.includes(sym) ? prev.filter((s) => s !== sym) : [...prev, sym]));
+    },
+    [activeWatchlistId, effIsPro]
+  );
 
   const handleCreateCustomWatchlist = (e: React.FormEvent) => {
     e.preventDefault();
@@ -504,7 +557,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
   }, [tickers]);
 
   const filteredTickers = useMemo(() => {
-    const q = search.trim().toUpperCase();
+    const q = debouncedSearch.trim().toUpperCase();
     const list = tickers.filter((t) => {
       if (q && !t.symbol.includes(q) && !t.baseAsset.includes(q)) return false;
       if (filter === 'gainers') return t.change24hPct > 0;
@@ -528,57 +581,28 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
     });
 
     return sorted;
-  }, [tickers, search, filter, activeWatchlistSymbols, sortBy, sortAsc]);
+  }, [tickers, debouncedSearch, filter, activeWatchlistSymbols, sortBy, sortAsc]);
 
   const momentumChartData = useMemo(
     () =>
       tickers.map((t) => ({
+        symbol: t.symbol,
         name: t.baseAsset,
+        price: t.price,
         changePct: t.change24hPct,
         volumeM: Number((t.volume24hUsdt / 1_000_000).toFixed(1)),
       })),
     [tickers]
   );
 
-  const handlePrefillMarketPrice = (sym: string) => {
-    const found = tickers.find((t) => t.symbol === sym);
-    if (found) {
-      setNewEntryPrice(String(found.price));
-    }
-  };
+  const selectedMomentumItem = useMemo(
+    () =>
+      momentumChartData.find((d) => d.symbol === selectedMomentumSymbol) ??
+      momentumChartData[0] ??
+      null,
+    [momentumChartData, selectedMomentumSymbol]
+  );
 
-  const handleAddHolding = (e: React.FormEvent) => {
-    e.preventDefault();
-    const amountNum = parseLocalePositiveNumber(newAmount);
-    const entryNum = parseLocalePositiveNumber(newEntryPrice);
-    if (!amountNum || !entryNum) {
-      setPortfolioError('Введите корректные положительные числа (можно через точку или запятую).');
-      return;
-    }
-    setPortfolioError(null);
-    triggerHaptic(10);
-    onAddHolding(newSymbol, amountNum, entryNum);
-  };
-
-  const handleStartEditHolding = (row: { id: string; amount: number; avgEntryPrice: number }) => {
-    setEditingHoldingId(row.id);
-    setEditAmount(String(row.amount));
-    setEditEntryPrice(String(row.avgEntryPrice));
-    setPortfolioError(null);
-  };
-
-  const handleSaveEditHolding = (id: string) => {
-    const amountNum = parseLocalePositiveNumber(editAmount);
-    const entryNum = parseLocalePositiveNumber(editEntryPrice);
-    if (!amountNum || !entryNum) {
-      setPortfolioError('Количество и цена входа должны быть положительными числами.');
-      return;
-    }
-    setPortfolioError(null);
-    triggerHaptic(10);
-    onUpdateHolding?.(id, amountNum, entryNum);
-    setEditingHoldingId(null);
-  };
 
   const handleExportScreenerCsv = () => {
     if (!isPro) {
@@ -1053,7 +1077,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
         )}
 
         {screenerSection === 'momentum' && (
-          <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
+          <section className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
@@ -1061,7 +1085,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                   <span>Карта импульса 24ч (%)</span>
                 </h3>
                 <p className="mt-0.5 text-xs text-slate-400">
-                  Сравнение относительной силы ликвидных активов за последние 24 часа.
+                  Нажмите на любой столбец графика, чтобы увидеть цену монеты и сразу открыть график.
                 </p>
               </div>
               <span className="text-xs font-mono text-slate-400">
@@ -1069,9 +1093,66 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
               </span>
             </div>
 
+            {selectedMomentumItem && (
+              <div className="rounded-xl border border-emerald-500/30 bg-[#0B0F17] px-3.5 py-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono tabular-nums text-xs">
+                  <div className="font-sans">
+                    <span className="text-sm font-bold text-white">{selectedMomentumItem.name}</span>
+                    <span className="text-slate-500 ml-1">/ USDT</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-sans mr-1.5">Цена:</span>
+                    <span className="font-semibold text-white">
+                      {formatUsd(selectedMomentumItem.price)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-sans mr-1.5">24ч:</span>
+                    <span
+                      className={`font-bold ${
+                        selectedMomentumItem.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                      }`}
+                    >
+                      {selectedMomentumItem.changePct >= 0 ? '+' : ''}
+                      {selectedMomentumItem.changePct.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-sans mr-1.5">Объём:</span>
+                    <span className="text-slate-200">${selectedMomentumItem.volumeM}M</span>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(10);
+                    onOpenPairOnMarket(selectedMomentumItem.symbol, marketType);
+                  }}
+                  className="min-h-[34px] px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+                >
+                  <span>Открыть график</span>
+                  <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+                </button>
+              </div>
+            )}
+
             <div className="h-[320px] w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={momentumChartData} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                <BarChart
+                  data={momentumChartData}
+                  margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+                  onClick={(state) => {
+                    const activeLabel = state?.activeLabel;
+                    if (typeof activeLabel === 'string') {
+                      const found = momentumChartData.find((d) => d.name === activeLabel);
+                      if (found) {
+                        triggerHaptic(8);
+                        setSelectedMomentumSymbol(found.symbol);
+                      }
+                    }
+                  }}
+                >
                   <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
                   <XAxis dataKey="name" tick={{ fill: '#94A3B8', fontSize: 11 }} axisLine={false} tickLine={false} />
                   <YAxis
@@ -1081,27 +1162,47 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                     tickFormatter={(v: number) => `${v}%`}
                   />
                   <Tooltip
-                    cursor={{ fill: 'rgba(255,255,255,0.04)' }}
-                    contentStyle={{
-                      backgroundColor: '#0E1420',
-                      borderColor: 'rgba(255,255,255,0.12)',
-                      borderRadius: '12px',
-                      fontSize: '12px',
-                      color: '#F1F5F9',
-                    }}
-                    formatter={(value) => {
-                      const num = Number(value ?? 0);
-                      return [`${num >= 0 ? '+' : ''}${num}%`, 'Изменение 24ч'];
+                    cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                    content={({ active, payload }) => {
+                      if (!active || !payload || !payload[0]?.payload) return null;
+                      const pt = payload[0].payload as (typeof momentumChartData)[number];
+                      return (
+                        <div className="rounded-xl border border-white/15 bg-[#0E1420] px-3 py-2 text-xs shadow-lg font-mono tabular-nums space-y-1">
+                          <div className="font-sans font-bold text-white">{pt.name}/USDT</div>
+                          <div className="text-slate-300">Цена: {formatUsd(pt.price)}</div>
+                          <div className={pt.changePct >= 0 ? 'text-emerald-400 font-semibold' : 'text-rose-400 font-semibold'}>
+                            24ч: {pt.changePct >= 0 ? '+' : ''}
+                            {pt.changePct.toFixed(2)}%
+                          </div>
+                          <div className="text-slate-400">Объём: ${pt.volumeM}M</div>
+                        </div>
+                      );
                     }}
                   />
-                  <Bar dataKey="changePct" radius={[6, 6, 0, 0]}>
-                    {momentumChartData.map((entry, idx) => (
-                      <Cell
-                        key={`bar-${entry.name}-${idx}`}
-                        fill={entry.changePct >= 0 ? '#10B981' : '#EF4444'}
-                        fillOpacity={0.85}
-                      />
-                    ))}
+                  <Bar
+                    dataKey="changePct"
+                    radius={[6, 6, 0, 0]}
+                    cursor="pointer"
+                    onClick={(data) => {
+                      const sym = (data as { symbol?: string })?.symbol;
+                      if (sym) {
+                        triggerHaptic(8);
+                        setSelectedMomentumSymbol(sym);
+                      }
+                    }}
+                  >
+                    {momentumChartData.map((entry, idx) => {
+                      const isSelected = selectedMomentumItem?.symbol === entry.symbol;
+                      return (
+                        <Cell
+                          key={`bar-${entry.name}-${idx}`}
+                          fill={entry.changePct >= 0 ? '#10B981' : '#EF4444'}
+                          fillOpacity={isSelected ? 1 : 0.78}
+                          stroke={isSelected ? '#FFFFFF' : 'none'}
+                          strokeWidth={isSelected ? 1.5 : 0}
+                        />
+                      );
+                    })}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
@@ -1115,13 +1216,28 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
               <div>
                 <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                   <Wallet className="w-4 h-4 text-emerald-400" />
-                  <span>Симулятор спот-портфеля</span>
+                  <span>Биржевой портфель (API)</span>
                 </h3>
                 <p className="mt-0.5 text-xs text-slate-400">
-                  Учебный портфель с автоматической переоценкой по живым котировкам.
+                  VERNIER не хранит средства — отображаются только балансы, синхронизированные с ваших бирж (Binance, Bybit, OKX).
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                {onOpenExchangeIntegrations && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerHaptic(8);
+                      onOpenExchangeIntegrations();
+                    }}
+                    className="min-h-[36px] px-3 rounded-xl border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors"
+                  >
+                    <Link2 className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                    <span>
+                      {enabledExchangesCount > 0 ? 'Синхр. / биржи' : 'Подключить биржу'}
+                    </span>
+                  </button>
+                )}
                 {onOpenPortfolioDetails && (
                   <button
                     type="button"
@@ -1172,193 +1288,108 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
                       portfolioReport.totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'
                     }`}
                   >
-                    Всего PnL:{' '}
+                    24ч PnL:{' '}
                     {privacyMode
                       ? '•••••'
-                      : `${portfolioReport.totalPnl >= 0 ? '+' : ''}$${portfolioReport.totalPnl.toFixed(2)}`}{' '}
-                    ({portfolioReport.totalPnlPct >= 0 ? '+' : ''}
-                    {portfolioReport.totalPnlPct.toFixed(2)}%)
+                      : `${portfolioReport.dailyPnlUsdt >= 0 ? '+' : ''}$${portfolioReport.dailyPnlUsdt.toFixed(2)}`}{' '}
+                    ({portfolioReport.dailyPnlPct >= 0 ? '+' : ''}
+                    {portfolioReport.dailyPnlPct.toFixed(2)}%)
                   </div>
                 </div>
               </div>
             </div>
 
-            {portfolioError && (
-              <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
-                {portfolioError}
+            {/* Non-custodial source status bar */}
+            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.05] px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-2 min-w-0 text-slate-200">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span className="min-w-0">
+                  {portfolioSource?.mode === 'exchange' && portfolioSource.exchange ? (
+                    <>
+                      Источник баланса:{' '}
+                      <strong className="text-emerald-300">
+                        {portfolioSource.exchange.toUpperCase()}
+                        {portfolioSource.label ? ` (${portfolioSource.label})` : ''}
+                      </strong>
+                      {portfolioSource.syncedAt && (
+                        <span className="text-slate-400 font-mono text-[11px]">
+                          {' '}· обновлён {new Date(portfolioSource.syncedAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      Режим <strong className="text-white">Non-Custodial</strong>: подключите Read-Only или Trade API ключ биржи в «Защита → Биржи API», чтобы видеть реальный баланс.
+                    </>
+                  )}
+                </span>
               </div>
-            )}
-
-            <form onSubmit={handleAddHolding} className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
-              <div className="sm:col-span-4">
-                <label htmlFor="pf-symbol" className="block text-[11px] text-slate-400 mb-1">
-                  Актив
-                </label>
-                <select
-                  id="pf-symbol"
-                  value={newSymbol}
-                  onChange={(e) => {
-                    setNewSymbol(e.target.value);
-                    handlePrefillMarketPrice(e.target.value);
-                  }}
-                  className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-emerald-500 focus:outline-none"
-                >
-                  {TRADING_PAIRS.map((p) => (
-                    <option key={p.symbol} value={p.symbol}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="sm:col-span-3">
-                <label htmlFor="pf-amount" className="block text-[11px] text-slate-400 mb-1">
-                  Кол-во (точка или запятая)
-                </label>
-                <input
-                  id="pf-amount"
-                  type="text"
-                  inputMode="decimal"
-                  value={newAmount}
-                  onChange={(e) => setNewAmount(e.target.value)}
-                  placeholder="0,15"
-                  className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-emerald-500 focus:outline-none"
-                />
-              </div>
-              <div className="sm:col-span-3">
-                <label htmlFor="pf-price" className="block text-[11px] text-slate-400 mb-1">
-                  Цена входа ($)
-                </label>
-                <input
-                  id="pf-price"
-                  type="text"
-                  inputMode="decimal"
-                  value={newEntryPrice}
-                  onChange={(e) => setNewEntryPrice(e.target.value)}
-                  placeholder="64000,50"
-                  className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white focus:border-emerald-500 focus:outline-none"
-                />
-              </div>
-              <div className="sm:col-span-2">
+              {onOpenExchangeIntegrations && (
                 <button
-                  type="submit"
-                  className="w-full min-h-[38px] rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center justify-center gap-1 transition-colors"
+                  type="button"
+                  onClick={onOpenExchangeIntegrations}
+                  className="text-emerald-300 hover:text-emerald-200 font-semibold whitespace-nowrap shrink-0"
                 >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Добавить</span>
+                  Настроить API →
                 </button>
-              </div>
-            </form>
+              )}
+            </div>
 
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
               <div className="md:col-span-7 overflow-x-auto">
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-white/8 text-slate-400">
-                      <th className="py-2 font-medium">Актив</th>
+                      <th className="py-2 font-medium">Актив биржи</th>
                       <th className="py-2 font-medium text-right">Оценка</th>
-                      <th className="py-2 font-medium text-right">PnL %</th>
-                      <th className="py-2 font-medium text-right" />
+                      <th className="py-2 font-medium text-right">24ч %</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/6 font-mono tabular-nums">
                     {portfolioReport.rows.length === 0 ? (
                       <tr>
-                        <td colSpan={4} className="py-6 text-center font-sans text-slate-400">
-                          Добавьте первый актив, чтобы рассчитать распределение портфеля.
+                        <td colSpan={3} className="py-7 text-center font-sans text-slate-400 space-y-2.5">
+                          <p>
+                            Нет синхронизированных балансов бирж. Для виртуальной тренировки используйте тренажёр Paper Trading в разделе «Рынок».
+                          </p>
+                          {onOpenExchangeIntegrations && (
+                            <button
+                              type="button"
+                              onClick={onOpenExchangeIntegrations}
+                              className="min-h-[36px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                            >
+                              <Link2 className="w-3.5 h-3.5" />
+                              <span>Подключить Binance / Bybit / OKX</span>
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ) : (
-                      portfolioReport.rows.map((row) => {
-                        const isEditingRow = editingHoldingId === row.id;
-                        return (
-                          <tr key={row.id}>
-                            <td className="py-2 font-sans">
-                              <div className="font-semibold text-white">{row.baseAsset}</div>
-                              {isEditingRow ? (
-                                <div className="mt-1 flex items-center gap-1.5 font-mono">
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={editAmount}
-                                    onChange={(e) => setEditAmount(e.target.value)}
-                                    aria-label="Новое количество"
-                                    className="w-20 rounded-lg border border-emerald-500/40 bg-[#0B0F17] px-2 py-1 text-[11px] text-white"
-                                  />
-                                  <span className="text-slate-500">×</span>
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={editEntryPrice}
-                                    onChange={(e) => setEditEntryPrice(e.target.value)}
-                                    aria-label="Новая цена входа"
-                                    className="w-24 rounded-lg border border-emerald-500/40 bg-[#0B0F17] px-2 py-1 text-[11px] text-white"
-                                  />
-                                </div>
-                              ) : (
-                                <div className="text-[11px] font-mono text-slate-400">
-                                  {effPrivacy ? '••••' : row.amount} × {formatUsd(row.avgEntryPrice)}
-                                </div>
-                              )}
-                            </td>
-                            <td className="py-2 text-right text-slate-100 whitespace-nowrap">
-                              {effPrivacy ? '•••••' : `$${row.valueUsdt.toFixed(2)}`}
-                            </td>
-                            <td
-                              className={`py-2 text-right font-semibold whitespace-nowrap ${
-                                row.pnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                              }`}
-                            >
-                              {row.pnlPct >= 0 ? '+' : ''}
-                              {row.pnlPct.toFixed(1)}%
-                            </td>
-                            <td className="py-2 text-right">
-                              <div className="inline-flex items-center gap-1">
-                                {isEditingRow ? (
-                                  <>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSaveEditHolding(row.id)}
-                                      aria-label="Сохранить позицию"
-                                      className="p-1.5 rounded-lg text-emerald-400 hover:bg-emerald-500/15 transition-colors"
-                                    >
-                                      <Check className="w-3.5 h-3.5" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditingHoldingId(null)}
-                                      aria-label="Отменить редактирование"
-                                      className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 transition-colors"
-                                    >
-                                      <X className="w-3.5 h-3.5" />
-                                    </button>
-                                  </>
-                                ) : (
-                                  <>
-                                    {onUpdateHolding && (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleStartEditHolding(row)}
-                                        aria-label={`Изменить позицию ${row.baseAsset}`}
-                                        className="p-1.5 rounded-lg text-slate-500 hover:text-emerald-300 hover:bg-emerald-500/10 transition-colors"
-                                      >
-                                        <Pencil className="w-3.5 h-3.5" />
-                                      </button>
-                                    )}
-                                    <button
-                                      type="button"
-                                      onClick={() => onRemoveHolding(row.id)}
-                                      aria-label={`Удалить позицию ${row.baseAsset}`}
-                                      className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })
+                      portfolioReport.rows.map((row) => (
+                        <tr
+                          key={row.id}
+                          onClick={() => onOpenPairOnMarket(row.symbol, 'spot')}
+                          className="hover:bg-white/[0.03] cursor-pointer transition-colors"
+                        >
+                          <td className="py-2.5 font-sans">
+                            <div className="font-semibold text-white">{row.baseAsset}</div>
+                            <div className="text-[11px] font-mono text-slate-400">
+                              {effPrivacy ? '••••' : row.amount} × {formatUsd(row.livePrice)}
+                            </div>
+                          </td>
+                          <td className="py-2.5 text-right text-slate-100 whitespace-nowrap">
+                            {effPrivacy ? '•••••' : `$${row.valueUsdt.toFixed(2)}`}
+                          </td>
+                          <td
+                            className={`py-2.5 text-right font-semibold whitespace-nowrap ${
+                              row.dailyPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                            }`}
+                          >
+                            {row.dailyPnlPct >= 0 ? '+' : ''}
+                            {row.dailyPnlPct.toFixed(2)}%
+                          </td>
+                        </tr>
+                      ))
                     )}
                   </tbody>
                 </table>

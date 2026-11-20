@@ -1,11 +1,14 @@
+import { attachSecurityHeaders, invalidateCsrfTokenCache } from '../lib/authFetch';
+
 export interface SafeFetchResult<T> {
   ok: boolean;
   status: number;
   data: T | null;
   errorMessage: string | null;
+  isHtml?: boolean;
 }
 
-export async function parseJsonResponse<T extends Record<string, unknown>>(
+export async function parseJsonResponse<T = Record<string, unknown>>(
   res: Response
 ): Promise<SafeFetchResult<T>> {
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -33,8 +36,9 @@ export async function parseJsonResponse<T extends Record<string, unknown>>(
       ok: false,
       status: res.status,
       data: null,
+      isHtml: true,
       errorMessage:
-        'Сервер временно недоступен или обновляется (получена HTML-страница вместо JSON). Повторите запрос через пару секунд.',
+        'Сервер временно обновляется. Переключаемся на локальный режим расчёта.',
     };
   }
 
@@ -51,9 +55,13 @@ export async function parseJsonResponse<T extends Record<string, unknown>>(
   }
 
   if (!res.ok) {
+    const rawErr =
+      parsed && typeof parsed === 'object' && 'error' in parsed
+        ? (parsed as { error?: unknown }).error
+        : undefined;
     const serverErr =
-      typeof parsed.error === 'string' && parsed.error.trim()
-        ? parsed.error.trim()
+      typeof rawErr === 'string' && rawErr.trim()
+        ? rawErr.trim()
         : `Ошибка сервера (HTTP ${res.status}).`;
     return {
       ok: false,
@@ -75,7 +83,7 @@ export async function parseJsonResponse<T extends Record<string, unknown>>(
  * Safely parses JSON API responses even if an upstream proxy, CDN, or restarting dev server
  * returns an HTML error page (e.g. "<!doctype html>") or empty body.
  */
-export async function safeFetchJson<T extends Record<string, unknown>>(
+export async function safeFetchJson<T = Record<string, unknown>>(
   input: RequestInfo | URL,
   init?: RequestInit & { timeoutMs?: number }
 ): Promise<SafeFetchResult<T>> {
@@ -95,10 +103,24 @@ export async function safeFetchJson<T extends Record<string, unknown>>(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(input, {
-      ...fetchInit,
+    const secured = await attachSecurityHeaders(input, fetchInit, false);
+    let res = await fetch(input, {
+      ...secured,
       signal: controller.signal,
     });
+
+    if (res.status === 403 && typeof input === 'string' && input.startsWith('/api/')) {
+      const probe = await res.clone().text().catch(() => '');
+      if (probe.includes('CSRF_INVALID')) {
+        invalidateCsrfTokenCache();
+        const refreshed = await attachSecurityHeaders(input, fetchInit, true);
+        res = await fetch(input, {
+          ...refreshed,
+          signal: controller.signal,
+        });
+      }
+    }
+
     return await parseJsonResponse<T>(res);
   } catch (err) {
     const isAbort =

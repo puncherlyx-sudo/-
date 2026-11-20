@@ -1,4 +1,5 @@
 import type { PlanTier, PriceAlertRecord, TradeJournalEntry } from '../types/domain';
+import { clearDecryptedSecretsFromMemory } from './securityDlp';
 
 export type ThemeMode = 'emerald' | 'oled';
 
@@ -42,6 +43,7 @@ export const STORAGE_KEYS = {
   theme: 'vernier_theme_mode_v1',
   privacyMode: 'vernier_privacy_mode_v1',
   pinHash: 'vernier_pin_hash_v1',
+  pinSalt: 'vernier_pin_salt_v2',
   pinTimeoutMin: 'vernier_pin_timeout_min_v1',
   antiPhishing: 'vernier_anti_phishing_v1',
   demoPlan: 'vernier_demo_plan_override_v1',
@@ -106,6 +108,17 @@ export function getPinHash(): string | null {
 
 export function setPinHash(hash: string | null): void {
   safeSet(STORAGE_KEYS.pinHash, hash);
+  if (!hash) {
+    safeSet(STORAGE_KEYS.pinSalt, null);
+  }
+}
+
+export function getPinSalt(): string | null {
+  return safeGet<string | null>(STORAGE_KEYS.pinSalt, null);
+}
+
+export function setPinSalt(salt: string | null): void {
+  safeSet(STORAGE_KEYS.pinSalt, salt);
 }
 
 export function getPinTimeoutMinutes(): 0 | 1 | 5 | 15 {
@@ -126,7 +139,12 @@ export function setAntiPhishingCode(code: string): void {
   safeSet(STORAGE_KEYS.antiPhishing, code.trim().slice(0, 24));
 }
 
+/**
+ * Demo Tier Switcher строго изолирован в DEV-сборке (`import.meta.env.DEV`).
+ * В production всегда возвращает null и игнорирует любые попытки записи.
+ */
 export function getDemoPlanOverride(): DemoPlanOverride | null {
+  if (!import.meta.env.DEV) return null;
   const val = safeGet<DemoPlanOverride | null>(STORAGE_KEYS.demoPlan, null);
   if (!val || (val.tier !== 'free' && val.tier !== 'pro' && val.tier !== 'max')) return null;
   return {
@@ -136,6 +154,10 @@ export function getDemoPlanOverride(): DemoPlanOverride | null {
 }
 
 export function setDemoPlanOverride(override: DemoPlanOverride | null): void {
+  if (!import.meta.env.DEV) {
+    safeSet(STORAGE_KEYS.demoPlan, null);
+    return;
+  }
   safeSet(STORAGE_KEYS.demoPlan, override);
 }
 
@@ -377,8 +399,17 @@ export function exportAllUserDataJson(extra?: Record<string, unknown>): string {
   return JSON.stringify(payload, null, 2);
 }
 
-export function wipeAllLocalAppData(): void {
+/**
+ * Полная очистка всех локальных данных (GDPR / Закон Украины № 2297-VI):
+ * - Очистка оперативной памяти расшифрованных секретов
+ * - localStorage и sessionStorage
+ * - Всех баз IndexedDB (включая Firebase/Firestore кэш)
+ * - Всех кэшей Service Worker (Cache Storage)
+ */
+export async function wipeAllLocalAppData(): Promise<void> {
+  clearDecryptedSecretsFromMemory();
   if (typeof window === 'undefined') return;
+
   try {
     window.localStorage.clear();
   } catch {
@@ -389,10 +420,108 @@ export function wipeAllLocalAppData(): void {
   } catch {
     // ignore
   }
+
+  // Полная очистка IndexedDB
+  if (typeof indexedDB !== 'undefined') {
+    const dbNames = new Set<string>([
+      'firebaseLocalStorageDb',
+      'firebase-heartbeat-database',
+      'firebase-installations-database',
+    ]);
+    try {
+      const idbWithList = indexedDB as IDBFactory & {
+        databases?: () => Promise<Array<{ name?: string }>>;
+      };
+      if (typeof idbWithList.databases === 'function') {
+        const list = await idbWithList.databases();
+        for (const item of list) {
+          if (item?.name) dbNames.add(item.name);
+        }
+      }
+    } catch {
+      // Fallback на базовый список
+    }
+
+    await Promise.all(
+      Array.from(dbNames).map(
+        (name) =>
+          new Promise<void>((resolve) => {
+            try {
+              const req = indexedDB.deleteDatabase(name);
+              req.onsuccess = () => resolve();
+              req.onerror = () => resolve();
+              req.onblocked = () => resolve();
+            } catch {
+              resolve();
+            }
+          })
+      )
+    );
+  }
+
+  // Полная очистка кэшей Service Worker
   if ('caches' in window) {
-    void window.caches
-      .keys()
-      .then((keys) => Promise.all(keys.map((k) => window.caches.delete(k))))
-      .catch(() => undefined);
+    try {
+      const keys = await window.caches.keys();
+      await Promise.all(keys.map((k) => window.caches.delete(k)));
+    } catch {
+      // ignore
+    }
   }
 }
+
+const DEPRECATED_EXACT_KEYS = new Set<string>([
+  // Устаревший небезопасный сырой AES-ключ до миграции на PBKDF2
+  'vernier_vault_key_v1',
+  'aegisquant_vault_key_v1',
+  'aegisquant_local_aes_key',
+  'aegisquant_demo_plan_v0',
+  'aegis_news_cache_v0',
+  'aegis_market_cache_v0',
+  'vernier_news_cache_v0',
+  'vernier_candles_cache_v0',
+  'vernier_legacy_pin_v0',
+]);
+
+const DEPRECATED_KEY_PREFIXES = [
+  'aegisquant_v0_',
+  'aegis_old_',
+  'aegis_legacy_',
+  'vernier_legacy_',
+  'vernier_tmp_',
+];
+
+/**
+ * Очищает устаревшие ключи localStorage от прошлых версий приложения,
+ * сохраняя footprint браузера компактным и удаляя устаревшие кэши.
+ */
+export function cleanupOldCache(): { removedKeys: string[]; freedBytes: number } {
+  const removedKeys: string[] = [];
+  let freedBytes = 0;
+  if (typeof window === 'undefined') return { removedKeys, freedBytes };
+
+  try {
+    const keysToDelete: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (!key) continue;
+      const isDeprecatedExact = DEPRECATED_EXACT_KEYS.has(key);
+      const isDeprecatedPrefix = DEPRECATED_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+      if (isDeprecatedExact || isDeprecatedPrefix) {
+        keysToDelete.push(key);
+      }
+    }
+
+    for (const key of keysToDelete) {
+      const raw = window.localStorage.getItem(key);
+      freedBytes += (key.length + (raw?.length ?? 0)) * 2;
+      window.localStorage.removeItem(key);
+      removedKeys.push(key);
+    }
+  } catch {
+    // ignore storage access errors
+  }
+
+  return { removedKeys, freedBytes };
+}
+

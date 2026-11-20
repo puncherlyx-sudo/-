@@ -14,6 +14,7 @@ import {
   Check,
   ChevronDown,
   Clock,
+  Copy,
   Crown,
   Flame,
   Gauge,
@@ -58,6 +59,7 @@ import type {
   AnalysisRecord,
   AnalysisResultPayload,
   CandlePoint,
+  EquityCurvePoint,
   ExchangeKeyRecord,
   ExchangeOrderResult,
   IndicatorSnapshot,
@@ -66,6 +68,8 @@ import type {
   PriceAlertRecord,
   RibbonPeriods,
   RibbonType,
+  StrategyBreakdownResult,
+  StrategyPerformanceReport,
   SupportTicketCategory,
   SupportTicketRecord,
   TickerOverview,
@@ -119,7 +123,18 @@ import { AiComplianceFooter } from './LegalConsentModal';
 import { OrderTransferCard } from './OrderTransferCard';
 import { PaperTradingPanel } from './PaperTradingPanel';
 import { AiConsiliumMaxPanel, ProLadderCalculator } from './TerminalProMaxModules';
+import { readPaperAccount } from '../lib/proMaxStore';
 import { DLP_WARNING_MESSAGE, detectSensitiveWalletInput, triggerHaptic } from '../lib/securityDlp';
+import {
+  buildChartSignalMarkers,
+  calculateSignalProgress,
+  chartMarkerToSignalOverlay,
+  ENGINE_STATE_META,
+  strategyEventStream,
+  type ActiveStrategySignalOverlay,
+  type ChartSignalMarker,
+  type StrategySignalEvent,
+} from '../lib/strategyEngine';
 
 type MarketSection = 'chart' | 'ai' | 'depth' | 'oscillators' | 'sentiment' | 'pairs';
 type AssetQuickFilter = 'all' | 'volume' | 'volatile' | 'new_listings' | 'favorites';
@@ -154,7 +169,12 @@ interface MarketTerminalViewProps {
   priceAlerts: PriceAlertRecord[];
   supportTickets: SupportTicketRecord[];
   pushSubscribed: boolean;
-  externalSelection?: { symbol: string; marketType: MarketType; nonce: number } | null;
+  externalSelection?: {
+    symbol: string;
+    marketType: MarketType;
+    nonce: number;
+    signalOverlay?: ActiveStrategySignalOverlay | null;
+  } | null;
   onRequireLogin: () => void;
   onUpgradePro: () => void;
   onUpgradeMax?: () => void;
@@ -212,6 +232,7 @@ interface MarketTerminalViewProps {
       takeProfit?: number;
     }
   ) => Promise<ExchangeOrderResult>;
+  portfolioBalanceUsdt?: number;
 }
 
 const RIBBON_PRESETS: Array<{ id: string; label: string; type: RibbonType; periods: RibbonPeriods }> = [
@@ -278,11 +299,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
   exchangeKeys = [],
   onOpenExchangeIntegrations,
   onPlaceExchangeOrder,
+  portfolioBalanceUsdt = 0,
 }) => {
   const [selectedExecKeyId, setSelectedExecKeyId] = useState<string>('');
   const [executingSignalOrder, setExecutingSignalOrder] = useState(false);
   const [signalOrderStatus, setSignalOrderStatus] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
   const [dlpSearchAlert, setDlpSearchAlert] = useState<string | null>(null);
+  const [portfolioDepositHint, setPortfolioDepositHint] = useState<string | null>(null);
   const [strategyPickerOpen, setStrategyPickerOpen] = useState(false);
   const [marketSection, setMarketSection] = useState<MarketSection>('chart');
   const [assetFilter, setAssetFilter] = useState<AssetQuickFilter>('all');
@@ -407,17 +430,58 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     return () => window.removeEventListener('aegis:tour-focus', handleTourFocus);
   }, []);
 
+  const [activeSignalOverlay, setActiveSignalOverlay] = useState<ActiveStrategySignalOverlay | null>(
+    null
+  );
+  const [selectedChartSignalId, setSelectedChartSignalId] = useState<string | null>(null);
+  const [showChartSignals, setShowChartSignals] = useState<boolean>(true);
+  const [signalOverlayTab, setSignalOverlayTab] = useState<'levels' | 'backtest'>('levels');
+  const [signalBacktestInterval, setSignalBacktestInterval] = useState<'1h' | '4h' | '1d'>('1h');
+  const [signalBacktestCache, setSignalBacktestCache] = useState<
+    Record<
+      string,
+      {
+        breakdown: StrategyBreakdownResult;
+        equityCurve: EquityCurvePoint[];
+        dataSource: 'live' | 'cached';
+        interval: '1h' | '4h' | '1d';
+      }
+    >
+  >({});
+  const [signalBacktestLoading, setSignalBacktestLoading] = useState(false);
+  const [signalBacktestError, setSignalBacktestError] = useState<string | null>(null);
+  const [copiedSignalPlan, setCopiedSignalPlan] = useState(false);
+  const renderedEntryMarkerKeysRef = useRef<Set<string>>(new Set());
+  const [streamSignalEvents, setStreamSignalEvents] = useState<StrategySignalEvent[]>(() =>
+    strategyEventStream.getEvents()
+  );
+
+  useEffect(() => {
+    return strategyEventStream.subscribe((events) => {
+      setStreamSignalEvents(events);
+    });
+  }, []);
+
   useEffect(() => {
     if (!externalSelection) return;
     setSymbol(externalSelection.symbol);
     setMarketType(externalSelection.marketType);
     setActiveResult(null);
     setDraftAlertPrice(null);
+    setActiveSignalOverlay(externalSelection.signalOverlay ?? null);
+    setSelectedChartSignalId(null);
+    if (externalSelection.signalOverlay) {
+      setShowChartSignals(true);
+      // Включаем нативный свечной график Vernier, чтобы линии и маркеры Entry / SL / TP были видны сразу
+      setChartEngine('native');
+      saveChartEngine('native');
+    }
     setMarketSection('chart');
   }, [externalSelection]);
 
   useEffect(() => {
     setDraftAlertPrice(null);
+    setSelectedChartSignalId(null);
   }, [symbol, marketType]);
 
   const activePlanTier = getActivePlanTier(profile);
@@ -908,9 +972,245 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
     }
   };
 
-  const entryOverlay = parseFirstPrice(activeResult?.entryZone);
-  const slOverlay = parseFirstPrice(activeResult?.stopLoss);
-  const tpOverlay = parseFirstPrice(activeResult?.takeProfits?.[0]);
+  const matchedSignalOverlay =
+    activeSignalOverlay &&
+    activeSignalOverlay.symbol === symbol &&
+    activeSignalOverlay.marketType === marketType
+      ? activeSignalOverlay
+      : null;
+
+  const pairChartSignals = useMemo(
+    () =>
+      buildChartSignalMarkers({
+        symbol,
+        marketType,
+        activeOverlay: matchedSignalOverlay,
+        streamEvents: streamSignalEvents,
+        analyses,
+      }),
+    [symbol, marketType, matchedSignalOverlay, streamSignalEvents, analyses]
+  );
+
+  // Если пользователь не выбрал конкретный оверлей вручную, но есть входящий живой сигнал по этой паре —
+  // показываем его уровни Entry / TP / SL на графике автоматически при включённом слое сигналов.
+  const effectiveSignalOverlay = useMemo<ActiveStrategySignalOverlay | null>(() => {
+    if (matchedSignalOverlay) return matchedSignalOverlay;
+    if (!showChartSignals) return null;
+    const incoming = pairChartSignals.find((m) => m.source === 'incoming');
+    return incoming ? chartMarkerToSignalOverlay(incoming) : null;
+  }, [matchedSignalOverlay, showChartSignals, pairChartSignals]);
+
+  const handleSelectChartSignalMarker = useCallback((marker: ChartSignalMarker) => {
+    triggerHaptic(8);
+    setSelectedChartSignalId(marker.id);
+    setActiveSignalOverlay(chartMarkerToSignalOverlay(marker));
+    setShowChartSignals(true);
+    setChartEngine('native');
+    saveChartEngine('native');
+  }, []);
+
+  const entryOverlay = effectiveSignalOverlay?.entryPrice ?? parseFirstPrice(activeResult?.entryZone);
+  const slOverlay = effectiveSignalOverlay?.stopLossPrice ?? parseFirstPrice(activeResult?.stopLoss);
+  const tp1Overlay = effectiveSignalOverlay?.tp1Price ?? null;
+  const tpOverlay =
+    effectiveSignalOverlay?.takeProfitPrice ?? parseFirstPrice(activeResult?.takeProfits?.[0]);
+  const liveSignalPrice =
+    indicators?.lastPrice ?? activeTicker?.price ?? effectiveSignalOverlay?.entryPrice ?? 0;
+  const signalProgress = useMemo(
+    () => (effectiveSignalOverlay ? calculateSignalProgress(effectiveSignalOverlay, liveSignalPrice) : null),
+    [effectiveSignalOverlay, liveSignalPrice]
+  );
+
+  // Trigger haptic notification (12ms) whenever a new 'Entry' signal marker is rendered on the chart
+  useEffect(() => {
+    if (chartEngine === 'tradingview') return;
+    const nextEntryKeys: string[] = [];
+
+    if (typeof entryOverlay === 'number' && Number.isFinite(entryOverlay) && entryOverlay > 0) {
+      const overlayKey = [
+        'active-entry',
+        symbol,
+        marketType,
+        effectiveSignalOverlay?.strategyKey ?? activeStrategy?.key ?? 'ai',
+        effectiveSignalOverlay?.direction ?? activeResult?.direction ?? 'SIG',
+        entryOverlay.toFixed(6),
+      ].join('|');
+      nextEntryKeys.push(overlayKey);
+    }
+
+    if (showChartSignals && pairChartSignals.length > 0) {
+      for (const marker of pairChartSignals) {
+        if (marker.source === 'incoming' || marker.source === 'active') {
+          nextEntryKeys.push(
+            `marker-entry|${marker.id}|${marker.symbol}|${marker.direction}|${marker.entryPrice.toFixed(6)}`
+          );
+        }
+      }
+    }
+
+    let hasNewEntryMarker = false;
+    for (const key of nextEntryKeys) {
+      if (!renderedEntryMarkerKeysRef.current.has(key)) {
+        renderedEntryMarkerKeysRef.current.add(key);
+        hasNewEntryMarker = true;
+      }
+    }
+
+    if (hasNewEntryMarker) {
+      triggerHaptic(12);
+    }
+  }, [
+    chartEngine,
+    showChartSignals,
+    entryOverlay,
+    symbol,
+    marketType,
+    effectiveSignalOverlay?.strategyKey,
+    effectiveSignalOverlay?.direction,
+    activeStrategy?.key,
+    activeResult?.direction,
+    pairChartSignals,
+  ]);
+
+  const effectiveBacktestInterval: '1h' | '4h' | '1d' =
+    signalBacktestInterval === '1d' && !isMax ? '4h' : signalBacktestInterval;
+  const signalBacktestCacheKey = effectiveSignalOverlay
+    ? `${effectiveSignalOverlay.strategyKey}|${effectiveSignalOverlay.symbol}|${effectiveBacktestInterval}`
+    : null;
+  const activeSignalBacktest = signalBacktestCacheKey
+    ? signalBacktestCache[signalBacktestCacheKey] ?? null
+    : null;
+
+  const fetchSignalStrategyBacktest = useCallback(
+    async (
+      overlay: ActiveStrategySignalOverlay,
+      interval: '1h' | '4h' | '1d',
+      force = false
+    ) => {
+      const cacheKey = `${overlay.strategyKey}|${overlay.symbol}|${interval}`;
+      if (!force && signalBacktestCache[cacheKey]) return;
+
+      const tpl = STRATEGY_CATALOG.find((s) => s.key === overlay.strategyKey);
+      const pairs = Array.from(new Set([overlay.symbol, 'BTCUSDT', 'ETHUSDT', 'SOLUSDT']));
+
+      setSignalBacktestLoading(true);
+      setSignalBacktestError(null);
+      try {
+        const res = await authFetch('/api/strategies/pnl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            interval,
+            depositUsdt: Math.max(100, depositUsdt),
+            scope: 'all',
+            demoTier: activePlanTier,
+            strategies: [
+              {
+                strategyKey: overlay.strategyKey,
+                name: tpl?.name ?? overlay.strategyName,
+                shortTag: tpl?.shortTag ?? (overlay.marketType === 'futures' ? 'Фьючерсы' : 'Спот'),
+                marketType: tpl?.marketType ?? overlay.marketType,
+                enabled: true,
+                riskPerTradePct: tpl?.defaultRiskPct ?? riskPct,
+                leverage:
+                  (tpl?.marketType ?? overlay.marketType) === 'futures'
+                    ? tpl?.defaultLeverage ?? Math.max(2, leverage)
+                    : 1,
+                pairs,
+              },
+            ],
+          }),
+        });
+        const parsed = await parseJsonResponse<StrategyPerformanceReport>(res);
+        if (!parsed.ok || !parsed.data) {
+          throw new Error(parsed.errorMessage || 'Не удалось загрузить бэктест стратегии.');
+        }
+        const matchedRow =
+          parsed.data.breakdown.find((row) => row.strategyKey === overlay.strategyKey) ??
+          parsed.data.breakdown[0] ?? {
+            strategyKey: overlay.strategyKey,
+            name: overlay.strategyName,
+            shortTag: overlay.marketType === 'futures' ? 'Фьючерсы' : 'Спот',
+            marketType: overlay.marketType,
+            enabled: true,
+            totalPnlPct: parsed.data.summary.totalPnlPct,
+            totalPnlUsdt: parsed.data.summary.totalPnlUsdt,
+            winRatePct: parsed.data.summary.winRatePct,
+            tradesCount: parsed.data.summary.totalTrades,
+            profitFactor: parsed.data.summary.profitFactor,
+            maxDrawdownPct: parsed.data.summary.maxDrawdownPct,
+            avgRiskReward: `1:${overlay.riskRewardRatio}`,
+          };
+
+        setSignalBacktestCache((prev) => ({
+          ...prev,
+          [cacheKey]: {
+            breakdown: matchedRow,
+            equityCurve: parsed.data!.equityCurve || [],
+            dataSource: parsed.data!.dataSource,
+            interval: parsed.data!.interval,
+          },
+        }));
+      } catch (err) {
+        setSignalBacktestError(
+          err instanceof Error ? err.message : 'Ошибка расчёта исторического бэктеста.'
+        );
+      } finally {
+        setSignalBacktestLoading(false);
+      }
+    },
+    [signalBacktestCache, depositUsdt, activePlanTier, riskPct, leverage]
+  );
+
+  useEffect(() => {
+    if (signalOverlayTab !== 'backtest' || !effectiveSignalOverlay) return;
+    void fetchSignalStrategyBacktest(effectiveSignalOverlay, effectiveBacktestInterval);
+  }, [signalOverlayTab, effectiveSignalOverlay, effectiveBacktestInterval, fetchSignalStrategyBacktest]);
+
+  const signalPositionSizing = useMemo(() => {
+    if (!effectiveSignalOverlay) return null;
+    const riskDist = Math.abs(effectiveSignalOverlay.entryPrice - effectiveSignalOverlay.stopLossPrice);
+    if (riskDist <= 1e-9 || effectiveSignalOverlay.entryPrice <= 0) return null;
+    const riskUsd = Math.max(1, (depositUsdt * riskPct) / 100);
+    const units = riskUsd / riskDist;
+    const notionalUsd = units * effectiveSignalOverlay.entryPrice;
+    const rewardTp2Usd =
+      units * Math.abs(effectiveSignalOverlay.takeProfitPrice - effectiveSignalOverlay.entryPrice);
+    return {
+      riskUsd,
+      units,
+      notionalUsd,
+      rewardTp2Usd,
+    };
+  }, [effectiveSignalOverlay, depositUsdt, riskPct]);
+
+  const handleCopySignalPlan = useCallback(async () => {
+    if (!effectiveSignalOverlay) return;
+    const pairTitle = `${effectiveSignalOverlay.symbol.replace('USDT', '')}/USDT`;
+    const lines = [
+      `VERNIER · ${pairTitle} (${effectiveSignalOverlay.marketType === 'futures' ? 'Futures' : 'Spot'}) · ${effectiveSignalOverlay.direction}`,
+      `Стратегия: ${effectiveSignalOverlay.strategyName} (${effectiveSignalOverlay.confidence}%)`,
+      `Вход (Entry): ${formatUsd(effectiveSignalOverlay.entryPrice)}`,
+      `Stop-Loss: ${formatUsd(effectiveSignalOverlay.stopLossPrice)}`,
+      `Take-Profit 1: ${formatUsd(effectiveSignalOverlay.tp1Price)}`,
+      `Take-Profit 2: ${formatUsd(effectiveSignalOverlay.takeProfitPrice)} (R:R 1:${effectiveSignalOverlay.riskRewardRatio})`,
+    ];
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(lines.join('\n'));
+      }
+      triggerHaptic(10);
+      setCopiedSignalPlan(true);
+      window.setTimeout(() => setCopiedSignalPlan(false), 2000);
+    } catch {
+      // Clipboard blocked silently
+    }
+  }, [effectiveSignalOverlay]);
+
+  const strategyHistoricalMatchesCount = useMemo(() => {
+    if (!effectiveSignalOverlay) return 0;
+    return analyses.filter((a) => a.strategyKey === effectiveSignalOverlay.strategyKey).length;
+  }, [analyses, effectiveSignalOverlay]);
 
   const bbPercentB = useMemo(() => {
     if (!indicators) return 50;
@@ -1256,6 +1556,8 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
           <img
             src="/src/assets/images/terminal_icon_chart_1794855841231.jpg"
             alt="Рынок Vernier"
+            width={32}
+            height={32}
             referrerPolicy="no-referrer"
             className="w-8 h-8 rounded-lg object-cover border border-emerald-500/25"
           />
@@ -1594,6 +1896,539 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
               </div>
             )}
 
+            {/* Входящие и исторические сигналы стратегий по выбранной паре */}
+            {chartEngine !== 'tradingview' && pairChartSignals.length > 0 && (
+              <div className="mt-3 rounded-xl border border-white/10 bg-[#0B0F17]/90 px-3 py-2 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-semibold text-white">Сигналы на графике</span>
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 font-mono text-[10px] text-emerald-300">
+                      Входящие: {pairChartSignals.filter((m) => m.source === 'incoming' || m.source === 'active').length}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-white/6 border border-white/10 font-mono text-[10px] text-slate-300">
+                      История: {pairChartSignals.filter((m) => m.source === 'historical').length}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerHaptic(6);
+                      setShowChartSignals((v) => !v);
+                    }}
+                    className={`min-h-[26px] px-2 rounded-lg border text-[10px] font-semibold transition-colors ${
+                      showChartSignals
+                        ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                        : 'border-white/10 bg-white/5 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {showChartSignals ? 'Маркеры вкл' : 'Маркеры выкл'}
+                  </button>
+                </div>
+
+                {showChartSignals && (
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 no-scrollbar">
+                    {pairChartSignals.map((m) => {
+                      const isSelected =
+                        selectedChartSignalId === m.id ||
+                        (effectiveSignalOverlay &&
+                          effectiveSignalOverlay.strategyKey === m.strategyKey &&
+                          effectiveSignalOverlay.direction === m.direction &&
+                          Math.abs(effectiveSignalOverlay.entryPrice - m.entryPrice) < 1e-6);
+                      const timeLabel = new Date(m.emittedAt).toLocaleTimeString('ru-RU', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      });
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => handleSelectChartSignalMarker(m)}
+                          className={`shrink-0 px-2 py-1 rounded-lg border text-[10px] font-mono inline-flex items-center gap-1.5 transition-colors ${
+                            isSelected
+                              ? 'border-amber-400/60 bg-amber-500/15 text-amber-100'
+                              : m.direction === 'LONG'
+                                ? 'border-emerald-500/25 bg-emerald-500/[0.06] text-emerald-200 hover:border-emerald-400/45'
+                                : 'border-rose-500/25 bg-rose-500/[0.06] text-rose-200 hover:border-rose-400/45'
+                          }`}
+                        >
+                          <span className="font-bold">{m.direction === 'LONG' ? '▲' : '▼'}</span>
+                          <span className="font-sans font-semibold max-w-[110px] truncate">{m.strategyName}</span>
+                          <span className="text-[9px] opacity-80">
+                            {m.source === 'historical' ? 'Ист.' : 'Live'} · {timeLabel}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Активный сигнал стратегии на графике: вкладки Уровни / Backtest Results */}
+            {effectiveSignalOverlay && signalProgress && (
+              <div
+                className={`mt-3 rounded-xl border p-3 sm:p-3.5 space-y-2.5 ${
+                  effectiveSignalOverlay.direction === 'LONG'
+                    ? 'border-emerald-500/35 bg-gradient-to-br from-emerald-500/[0.09] via-[#0B1219] to-[#080C12]'
+                    : 'border-rose-500/35 bg-gradient-to-br from-rose-500/[0.09] via-[#130D14] to-[#080C12]'
+                }`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span
+                        className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-bold border ${
+                          effectiveSignalOverlay.direction === 'LONG'
+                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                            : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                        }`}
+                      >
+                        {effectiveSignalOverlay.direction}
+                      </span>
+                      <span className="text-xs font-semibold text-white truncate">
+                        {effectiveSignalOverlay.strategyName}
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-400">
+                        · {ENGINE_STATE_META[effectiveSignalOverlay.engineState].shortRu} ·{' '}
+                        {effectiveSignalOverlay.mode === 'live' ? 'Live API' : 'Paper'}
+                      </span>
+                      {effectiveSignalOverlay.isProjected && (
+                        <span className="text-[10px] text-amber-300">· Проектные зоны</span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-slate-300 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className="font-medium text-emerald-300">{signalProgress.phaseLabelRu}</span>
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+                      <span className="font-mono tabular-nums">
+                        От входа:{' '}
+                        <strong
+                          className={
+                            signalProgress.pnlFromEntryPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                          }
+                        >
+                          {signalProgress.pnlFromEntryPct >= 0 ? '+' : ''}
+                          {signalProgress.pnlFromEntryPct.toFixed(2)}%
+                        </strong>
+                      </span>
+                      <span aria-hidden="true" className="text-slate-600">·</span>
+                      <span className="font-mono tabular-nums text-slate-400">
+                        R:R 1:{effectiveSignalOverlay.riskRewardRatio}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopySignalPlan()}
+                      title="Скопировать уровни Entry / SL / TP"
+                      className={`min-h-[30px] px-2.5 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 whitespace-nowrap transition-colors ${
+                        copiedSignalPlan
+                          ? 'border-emerald-500/45 bg-emerald-500/20 text-emerald-200'
+                          : 'border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      {copiedSignalPlan ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5 shrink-0" />
+                      )}
+                      <span>{copiedSignalPlan ? 'Скопировано' : 'План'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        setDraftAlertPrice(effectiveSignalOverlay.entryPrice);
+                        setShowQuickAlert(true);
+                      }}
+                      title="Поставить ценовой алерт на цену входа"
+                      className="min-h-[30px] px-2.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-[11px] font-medium text-cyan-200 inline-flex items-center gap-1 whitespace-nowrap transition-colors"
+                    >
+                      <BellPlus className="w-3.5 h-3.5 shrink-0" />
+                      <span>Алерт</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveSignalOverlay(null);
+                        setSelectedChartSignalId(null);
+                        setShowChartSignals(false);
+                      }}
+                      aria-label="Скрыть уровни сигнала с графика"
+                      className="min-h-[30px] px-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-[11px] text-slate-400 hover:text-white inline-flex items-center gap-1 shrink-0 transition-colors"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">Скрыть</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Сегментированный переключатель вкладок внутри панели сигнала */}
+                <div
+                  role="tablist"
+                  aria-label="Вкладки панели сигнала стратегии"
+                  className="inline-flex items-center gap-1 p-1 rounded-xl bg-[#070B12] border border-white/10"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={signalOverlayTab === 'levels'}
+                    onClick={() => {
+                      triggerHaptic(6);
+                      setSignalOverlayTab('levels');
+                    }}
+                    className={`min-h-[32px] px-3 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                      signalOverlayTab === 'levels'
+                        ? 'bg-emerald-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Уровни и прогресс
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={signalOverlayTab === 'backtest'}
+                    onClick={() => {
+                      triggerHaptic(6);
+                      setSignalOverlayTab('backtest');
+                    }}
+                    className={`min-h-[32px] px-3 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                      signalOverlayTab === 'backtest'
+                        ? 'bg-cyan-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <BarChart3 className="w-3.5 h-3.5 shrink-0" />
+                    <span>Backtest Results</span>
+                  </button>
+                </div>
+
+                {signalOverlayTab === 'levels' ? (
+                  <>
+                    {/* Визуальная шкала прогресса цены между SL -> Вход -> TP1 -> TP2 */}
+                    <div className="space-y-1.5">
+                      <div className="relative h-2.5 w-full rounded-full bg-[#070B12] border border-white/10 overflow-visible">
+                        <div
+                          className="absolute top-0 bottom-0 left-0 rounded-l-full bg-rose-500/25"
+                          style={{ width: `${signalProgress.entryMarkerPct}%` }}
+                        />
+                        <div
+                          className="absolute top-0 bottom-0 right-0 rounded-r-full bg-emerald-500/20"
+                          style={{ left: `${signalProgress.entryMarkerPct}%` }}
+                        />
+                        <div
+                          className={`absolute top-0 bottom-0 transition-all duration-300 ${
+                            signalProgress.pnlFromEntryPct >= 0 ? 'bg-emerald-400/75' : 'bg-rose-400/75'
+                          }`}
+                          style={{
+                            left: `${Math.min(signalProgress.entryMarkerPct, signalProgress.trackPct)}%`,
+                            width: `${Math.max(1.5, Math.abs(signalProgress.trackPct - signalProgress.entryMarkerPct))}%`,
+                          }}
+                        />
+                        <span
+                          title="Точка входа"
+                          className="absolute -top-0.5 -bottom-0.5 w-[2px] bg-amber-400"
+                          style={{ left: `${signalProgress.entryMarkerPct}%` }}
+                        />
+                        <span
+                          title="TP1 (50%)"
+                          className="absolute -top-0.5 -bottom-0.5 w-[2px] bg-cyan-400"
+                          style={{ left: `${signalProgress.tp1MarkerPct}%` }}
+                        />
+                        <span
+                          title={`Текущая цена: $${liveSignalPrice}`}
+                          className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-white border-2 border-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.9)] transition-[left] duration-300"
+                          style={{ left: `${signalProgress.trackPct}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                        <span className="text-rose-400">SL</span>
+                        <span className="text-amber-300">Вход</span>
+                        <span className="text-cyan-300">TP1</span>
+                        <span className="text-emerald-400">TP2</span>
+                      </div>
+                    </div>
+
+                    {/* Числовые уровни Стоп / Вход / TP1 / TP2 */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] font-mono tabular-nums">
+                      <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.06] px-2.5 py-1.5">
+                        <div className="font-sans text-[10px] text-rose-300/80 flex items-center justify-between">
+                          <span>Stop-Loss</span>
+                          <span>{signalProgress.distToSlPct.toFixed(1)}%</span>
+                        </div>
+                        <div className="text-rose-400 font-bold mt-0.5">
+                          {formatUsd(effectiveSignalOverlay.stopLossPrice)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-2.5 py-1.5">
+                        <div className="font-sans text-[10px] text-amber-300/80">Вход (Entry)</div>
+                        <div className="text-amber-300 font-bold mt-0.5">
+                          {formatUsd(effectiveSignalOverlay.entryPrice)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/[0.06] px-2.5 py-1.5">
+                        <div className="font-sans text-[10px] text-cyan-300/80">Take-Profit 1</div>
+                        <div className="text-cyan-300 font-bold mt-0.5">
+                          {formatUsd(effectiveSignalOverlay.tp1Price)}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.08] px-2.5 py-1.5">
+                        <div className="font-sans text-[10px] text-emerald-300/80 flex items-center justify-between">
+                          <span>Take-Profit 2</span>
+                          <span>
+                            {signalProgress.distToTp2Pct > 0 ? `+${signalProgress.distToTp2Pct.toFixed(1)}%` : 'Цель!'}
+                          </span>
+                        </div>
+                        <div className="text-emerald-400 font-bold mt-0.5">
+                          {formatUsd(effectiveSignalOverlay.takeProfitPrice)}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Компактный авто-расчёт размера позиции под текущий депозит и риск */}
+                    {signalPositionSizing && (
+                      <div className="pt-1.5 border-t border-white/8 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] font-mono tabular-nums text-slate-300">
+                        <span className="font-sans text-slate-400">
+                          Авто-объём (депозит ${depositUsdt.toLocaleString('en-US')}, риск {riskPct}%):
+                        </span>
+                        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5">
+                          <span>
+                            Позиция:{' '}
+                            <strong className="text-white">
+                              ${signalPositionSizing.notionalUsd.toFixed(0)}
+                            </strong>{' '}
+                            <span className="text-slate-400">
+                              ({signalPositionSizing.units >= 1
+                                ? signalPositionSizing.units.toFixed(3)
+                                : signalPositionSizing.units.toFixed(5)}{' '}
+                              {effectiveSignalOverlay.symbol.replace('USDT', '')})
+                            </span>
+                          </span>
+                          <span aria-hidden="true" className="text-slate-600">·</span>
+                          <span className="text-rose-300">
+                            Риск: -${signalPositionSizing.riskUsd.toFixed(1)}
+                          </span>
+                          <span aria-hidden="true" className="text-slate-600">·</span>
+                          <span className="text-emerald-300">
+                            TP2: +${signalPositionSizing.rewardTp2Usd.toFixed(1)}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  /* Вкладка Backtest Results: исторический Win Rate, Max Drawdown, PnL и кривая капитала */
+                  <div className="space-y-2.5 pt-0.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <div className="text-slate-400">
+                        Исторический OHLCV-бэктест стратегии ·{' '}
+                        <span className="text-slate-200 font-mono">
+                          {effectiveSignalOverlay.symbol.replace('USDT', '/USDT')}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {(['1h', '4h', '1d'] as const).map((tfOpt) => {
+                          const locked = tfOpt === '1d' && !isMax;
+                          const selected = effectiveBacktestInterval === tfOpt;
+                          return (
+                            <button
+                              key={tfOpt}
+                              type="button"
+                              onClick={() => {
+                                if (locked) {
+                                  (onUpgradeMax ?? onUpgradePro)();
+                                  return;
+                                }
+                                triggerHaptic(6);
+                                setSignalBacktestInterval(tfOpt);
+                              }}
+                              className={`min-h-[26px] px-2 rounded-md font-mono text-[10px] font-semibold inline-flex items-center gap-1 transition-colors ${
+                                selected
+                                  ? 'bg-cyan-500/25 border border-cyan-400/50 text-cyan-100'
+                                  : 'bg-[#070B12] border border-white/10 text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              {locked && <Lock className="w-2.5 h-2.5 text-amber-400" />}
+                              <span>{tfOpt.toUpperCase()}</span>
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          disabled={signalBacktestLoading}
+                          onClick={() =>
+                            void fetchSignalStrategyBacktest(
+                              effectiveSignalOverlay,
+                              effectiveBacktestInterval,
+                              true
+                            )
+                          }
+                          aria-label="Пересчитать бэктест"
+                          className="min-h-[26px] min-w-[26px] rounded-md border border-white/10 bg-[#070B12] hover:bg-white/10 text-slate-300 flex items-center justify-center transition-colors disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 ${signalBacktestLoading ? 'animate-spin' : ''}`}
+                          />
+                        </button>
+                      </div>
+                    </div>
+
+                    {signalBacktestLoading && !activeSignalBacktest ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {[0, 1, 2, 3].map((idx) => (
+                          <div
+                            key={idx}
+                            className="h-14 rounded-lg border border-white/8 bg-[#070B12]/70 animate-pulse"
+                          />
+                        ))}
+                      </div>
+                    ) : signalBacktestError && !activeSignalBacktest ? (
+                      <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 flex flex-wrap items-center justify-between gap-2 text-xs text-rose-200">
+                        <span>{signalBacktestError}</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void fetchSignalStrategyBacktest(
+                              effectiveSignalOverlay,
+                              effectiveBacktestInterval,
+                              true
+                            )
+                          }
+                          className="min-h-[30px] px-3 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/40 text-xs font-semibold text-rose-100"
+                        >
+                          Повторить
+                        </button>
+                      </div>
+                    ) : activeSignalBacktest ? (
+                      (() => {
+                        const bt = activeSignalBacktest.breakdown;
+                        const ddAbs = Math.abs(bt.maxDrawdownPct);
+                        const ddSeverity =
+                          ddAbs <= 6 ? 'Умеренная' : ddAbs <= 14 ? 'Средняя' : 'Повышенная';
+                        const winPctClamped = Math.max(0, Math.min(100, bt.winRatePct));
+                        const curve = activeSignalBacktest.equityCurve;
+                        const svgWidth = 260;
+                        const svgHeight = 46;
+                        const curvePath = (() => {
+                          if (curve.length < 2) return '';
+                          const vals = curve.map((p) => p.portfolioPnlPct);
+                          const minV = Math.min(...vals, 0);
+                          const maxV = Math.max(...vals, 0.5);
+                          const span = Math.max(0.1, maxV - minV);
+                          return vals
+                            .map((v, i) => {
+                              const x = (i / (vals.length - 1)) * svgWidth;
+                              const y = svgHeight - 4 - ((v - minV) / span) * (svgHeight - 8);
+                              return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+                            })
+                            .join(' ');
+                        })();
+
+                        return (
+                          <div className="space-y-2.5">
+                            {/* 4 ключевых показателя: Win Rate, Max Drawdown, Total PnL, Profit Factor */}
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono tabular-nums">
+                              <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/[0.06] px-2.5 py-2">
+                                <div className="font-sans text-[10px] text-slate-400">
+                                  Успешность (Win Rate)
+                                </div>
+                                <div className="text-sm font-bold text-emerald-300 mt-0.5">
+                                  {bt.winRatePct.toFixed(1)}%
+                                </div>
+                                <div className="mt-1.5 h-1.5 w-full rounded-full bg-rose-500/25 overflow-hidden">
+                                  <div
+                                    className="h-full rounded-full bg-emerald-400"
+                                    style={{ width: `${winPctClamped}%` }}
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="rounded-lg border border-rose-500/25 bg-rose-500/[0.06] px-2.5 py-2">
+                                <div className="font-sans text-[10px] text-slate-400">
+                                  Макс. просадка (DD)
+                                </div>
+                                <div className="text-sm font-bold text-rose-400 mt-0.5">
+                                  {bt.maxDrawdownPct <= 0
+                                    ? `${bt.maxDrawdownPct.toFixed(2)}%`
+                                    : `-${bt.maxDrawdownPct.toFixed(2)}%`}
+                                </div>
+                                <div className="font-sans text-[10px] text-slate-400 mt-0.5">
+                                  Риск: {ddSeverity}
+                                </div>
+                              </div>
+
+                              <div className="rounded-lg border border-white/10 bg-[#070B12]/80 px-2.5 py-2">
+                                <div className="font-sans text-[10px] text-slate-400">
+                                  Итоговый PnL ({activeSignalBacktest.interval.toUpperCase()})
+                                </div>
+                                <div
+                                  className={`text-sm font-bold mt-0.5 ${
+                                    bt.totalPnlPct >= 0 ? 'text-emerald-300' : 'text-rose-400'
+                                  }`}
+                                >
+                                  {bt.totalPnlPct >= 0 ? '+' : ''}
+                                  {bt.totalPnlPct.toFixed(2)}%
+                                </div>
+                                <div className="text-[10px] text-slate-400 mt-0.5">
+                                  {bt.totalPnlUsdt >= 0 ? '+' : ''}
+                                  ${bt.totalPnlUsdt.toFixed(0)}
+                                </div>
+                              </div>
+
+                              <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/[0.06] px-2.5 py-2">
+                                <div className="font-sans text-[10px] text-slate-400">
+                                  Profit Factor · Сделки
+                                </div>
+                                <div className="text-sm font-bold text-cyan-300 mt-0.5">
+                                  {bt.profitFactor.toFixed(2)}
+                                </div>
+                                <div className="text-[10px] text-slate-400 mt-0.5">
+                                  {bt.tradesCount} сд. · R:R {bt.avgRiskReward}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Мини-кривая доходности + счётчик сохранённых сигналов */}
+                            <div className="rounded-lg border border-white/8 bg-[#070B12]/90 px-3 py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                              <div className="space-y-0.5 text-[11px]">
+                                <div className="text-slate-300 font-medium">
+                                  Кривая капитала ({activeSignalBacktest.interval.toUpperCase()} OHLCV)
+                                </div>
+                                <div className="text-[10px] text-slate-400">
+                                  Источник: {activeSignalBacktest.dataSource === 'live' ? 'живые свечи биржи' : 'кэш свечей'}
+                                  {' · '}Ваших сигналов в истории: <span className="font-mono text-slate-200">{strategyHistoricalMatchesCount}</span>
+                                </div>
+                              </div>
+                              {curvePath && (
+                                <svg
+                                  viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+                                  className="w-full sm:w-44 h-11 shrink-0 overflow-visible"
+                                  aria-label="Мини-график кривой доходности стратегии"
+                                >
+                                  <path
+                                    d={curvePath}
+                                    fill="none"
+                                    stroke={bt.totalPnlPct >= 0 ? '#34D399' : '#FB7185'}
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : null}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Candlestick Chart */}
             <div className="mt-3">
               {chartEngine === 'tradingview' ? (
@@ -1614,7 +2449,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                 ribbonPeriods={ribbonPeriods}
                 entryLevel={entryOverlay}
                 stopLossLevel={slOverlay}
+                takeProfit1Level={tp1Overlay}
                 takeProfitLevel={tpOverlay}
+                signalDirection={effectiveSignalOverlay?.direction ?? null}
+                activeSignalEmittedAt={effectiveSignalOverlay?.emittedAt ?? null}
+                signalMarkers={showChartSignals ? pairChartSignals : []}
+                selectedSignalId={selectedChartSignalId}
+                onSelectSignalMarker={handleSelectChartSignalMarker}
                 priceAlerts={priceAlerts.filter((a) => a.symbol === symbol && a.marketType === marketType)}
                 draftAlertPrice={draftAlertPrice}
                 onPickPriceFromChart={(picked) => {
@@ -1751,42 +2592,43 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   Совмещает свечные индикаторы, новостной фон, PRO-лесенку и Paper Trading.
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="inline-flex items-center p-0.5 rounded-xl bg-[#0B0F17] border border-white/10">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic(8);
-                      setAiPanelMode('analysis');
-                    }}
-                    className={`min-h-[32px] px-3 rounded-lg text-xs font-semibold transition-colors ${
-                      aiPanelMode === 'analysis'
-                        ? 'bg-emerald-600 text-white'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Анализ
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic(8);
-                      setAiPanelMode('paper');
-                    }}
-                    className={`min-h-[32px] px-3 rounded-lg text-xs font-semibold inline-flex items-center gap-1 transition-colors ${
-                      aiPanelMode === 'paper'
-                        ? 'bg-cyan-500 text-slate-950'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <span>Paper-сделка</span>
-                    <span className="text-[9px] font-mono px-1 rounded bg-black/20">MAX</span>
-                  </button>
-                </div>
+              <div className="grid grid-cols-3 sm:inline-flex items-center gap-1 p-1 rounded-xl bg-[#0B0F17] border border-white/10 w-full sm:w-auto">
                 <button
                   type="button"
-                  onClick={() => setMarketSection('chart')}
-                  className="text-xs font-medium text-cyan-300 hover:text-cyan-200 whitespace-nowrap"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    setAiPanelMode('analysis');
+                  }}
+                  className={`min-h-[34px] px-2.5 sm:px-3 rounded-lg text-[11px] sm:text-xs font-semibold whitespace-nowrap transition-colors ${
+                    aiPanelMode === 'analysis'
+                      ? 'bg-emerald-600 text-white'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Анализ
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    setAiPanelMode('paper');
+                  }}
+                  className={`min-h-[34px] px-2 sm:px-3 rounded-lg text-[11px] sm:text-xs font-semibold inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors ${
+                    aiPanelMode === 'paper'
+                      ? 'bg-cyan-500 text-slate-950'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <span>Paper</span>
+                  <span className="text-[9px] font-mono px-1 rounded bg-black/20">MAX</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    setMarketSection('chart');
+                  }}
+                  className="min-h-[34px] px-2.5 sm:px-3 rounded-lg text-[11px] sm:text-xs font-semibold text-cyan-300 hover:text-cyan-200 hover:bg-white/[0.06] whitespace-nowrap transition-colors"
                 >
                   График →
                 </button>
@@ -1836,7 +2678,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   </button>
                 </div>
 
-                {riskCalcMode === 'ladder' && (
+                {riskCalcMode === 'ladder' ? (
                   <ProLadderCalculator
                     symbol={symbol}
                     marketType={marketType}
@@ -1846,8 +2688,8 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                     leverage={leverage}
                     strategyName={activeStrategy?.name}
                   />
-                )}
-
+                ) : (
+                <>
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <label htmlFor="strategy-select" className="block text-xs font-medium text-slate-300">
@@ -2013,18 +2855,46 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label htmlFor="deposit-input" className="block text-xs text-slate-400 mb-1">
-                      Депозит (USDT)
-                    </label>
+                    <div className="flex items-center justify-between gap-1.5 mb-1">
+                      <label htmlFor="deposit-input" className="block text-xs text-slate-400 truncate">
+                        Депозит (USDT)
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic(8);
+                          if (portfolioBalanceUsdt > 0) {
+                            const rounded = Math.max(10, Math.round(portfolioBalanceUsdt));
+                            setDepositUsdt(rounded);
+                            setPortfolioDepositHint(`Подставлен баланс портфеля ($${rounded.toLocaleString('en-US')})`);
+                          } else {
+                            const paperBal = Math.max(10, Math.round(readPaperAccount().balanceUsdt || 10000));
+                            setDepositUsdt(paperBal);
+                            setPortfolioDepositHint(`Портфель $0 — подставлен Paper-счёт ($${paperBal.toLocaleString('en-US')})`);
+                          }
+                        }}
+                        className="text-[10.5px] font-semibold text-emerald-300 hover:text-emerald-200 whitespace-nowrap shrink-0 transition-colors"
+                      >
+                        Из портфеля
+                      </button>
+                    </div>
                     <input
                       id="deposit-input"
                       type="number"
                       min={10}
                       max={10000000}
                       value={depositUsdt}
-                      onChange={(e) => setDepositUsdt(Math.max(10, Number(e.target.value)))}
+                      onChange={(e) => {
+                        setDepositUsdt(Math.max(10, Number(e.target.value)));
+                        if (portfolioDepositHint) setPortfolioDepositHint(null);
+                      }}
                       className="w-full min-h-[40px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-sm font-mono text-white focus:border-emerald-500 focus:outline-none"
                     />
+                    {portfolioDepositHint && (
+                      <div className="mt-1 text-[10px] text-emerald-300/90 leading-snug">
+                        {portfolioDepositHint}
+                      </div>
+                    )}
                   </div>
                   <div>
                     <label htmlFor="risk-input" className="block text-xs text-slate-400 mb-1">
@@ -2161,6 +3031,8 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                             : `Проверить рынок (${requiredCredits} ${requiredCredits === 1 ? 'кредит' : 'кредита'})`}
                     </span>
                   </motion.button>
+                )}
+                </>
                 )}
               </div>
 
@@ -2471,7 +3343,9 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                               <div className="rounded-lg border border-white/8 bg-[#111827] p-2.5">
                                 <div className="font-sans text-[11px] text-slate-400">R:R / Объём</div>
                                 <div className="mt-0.5 text-amber-300 font-semibold">1 : 2.6</div>
-                                <div className="text-[10px] text-slate-300">~${Math.round(previewPosUsdt)} USDT</div>
+                                <div className="text-[10px] text-slate-300">
+                                  ~${Math.round(previewPosUsdt).toLocaleString('en-US')}
+                                </div>
                               </div>
                             </div>
 
@@ -2536,7 +3410,7 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                         >
                           <div className="text-[10px] text-slate-400">{row.tf}</div>
                           <div
-                            className={`mt-0.5 font-bold ${
+                            className={`mt-1 font-bold inline-flex items-center justify-center gap-1 whitespace-nowrap text-[11px] sm:text-xs ${
                               row.bias === 'BULL'
                                 ? 'text-emerald-400'
                                 : row.bias === 'BEAR'
@@ -2544,7 +3418,12 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                                   : 'text-amber-300'
                             }`}
                           >
-                            {row.bias === 'BULL' ? '▲ ЛОНГ' : row.bias === 'BEAR' ? '▼ ШОРТ' : '• ФЛЭТ'}
+                            <span className="leading-none">
+                              {row.bias === 'BULL' ? '▲' : row.bias === 'BEAR' ? '▼' : '•'}
+                            </span>
+                            <span className="leading-none">
+                              {row.bias === 'BULL' ? 'ЛОНГ' : row.bias === 'BEAR' ? 'ШОРТ' : 'ФЛЭТ'}
+                            </span>
                           </div>
                         </div>
                       ))}
@@ -3386,7 +4265,13 @@ export const MarketTerminalView: React.FC<MarketTerminalViewProps> = ({
                   ribbonPeriods={ribbonPeriods}
                   entryLevel={entryOverlay}
                   stopLossLevel={slOverlay}
+                  takeProfit1Level={tp1Overlay}
                   takeProfitLevel={tpOverlay}
+                  signalDirection={effectiveSignalOverlay?.direction ?? null}
+                  activeSignalEmittedAt={effectiveSignalOverlay?.emittedAt ?? null}
+                  signalMarkers={showChartSignals ? pairChartSignals : []}
+                  selectedSignalId={selectedChartSignalId}
+                  onSelectSignalMarker={handleSelectChartSignalMarker}
                   priceAlerts={priceAlerts.filter((a) => a.symbol === symbol && a.marketType === marketType)}
                   draftAlertPrice={draftAlertPrice}
                   onPickPriceFromChart={(picked) => {

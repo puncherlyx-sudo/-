@@ -11,6 +11,8 @@ import {
 import { AnimatePresence, motion } from 'framer-motion';
 import { usePlan } from '../contexts/PlanContext';
 import { triggerHaptic } from '../lib/securityDlp';
+import { isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import type { MarketType, OrderBookSnapshot } from '../types/domain';
 import { OrderBookSkeleton, skeletonSwapVariants } from './MarketSkeletons';
 
@@ -89,18 +91,25 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
     return prints;
   }, []);
 
+  const depthAbortRef = useRef<AbortController | null>(null);
+
   const loadDepth = useCallback(
     async (withSkeleton = false, forceRefresh = false) => {
+      depthAbortRef.current?.abort();
+      const controller = new AbortController();
+      depthAbortRef.current = controller;
+
       setLoading(true);
       if (withSkeleton) setShowSkeleton(true);
       try {
         const refreshParam = forceRefresh ? '&refresh=1' : '';
         const res = await fetch(
           `/api/market/depth?symbol=${symbol}&marketType=${marketType}${refreshParam}`,
-          { cache: 'no-store' }
+          { cache: 'no-store', signal: controller.signal }
         );
-        if (res.ok) {
-          const data = (await res.json()) as OrderBookSnapshot;
+        const parsed = await parseJsonResponse<OrderBookSnapshot>(res);
+        if (!controller.signal.aborted && parsed.ok && parsed.data) {
+          const data = parsed.data;
           setDepth(data);
           setTapePrints(generateTapeFromSnapshot(data));
 
@@ -121,10 +130,12 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
           prevWallSigRef.current = sig;
         }
       } catch {
-        // Keep previous snapshot
+        // Keep previous snapshot on network hiccup or abort
       } finally {
-        setLoading(false);
-        setShowSkeleton(false);
+        if (!controller.signal.aborted) {
+          setLoading(false);
+          setShowSkeleton(false);
+        }
       }
     },
     [symbol, marketType, generateTapeFromSnapshot]
@@ -135,12 +146,21 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
     prevWallSigRef.current = '';
     setSpoofingAlert(null);
     void loadDepth(true, false);
-    const id = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+    const id = window.setInterval(() => {
+      if (isPageVisible()) {
         void loadDepth(false, false);
       }
     }, 10_000);
-    return () => clearInterval(id);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
+        void loadDepth(false, false);
+      }
+    });
+    return () => {
+      window.clearInterval(id);
+      unsubVis();
+      depthAbortRef.current?.abort();
+    };
   }, [loadDepth]);
 
   const askDominancePct = depth ? Number((100 - depth.bidDominancePct).toFixed(1)) : 50;

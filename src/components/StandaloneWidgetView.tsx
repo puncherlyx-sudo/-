@@ -138,23 +138,30 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
     }));
   }, [feed]);
 
-  const activeStrategiesList = useMemo(() => {
-    if (strategies.length > 0) {
-      return strategies;
-    }
-    return STRATEGY_CATALOG.slice(0, 4).map((t) => ({
-      id: t.key,
-      userId: 'guest',
-      marketType: t.marketType,
-      strategyKey: t.key,
-      name: t.name,
-      enabled: true,
-      dailySignalLimit: 3,
-      minConfidence: 68,
-      riskPerTradePct: t.defaultRiskPct,
-      leverage: t.defaultLeverage,
-      pairs: ['BTCUSDT', 'ETHUSDT'],
-    }));
+  const { activeStrategiesList, activeStrategiesCount, totalStrategiesCount } = useMemo(() => {
+    const baseList =
+      strategies.length > 0
+        ? strategies
+        : STRATEGY_CATALOG.slice(0, 4).map((t) => ({
+            id: t.key,
+            userId: 'guest',
+            marketType: t.marketType,
+            strategyKey: t.key,
+            name: t.name,
+            enabled: true,
+            dailySignalLimit: 3,
+            minConfidence: 68,
+            riskPerTradePct: t.defaultRiskPct,
+            leverage: t.defaultLeverage,
+            pairs: ['BTCUSDT', 'ETHUSDT'],
+          }));
+    const sorted = [...baseList].sort((a, b) => Number(b.enabled) - Number(a.enabled));
+    const activeCount = baseList.filter((s) => s.enabled).length;
+    return {
+      activeStrategiesList: sorted,
+      activeStrategiesCount: activeCount,
+      totalStrategiesCount: baseList.length,
+    };
   }, [strategies]);
 
   const handleCopyWidgetUrl = async () => {
@@ -636,6 +643,9 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
                 <div className="text-sm font-semibold text-white flex items-center gap-2">
                   <Layers className="w-4 h-4 text-emerald-400" />
                   <span>Виджет стратегий</span>
+                  <span className="text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300">
+                    {activeStrategiesCount}/{totalStrategiesCount} акт.
+                  </span>
                 </div>
                 <span className="text-xs text-slate-400 flex items-center gap-1">
                   <Activity className="w-3.5 h-3.5 text-cyan-400" />
@@ -651,19 +661,37 @@ export const StandaloneWidgetView: React.FC<StandaloneWidgetViewProps> = ({
               </div>
 
               <div className="divide-y divide-white/8 text-xs">
-                {activeStrategiesList.slice(0, 4).map((st) => (
-                  <div key={st.id} className="py-2.5 flex items-center justify-between gap-2">
-                    <div>
-                      <div className="font-medium text-white">{st.name}</div>
-                      <div className="text-slate-400 font-mono tabular-nums">
-                        {st.marketType === 'futures' ? `Фьючерсы x${st.leverage}` : 'Спот'} · Риск {st.riskPerTradePct}%
+                {activeStrategiesList.slice(0, 4).map((st) => {
+                  const vol = Number(feed?.strategies.volatilityPct ?? 0);
+                  const liveProgress = st.enabled ? Math.min(96, Math.max(25, Math.round(35 + vol * 10))) : 0;
+                  return (
+                    <div key={st.id} className="py-2.5 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="font-medium text-white truncate">{st.name}</div>
+                          <div className="text-slate-400 font-mono tabular-nums text-[11px]">
+                            {st.marketType === 'futures' ? `Фьючерсы x${st.leverage}` : 'Спот'} · Риск {st.riskPerTradePct}% · Порог {st.minConfidence}%
+                          </div>
+                        </div>
+                        <span
+                          className={`shrink-0 font-mono text-[11px] ${
+                            st.enabled ? 'text-emerald-400 font-semibold' : 'text-slate-500'
+                          }`}
+                        >
+                          {st.enabled ? `LIVE · ${liveProgress}%` : 'Пауза'}
+                        </span>
                       </div>
+                      {st.enabled && (
+                        <div className="h-1 w-full rounded-full bg-white/10 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-cyan-400 transition-[width] duration-500"
+                            style={{ width: `${liveProgress}%` }}
+                          />
+                        </div>
+                      )}
                     </div>
-                    <span className={st.enabled ? 'text-emerald-400 font-medium' : 'text-slate-500'}>
-                      {st.enabled ? 'Активна' : 'Пауза'}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </>
           )}

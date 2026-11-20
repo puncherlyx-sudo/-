@@ -26,6 +26,9 @@ import {
   getStrategyTemplate,
 } from '../data/strategies';
 import { authFetch } from '../lib/authFetch';
+import { runLocalPortfolioBacktest } from '../lib/localAnalyticsEngine';
+import { parseJsonResponse } from '../utils/safeFetchJson';
+import { logger } from '../utils/logger';
 import type {
   EquityCurvePoint,
   StrategyBreakdownResult,
@@ -72,7 +75,7 @@ const EquityTooltip: React.FC<CustomEquityTooltipProps> = ({ active, payload, un
   if (!active || !payload || payload.length === 0 || !payload[0]?.payload) return null;
   const pt = payload[0].payload;
   return (
-    <div className="rounded-xl border border-white/15 bg-[#0B0F17]/95 px-3.5 py-2.5 text-xs shadow-lg backdrop-blur-md space-y-1.5 font-mono tabular-nums">
+    <div className="rounded-xl border border-white/15 bg-[#0B0F17] px-3.5 py-2.5 text-xs shadow-lg space-y-1.5 font-mono tabular-nums">
       <div className="font-sans text-slate-400">{pt.label}</div>
       <div className="flex items-center justify-between gap-4">
         <span className="font-sans text-slate-300">Портфель:</span>
@@ -107,7 +110,7 @@ const StrategyBarTooltip: React.FC<CustomBarTooltipProps> = ({ active, payload }
   if (!active || !payload || payload.length === 0 || !payload[0]?.payload) return null;
   const row = payload[0].payload;
   return (
-    <div className="rounded-xl border border-white/15 bg-[#0B0F17]/95 px-3.5 py-2.5 text-xs shadow-lg backdrop-blur-md space-y-1 font-mono tabular-nums max-w-[260px]">
+    <div className="rounded-xl border border-white/15 bg-[#0B0F17] px-3.5 py-2.5 text-xs shadow-lg space-y-1 font-mono tabular-nums max-w-[260px]">
       <div className="font-sans font-semibold text-white">{row.name}</div>
       <div className="font-sans text-[11px] text-slate-400">
         {row.marketType === 'futures' ? 'Фьючерсы' : 'Спот'} · {row.enabled ? 'Активна' : 'Отключена'}
@@ -147,6 +150,7 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
   const [depositUsdt, setDepositUsdt] = useState<number>(2500);
 
   const [report, setReport] = useState<StrategyPerformanceReport | null>(null);
+  const [isLocalFallback, setIsLocalFallback] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -196,31 +200,55 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
     [simulationPayload]
   );
 
-  const fetchBacktest = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await authFetch('/api/strategies/pnl', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          strategies: simulationPayload,
-          interval,
-          depositUsdt,
-          scope,
-        }),
-      });
-      const data = (await res.json()) as StrategyPerformanceReport & { error?: string };
-      if (!res.ok) {
-        throw new Error(data.error || 'Не удалось рассчитать доходность стратегий.');
+  const fetchBacktest = useCallback(
+    async (externalSignal?: AbortSignal) => {
+      setLoading(true);
+      setError(null);
+      try {
+        if (externalSignal?.aborted) return;
+        const res = await authFetch('/api/strategies/pnl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            strategies: simulationPayload,
+            interval,
+            depositUsdt,
+            scope,
+            ...(isMax ? { demoTier: 'max' } : isPro ? { demoTier: 'pro' } : {}),
+          }),
+          signal: externalSignal,
+        });
+        const parsed = await parseJsonResponse<StrategyPerformanceReport & { error?: string }>(res);
+        if (parsed.ok && parsed.data && parsed.data.summary) {
+          if (!externalSignal?.aborted) {
+            setReport(parsed.data);
+            setIsLocalFallback(false);
+          }
+          return;
+        }
+        throw new Error(parsed.errorMessage || 'Fallback to local backtest');
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        logger.warn('strategies:pnl:local-fallback', err);
+        if (!externalSignal?.aborted) {
+          const localReport = runLocalPortfolioBacktest({
+            strategies: simulationPayload,
+            interval,
+            depositUsdt,
+            scope,
+          });
+          setReport(localReport);
+          setIsLocalFallback(true);
+          setError(null);
+        }
+      } finally {
+        if (!externalSignal?.aborted) {
+          setLoading(false);
+        }
       }
-      setReport(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки статистики PnL');
-    } finally {
-      setLoading(false);
-    }
-  }, [simulationPayload, interval, depositUsdt, scope]);
+    },
+    [simulationPayload, interval, depositUsdt, scope, isMax, isPro]
+  );
 
   const handleManualRecalculate = async () => {
     setError(null);
@@ -240,10 +268,14 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
   };
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      void fetchBacktest();
-    }, 180);
-    return () => clearTimeout(timer);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void fetchBacktest(controller.signal);
+    }, 220);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [fetchBacktest]);
 
   const totalPositive = (report?.summary.totalPnlPct ?? 0) >= 0;
@@ -267,7 +299,13 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
             <span>Бэктест по реальным свечам OHLCV</span>
             <span aria-hidden="true">·</span>
-            <span>{report?.dataSource === 'live' ? 'Биржевой поток' : 'Исторический фид'}</span>
+            <span className={isLocalFallback ? 'text-emerald-300 font-medium' : ''}>
+              {isLocalFallback
+                ? 'Локальный расчёт (OHLCV модель)'
+                : report?.dataSource === 'live'
+                  ? 'Биржевой поток'
+                  : 'Исторический фид'}
+            </span>
             <span aria-hidden="true">·</span>
             <span>Комиссия 0.08% учтена</span>
           </div>
@@ -649,54 +687,124 @@ export const StrategyPnlChart: React.FC<StrategyPnlChartProps> = ({
             </div>
           </div>
 
-          {/* Right: Per-Strategy PnL Breakdown BarChart */}
+          {/* Right: Per-Strategy PnL Breakdown (full strategy name above each bar — zero truncation on 390px) */}
           <div className="xl:col-span-5 space-y-3">
             <div className="flex items-center justify-between text-xs">
               <span className="font-medium text-white">Доходность по каждой стратегии</span>
               <span className="text-slate-400">PnL % за период</span>
             </div>
 
-            <div className="h-[280px] w-full rounded-xl bg-[#0B0F17] border border-white/8 pt-3 pr-3 pb-1">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  data={barChartData}
-                  layout="vertical"
-                  margin={{ top: 4, right: 16, left: 6, bottom: 4 }}
-                >
-                  <CartesianGrid stroke="rgba(255,255,255,0.06)" strokeDasharray="3 3" horizontal={false} />
-                  <XAxis
-                    type="number"
-                    tick={{ fill: '#94a3b8', fontSize: 11 }}
-                    tickLine={false}
-                    axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
-                    tickFormatter={(v: number) => `${v > 0 ? '+' : ''}${v}%`}
-                  />
-                  <YAxis
-                    type="category"
-                    dataKey="shortName"
-                    width={136}
-                    tick={{ fill: '#cbd5e1', fontSize: 11 }}
-                    tickLine={false}
-                    axisLine={false}
-                  />
-                  <ReferenceLine x={0} stroke="rgba(255,255,255,0.22)" />
-                  <Tooltip content={<StrategyBarTooltip />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
-                  <Bar dataKey="totalPnlPct" radius={[0, 4, 4, 0]} maxBarSize={22} isAnimationActive={false}>
-                    {barChartData.map((entry) => (
-                      <Cell
-                        key={entry.strategyKey}
-                        fill={entry.totalPnlPct >= 0 ? '#10b981' : '#f43f5e'}
-                        fillOpacity={entry.enabled ? 0.92 : 0.45}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
+            <div className="max-h-[300px] overflow-y-auto rounded-xl bg-[#0B0F17] border border-white/8 p-3 space-y-2.5">
+              {(() => {
+                const maxAbsPnl = Math.max(
+                  1,
+                  ...barChartData.map((item) => Math.abs(item.totalPnlPct))
+                );
+                return barChartData.map((entry) => {
+                  const pctWidth = Math.max(6, Math.min(100, (Math.abs(entry.totalPnlPct) / maxAbsPnl) * 100));
+                  const isPos = entry.totalPnlPct >= 0;
+                  return (
+                    <div
+                      key={entry.strategyKey}
+                      className={`space-y-1.5 pb-2 border-b border-white/6 last:border-b-0 last:pb-0 ${
+                        entry.enabled ? '' : 'opacity-65'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2 text-xs">
+                        <span className="font-sans font-medium text-slate-100 leading-tight break-words min-w-0">
+                          {entry.name}
+                        </span>
+                        <span
+                          className={`font-mono tabular-nums font-semibold whitespace-nowrap shrink-0 ${
+                            isPos ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {formatSignedPct(entry.totalPnlPct)}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-white/[0.06] overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-[width] duration-300 ${
+                            isPos ? 'bg-emerald-500' : 'bg-rose-500'
+                          }`}
+                          style={{ width: `${pctWidth}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] font-mono tabular-nums text-slate-400">
+                        <span className="font-sans">
+                          {entry.marketType === 'futures' ? 'Фьючерсы' : 'Спот'} · WR {entry.winRatePct}%
+                        </span>
+                        <span>
+                          {entry.tradesCount} сд. · {formatSignedUsdt(entry.totalPnlUsdt)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
             </div>
           </div>
 
-          {/* Dense Tabular Strategy Comparison Strip */}
-          <div className="xl:col-span-12 overflow-x-auto pt-2 border-t border-white/8">
+          {/* Mobile Compact Strategy Row-Cards (360px–767px: PnL %, WR %, Trades always visible without scroll) */}
+          <div className="xl:col-span-12 md:hidden pt-2 border-t border-white/8 space-y-2">
+            <div className="flex items-center justify-between px-1 text-[11px] text-slate-400">
+              <span>Стратегия</span>
+              <span className="font-mono">WR · Сд. · PnL %</span>
+            </div>
+            <div className="divide-y divide-white/8 rounded-xl border border-white/8 bg-[#0B0F17] overflow-hidden">
+              {report.breakdown.map((row) => {
+                const tplTier = getStrategyTemplate(row.strategyKey)?.tier;
+                const isPos = row.totalPnlPct >= 0;
+                return (
+                  <div
+                    key={row.strategyKey}
+                    className="px-3 py-2.5 flex items-center justify-between gap-2.5"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-medium text-white leading-tight line-clamp-2">
+                        {tplTier === 'max' && (
+                          <span className="font-mono text-[10px] font-bold text-cyan-300 mr-1">MAX</span>
+                        )}
+                        {row.name}
+                      </div>
+                      <div className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-400">
+                        <span>{row.marketType === 'futures' ? 'Фьюч' : 'Спот'}</span>
+                        <span aria-hidden="true">·</span>
+                        <span className={row.enabled ? 'text-emerald-400' : 'text-slate-500'}>
+                          {row.enabled ? 'Акт.' : 'Выкл.'}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono tabular-nums text-rose-300/90">
+                          DD {row.maxDrawdownPct}%
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0 font-mono tabular-nums text-[11px]">
+                      <div className="text-right">
+                        <div className={row.winRatePct >= 55 ? 'text-emerald-300 font-semibold' : 'text-slate-200'}>
+                          {row.winRatePct}%
+                        </div>
+                        <div className="text-[10px] text-slate-500">{row.tradesCount} сд.</div>
+                      </div>
+                      <div
+                        className={`min-w-[66px] text-right px-2 py-1 rounded-lg border font-semibold ${
+                          isPos
+                            ? 'border-emerald-500/30 bg-emerald-500/12 text-emerald-300'
+                            : 'border-rose-500/30 bg-rose-500/12 text-rose-300'
+                        }`}
+                      >
+                        <div>{formatSignedPct(row.totalPnlPct)}</div>
+                        <div className="text-[9px] opacity-80">{formatSignedUsdt(row.totalPnlUsdt)}</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Desktop Dense Tabular Strategy Comparison Strip */}
+          <div className="hidden md:block xl:col-span-12 overflow-x-auto pt-2 border-t border-white/8">
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-white/8 text-slate-400">

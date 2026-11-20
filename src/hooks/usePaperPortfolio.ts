@@ -1,4 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ingestLiveTickers } from '../stores/liveMarketStore';
+import { CACHE_TTL, fetchWithSWR, isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import type {
   ExchangeAssetBalance,
   ExchangeId,
@@ -35,8 +38,8 @@ export function getPortfolioIdentity(source: PortfolioSourceMeta): PortfolioIden
     };
   }
   return {
-    portfolioId: 'manual',
-    portfolioLabel: 'Локальный портфель',
+    portfolioId: 'exchange_unlinked',
+    portfolioLabel: 'Биржевой портфель (не подключён)',
   };
 }
 
@@ -49,11 +52,8 @@ export const PORTFOLIO_COLORS = [
   '#38BDF8',
 ] as const;
 
-export const DEFAULT_PORTFOLIO_HOLDINGS: PortfolioHolding[] = [
-  { id: 'seed-btc', symbol: 'BTCUSDT', amount: 0.045, avgEntryPrice: 86500 },
-  { id: 'seed-eth', symbol: 'ETHUSDT', amount: 0.85, avgEntryPrice: 3020 },
-  { id: 'seed-sol', symbol: 'SOLUSDT', amount: 12, avgEntryPrice: 196 },
-];
+/** VERNIER не хранит средства пользователей: портфель отображает только балансы, синхронизированные с бирж по API. */
+export const DEFAULT_PORTFOLIO_HOLDINGS: PortfolioHolding[] = [];
 
 export interface PortfolioEvaluatedRow extends PortfolioHolding {
   baseAsset: string;
@@ -98,8 +98,14 @@ export interface PaperPortfolioReport {
 
 export function usePaperPortfolio() {
   const [holdings, setHoldings] = useState<PortfolioHolding[]>(() => {
-    if (typeof window === 'undefined') return DEFAULT_PORTFOLIO_HOLDINGS;
+    if (typeof window === 'undefined') return [];
     try {
+      const sourceRaw = window.localStorage.getItem(PORTFOLIO_SOURCE_STORAGE_KEY);
+      const sourceParsed = sourceRaw ? (JSON.parse(sourceRaw) as Partial<PortfolioSourceMeta>) : null;
+      // Показываем сохранённые балансы только если они реально синхронизированы с подключённой биржи
+      if (sourceParsed?.mode !== 'exchange') {
+        return [];
+      }
       const raw = window.localStorage.getItem(PORTFOLIO_STORAGE_KEY);
       if (raw !== null) {
         const parsed = JSON.parse(raw) as unknown;
@@ -108,7 +114,7 @@ export function usePaperPortfolio() {
     } catch {
       // Ignore private browsing storage error
     }
-    return DEFAULT_PORTFOLIO_HOLDINGS;
+    return [];
   });
 
   const [portfolioSource, setPortfolioSource] = useState<PortfolioSourceMeta>(() => {
@@ -143,26 +149,60 @@ export function usePaperPortfolio() {
     }
   }, [portfolioSource]);
 
+  const abortRef = useRef<AbortController | null>(null);
+
   const refreshSpotPrices = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
-      const res = await fetch('/api/market/overview?marketType=spot');
-      if (res.ok) {
-        const data = (await res.json()) as { tickers?: TickerOverview[] };
-        if (Array.isArray(data.tickers)) {
-          setSpotTickers(data.tickers);
+      const data = await fetchWithSWR<{ tickers?: TickerOverview[]; updatedAt?: string }>(
+        'market:overview:spot',
+        async (signal) => {
+          const res = await fetch('/api/market/overview?marketType=spot', { signal });
+          const parsed = await parseJsonResponse<{ tickers?: TickerOverview[]; updatedAt?: string }>(res);
+          if (!parsed.ok || !parsed.data) {
+            throw new Error(parsed.errorMessage || 'Failed to load spot overview');
+          }
+          return parsed.data;
+        },
+        {
+          ttlMs: CACHE_TTL.LIVE_OVERVIEW_MS,
+          signal: controller.signal,
+          onBackgroundUpdate: (fresh) => {
+            if (Array.isArray(fresh.tickers) && fresh.tickers.length > 0) {
+              setSpotTickers(fresh.tickers);
+              ingestLiveTickers('spot', fresh.tickers, true);
+            }
+          },
         }
+      );
+      if (!controller.signal.aborted && Array.isArray(data.tickers) && data.tickers.length > 0) {
+        setSpotTickers(data.tickers);
+        ingestLiveTickers('spot', data.tickers, true);
       }
     } catch {
-      // Retain existing prices on temporary offline hiccup
+      // Retain existing prices on temporary offline hiccup or abort
     }
   }, []);
 
   useEffect(() => {
     void refreshSpotPrices();
-    const timer = setInterval(() => {
-      void refreshSpotPrices();
-    }, 30_000);
-    return () => clearInterval(timer);
+    const timer = window.setInterval(() => {
+      if (isPageVisible()) {
+        void refreshSpotPrices();
+      }
+    }, 45_000);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
+        void refreshSpotPrices();
+      }
+    });
+    return () => {
+      window.clearInterval(timer);
+      unsubVis();
+      abortRef.current?.abort();
+    };
   }, [refreshSpotPrices]);
 
   const addHolding = useCallback((symbol: string, amount: number, avgEntryPrice: number) => {
@@ -201,7 +241,7 @@ export function usePaperPortfolio() {
   }, []);
 
   const resetDemoPortfolio = useCallback(() => {
-    setHoldings(DEFAULT_PORTFOLIO_HOLDINGS);
+    setHoldings([]);
     setPortfolioSource({ mode: 'manual' });
   }, []);
 

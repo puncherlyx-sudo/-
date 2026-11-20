@@ -856,25 +856,81 @@ export interface LiveScannerItem {
   change24hPct: number;
 }
 
-export async function runLiveStrategyScanner(params: {
+export interface StrategyLiveTelemetryItem {
+  strategyKey: string;
+  status: 'SIGNAL_READY' | 'BUILDING' | 'MONITORING';
+  readinessPct: number;
+  bestSymbol: string;
+  bestDirection: 'LONG' | 'SHORT' | 'WAIT';
+  bestConfidence: number;
+  minConfidence: number;
+  rsi14: number | null;
+  trendBias: 'BULLISH' | 'BEARISH' | 'RANGE';
+  matchedSignalsCount: number;
+  reasonRu: string;
+  evaluatedAt: string;
+}
+
+export async function runLiveStrategyScannerWithTelemetry(params: {
   symbols: string[];
   strategies: Array<{
     strategyKey: string;
     name: string;
     marketType: 'spot' | 'futures';
     tier: 'free' | 'pro' | 'max';
+    minConfidence?: number;
+    pairs?: string[];
   }>;
   timeframe: '1h' | '4h';
   minConfidence: number;
-}): Promise<LiveScannerItem[]> {
+}): Promise<{
+  opportunities: LiveScannerItem[];
+  strategyTelemetry: Record<string, StrategyLiveTelemetryItem>;
+}> {
   const timeframe: '1h' | '4h' = params.timeframe === '4h' ? '4h' : '1h';
-  const minConf = Math.min(95, Math.max(55, Number(params.minConfidence || 68)));
-  const results: LiveScannerItem[] = [];
+  const defaultMinConf = Math.min(95, Math.max(55, Number(params.minConfidence || 68)));
+  const evaluatedAt = new Date().toISOString();
+  const opportunities: LiveScannerItem[] = [];
 
-  // Process symbols in small concurrent batches so exchange endpoints are never overloaded
+  // Инициализируем телеметрию по каждой стратегии, чтобы ни одна активная стратегия не зависала
+  const telemetryMap: Record<string, StrategyLiveTelemetryItem> = {};
+  const strategyPairSets = new Map<string, Set<string>>();
+  for (const st of params.strategies) {
+    const stMinConf = Math.min(95, Math.max(55, Number(st.minConfidence ?? defaultMinConf)));
+    telemetryMap[st.strategyKey] = {
+      strategyKey: st.strategyKey,
+      status: 'MONITORING',
+      readinessPct: 22,
+      bestSymbol: st.pairs?.[0] || params.symbols[0] || 'BTCUSDT',
+      bestDirection: 'WAIT',
+      bestConfidence: 0,
+      minConfidence: stMinConf,
+      rsi14: null,
+      trendBias: 'RANGE',
+      matchedSignalsCount: 0,
+      reasonRu: 'Ожидание формирования свечного паттерна на выбранных парах',
+      evaluatedAt,
+    };
+    if (Array.isArray(st.pairs) && st.pairs.length > 0) {
+      strategyPairSets.set(st.strategyKey, new Set(st.pairs));
+    }
+  }
+
+  // Объединяем запрошенные символы и пары активных стратегий
+  const symbolSet = new Set<string>(params.symbols);
+  for (const st of params.strategies) {
+    if (Array.isArray(st.pairs)) {
+      for (const p of st.pairs.slice(0, 6)) {
+        if (typeof p === 'string' && p.endsWith('USDT')) symbolSet.add(p);
+      }
+    }
+  }
+  const allSymbols = Array.from(symbolSet);
+
+  // Обработка батчами по 6 пар, чтобы не перегружать биржевые API
   const batchSize = 6;
-  for (let start = 0; start < params.symbols.length; start += batchSize) {
-    const batch = params.symbols.slice(start, start + batchSize);
+  for (let start = 0; start < allSymbols.length; start += batchSize) {
+    const batch = allSymbols.slice(start, start + batchSize);
     const batchItems = await Promise.all(
       batch.map(async (symbol) => {
         const found: LiveScannerItem[] = [];
@@ -894,47 +950,97 @@ export async function runLiveStrategyScanner(params: {
                 ? Number((((lastBar.close - firstBar.close) / firstBar.close) * 100).toFixed(2))
                 : 0;
             const atr = estimateBarAtr(candles, lastIdx);
+            const rsiVal = Number((feed.indicators.rsi14 ?? 50).toFixed(1));
+            const trendBias = feed.indicators.trendBias;
 
-            // Pick highest-confidence strategy match for this symbol & market
-            let bestMatch: LiveScannerItem | null = null;
+            // Оцениваем каждую стратегию для данной пары
+            let bestMatchForSymbol: LiveScannerItem | null = null;
             for (const strat of marketStrategies) {
+              const allowedPairs = strategyPairSets.get(strat.strategyKey);
+              if (allowedPairs && !allowedPairs.has(symbol)) continue;
+
+              const stMinConf = Math.min(95, Math.max(55, Number(strat.minConfidence ?? defaultMinConf)));
               const sig =
                 evaluateSignal(strat.strategyKey, mType, candles, lastIdx) ??
                 evaluateSignal(strat.strategyKey, mType, candles, prevIdx);
-              if (!sig || sig.confidence < minConf) continue;
+              const t = telemetryMap[strat.strategyKey];
 
-              const execProfile = getStrategyExecutionProfile(strat.strategyKey);
-              const entryPrice = lastBar.close;
-              const slDist = Math.max(entryPrice * 0.0045, atr * execProfile.slAtr);
-              const tpDist = Math.max(entryPrice * 0.0038, atr * (execProfile.breakevenTriggerAtr ? execProfile.tpAtr * 1.55 : 2.35));
-              const stopLossPrice =
-                sig.direction === 'LONG' ? entryPrice - slDist : entryPrice + slDist;
-              const takeProfitPrice =
-                sig.direction === 'LONG' ? entryPrice + tpDist : entryPrice - tpDist;
-              const rr = Number((tpDist / slDist).toFixed(2));
+              if (sig) {
+                const execProfile = getStrategyExecutionProfile(strat.strategyKey);
+                const entryPrice = lastBar.close;
+                const slDist = Math.max(entryPrice * 0.0045, atr * execProfile.slAtr);
+                const tpDist = Math.max(
+                  entryPrice * 0.0038,
+                  atr * (execProfile.breakevenTriggerAtr ? execProfile.tpAtr * 1.55 : 2.35)
+                );
+                const stopLossPrice = sig.direction === 'LONG' ? entryPrice - slDist : entryPrice + slDist;
+                const takeProfitPrice = sig.direction === 'LONG' ? entryPrice + tpDist : entryPrice - tpDist;
+                const rr = Number((tpDist / slDist).toFixed(2));
 
-              if (!bestMatch || sig.confidence > bestMatch.confidence) {
-                bestMatch = {
-                  symbol,
-                  marketType: mType,
-                  timeframe,
-                  strategyKey: strat.strategyKey,
-                  strategyName: strat.name,
-                  strategyTier: strat.tier,
-                  direction: sig.direction,
-                  confidence: sig.confidence,
-                  entryPrice,
-                  stopLossPrice,
-                  takeProfitPrice,
-                  riskRewardRatio: rr,
-                  rsi14: Number((feed.indicators.rsi14 ?? 50).toFixed(1)),
-                  trendBias: feed.indicators.trendBias,
-                  change24hPct,
-                };
+                if (sig.confidence >= stMinConf) {
+                  t.matchedSignalsCount += 1;
+                  if (sig.confidence >= t.bestConfidence || t.status !== 'SIGNAL_READY') {
+                    t.status = 'SIGNAL_READY';
+                    t.readinessPct = 100;
+                    t.bestSymbol = symbol;
+                    t.bestDirection = sig.direction;
+                    t.bestConfidence = sig.confidence;
+                    t.rsi14 = rsiVal;
+                    t.trendBias = trendBias;
+                    t.reasonRu = `Сигнал ${sig.direction} (${sig.confidence}%) по ${symbol.replace('USDT', '/USDT')} сформирован`;
+                  }
+                  if (!bestMatchForSymbol || sig.confidence > bestMatchForSymbol.confidence) {
+                    bestMatchForSymbol = {
+                      symbol,
+                      marketType: mType,
+                      timeframe,
+                      strategyKey: strat.strategyKey,
+                      strategyName: strat.name,
+                      strategyTier: strat.tier,
+                      direction: sig.direction,
+                      confidence: sig.confidence,
+                      entryPrice,
+                      stopLossPrice,
+                      takeProfitPrice,
+                      riskRewardRatio: rr,
+                      rsi14: rsiVal,
+                      trendBias,
+                      change24hPct,
+                    };
+                  }
+                } else if (t.status !== 'SIGNAL_READY' && sig.confidence > t.bestConfidence) {
+                  // Реальный near-miss: паттерн есть, но уверенность ниже пользовательского порога
+                  const ratioPct = Math.min(94, Math.max(45, Math.round((sig.confidence / stMinConf) * 95)));
+                  t.status = 'BUILDING';
+                  t.readinessPct = ratioPct;
+                  t.bestSymbol = symbol;
+                  t.bestDirection = sig.direction;
+                  t.bestConfidence = sig.confidence;
+                  t.rsi14 = rsiVal;
+                  t.trendBias = trendBias;
+                  t.reasonRu = `Формируется ${sig.direction} по ${symbol.replace('USDT', '')}: уверенность ${sig.confidence}% из порога ${stMinConf}%`;
+                }
+              } else if (t.status === 'MONITORING') {
+                // Реальная оценка близости индикаторов (RSI-экстремум + сила тренда)
+                const rsiTension = Math.min(1, Math.abs(rsiVal - 50) / 28);
+                const moveTension = Math.min(1, Math.abs(change24hPct) / 6);
+                const biasBonus = trendBias === 'RANGE' ? 0 : 12;
+                const liveReadiness = Math.min(58, Math.max(18, Math.round(20 + rsiTension * 22 + moveTension * 10 + biasBonus)));
+                if (liveReadiness > t.readinessPct || t.rsi14 === null) {
+                  t.readinessPct = liveReadiness;
+                  t.bestSymbol = symbol;
+                  t.rsi14 = rsiVal;
+                  t.trendBias = trendBias;
+                  t.reasonRu =
+                    trendBias === 'RANGE'
+                      ? `${symbol.replace('USDT', '')}: боковик (RSI ${rsiVal}) — ждём выход из диапазона`
+                      : `${symbol.replace('USDT', '')}: тренд ${trendBias === 'BULLISH' ? 'вверх' : 'вниз'} (RSI ${rsiVal}) — ждём триггер входа`;
+                }
               }
             }
-            if (bestMatch) {
-              found.push(bestMatch);
+
+            if (bestMatchForSymbol) {
+              found.push(bestMatchForSymbol);
             }
           } catch {
             // Skip unavailable symbol gracefully
@@ -944,10 +1050,25 @@ export async function runLiveStrategyScanner(params: {
       })
     );
     for (const group of batchItems) {
-      results.push(...group);
+      opportunities.push(...group);
     }
   }
 
-  results.sort((a, b) => b.confidence * b.riskRewardRatio - a.confidence * a.riskRewardRatio);
-  return results;
+  opportunities.sort((a, b) => b.confidence * b.riskRewardRatio - a.confidence * a.riskRewardRatio);
+  return { opportunities, strategyTelemetry: telemetryMap };
+}
+
+export async function runLiveStrategyScanner(params: {
+  symbols: string[];
+  strategies: Array<{
+    strategyKey: string;
+    name: string;
+    marketType: 'spot' | 'futures';
+    tier: 'free' | 'pro' | 'max';
+  }>;
+  timeframe: '1h' | '4h';
+  minConfidence: number;
+}): Promise<LiveScannerItem[]> {
+  const { opportunities } = await runLiveStrategyScannerWithTelemetry(params);
+  return opportunities;
 }

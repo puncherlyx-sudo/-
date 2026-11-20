@@ -27,11 +27,9 @@ import { NATIVE_PILL_SPRING, tabSlideBlurVariants } from './components/MotionPri
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PinLockOverlay } from './components/PinLockOverlay';
 import { PWAInstallButton } from './components/PWAInstallButton';
-import { QuickAnswersCard } from './components/QuickAnswersCard';
 import type { SecuritySection } from './components/SecurityCenterView';
 import { SplashIntro } from './components/MotionExtras';
 import { TickerTape } from './components/TickerTape';
-import { PricingModal } from './components/PricingModal';
 import {
   TradeRiskConfirmModal,
   type PendingApiOrderConfirm,
@@ -44,6 +42,8 @@ import {
   NewsFeedView,
   PortfolioDetailsModal,
   prefetchViews,
+  PricingModal,
+  QuickAnswersCard,
   SecurityCenterView,
   StandaloneWidgetView,
   StrategiesView,
@@ -97,7 +97,9 @@ import {
   readExchangeSyncErrorLogs,
   type ExchangeSyncErrorLogEntry,
 } from './lib/exchangeSyncErrorLog';
+import type { ActiveStrategySignalOverlay } from './lib/strategyEngine';
 import {
+  cleanupOldCache,
   clearDemoStrategyOverrides,
   createOAuthCsrfState,
   getAntiPhishingCode,
@@ -114,6 +116,7 @@ import {
   setAntiPhishingCode,
   setDemoPlanOverride,
   setPinHash,
+  setPinSalt,
   setPinTimeoutMinutes,
   setPrivacyMode,
   setThemeMode,
@@ -126,7 +129,13 @@ import {
   type ThemeMode,
 } from './lib/localDemoStore';
 import { clearMemoryCache } from './lib/marketCache';
-import { hashPinSha256, triggerHaptic } from './lib/securityDlp';
+import {
+  clearDecryptedSecretsFromMemory,
+  derivePinPbkdf2,
+  setSessionVaultPassphrase,
+  triggerHaptic,
+} from './lib/securityDlp';
+import { logger } from './utils/logger';
 
 function formatBannerErrorMessage(raw: string): string {
   const trimmed = raw.trim();
@@ -236,15 +245,23 @@ export default function App() {
   >(() => readDemoStrategyOverrides());
 
   useEffect(() => {
+    cleanupOldCache();
+  }, []);
+
+  useEffect(() => {
     setThemeMode(themeMode);
   }, [themeMode]);
 
   useEffect(() => {
     if (!pinHash || pinTimeoutMin <= 0 || isPinLocked) return;
-    let timerId = window.setTimeout(() => setIsPinLocked(true), pinTimeoutMin * 60_000);
+    const triggerLock = () => {
+      clearDecryptedSecretsFromMemory();
+      setIsPinLocked(true);
+    };
+    let timerId = window.setTimeout(triggerLock, pinTimeoutMin * 60_000);
     const resetTimer = () => {
       window.clearTimeout(timerId);
-      timerId = window.setTimeout(() => setIsPinLocked(true), pinTimeoutMin * 60_000);
+      timerId = window.setTimeout(triggerLock, pinTimeoutMin * 60_000);
     };
     const events = ['pointerdown', 'keydown', 'touchstart'] as const;
     events.forEach((ev) => window.addEventListener(ev, resetTimer, { passive: true }));
@@ -268,13 +285,17 @@ export default function App() {
   }, []);
 
   const handleSavePin = useCallback(async (pin: string) => {
-    const hashed = await hashPinSha256(pin);
-    setPinHash(hashed);
-    setPinHashState(hashed);
+    const { hash, salt } = await derivePinPbkdf2(pin);
+    setPinHash(hash);
+    setPinSalt(salt);
+    setPinHashState(hash);
+    setSessionVaultPassphrase(pin);
   }, []);
 
   const handleDisablePin = useCallback(() => {
+    clearDecryptedSecretsFromMemory();
     setPinHash(null);
+    setPinSalt(null);
     setPinHashState(null);
     setIsPinLocked(false);
   }, []);
@@ -330,6 +351,7 @@ export default function App() {
     symbol: string;
     marketType: MarketType;
     nonce: number;
+    signalOverlay?: ActiveStrategySignalOverlay | null;
   } | null>(null);
   const [screenerSectionSelection, setScreenerSectionSelection] = useState<{
     section: ScreenerSection;
@@ -993,14 +1015,56 @@ export default function App() {
   };
 
   const runGoogleOAuthWithCsrf = async () => {
+    const startedAt = Date.now();
     const csrfState = createOAuthCsrfState();
-    const loggedUid = await loginWithGoogle();
-    if (!verifyOAuthCsrfState(csrfState)) {
-      setBannerError('Не пройдена проверка OAuth CSRF state. Повторите вход.');
-      return;
-    }
-    if (loggedUid) {
+    const statePrefix = csrfState ? `${csrfState.slice(0, 6)}…` : 'empty';
+
+    try {
+      const loggedUid = await loginWithGoogle();
+      const csrfValid = verifyOAuthCsrfState(csrfState);
+
+      if (!csrfValid) {
+        logger.warn('auth:oauth-csrf', 'OAuth CSRF state verification failed', {
+          statePrefix,
+          hasUid: Boolean(loggedUid),
+          durationMs: Date.now() - startedAt,
+          origin: typeof window !== 'undefined' ? window.location.origin : 'unknown',
+        });
+        setBannerError('Не пройдена проверка OAuth CSRF state. Повторите вход.');
+        return;
+      }
+
+      if (!loggedUid) {
+        logger.warn('auth:google-oauth', 'Google OAuth completed without user session', {
+          statePrefix,
+          durationMs: Date.now() - startedAt,
+        });
+        return;
+      }
+
+      logger.info('auth:google-oauth', 'Google OAuth verified successfully', {
+        uidPrefix: `${loggedUid.slice(0, 6)}…`,
+        durationMs: Date.now() - startedAt,
+      });
       setPendingLoginPushUid(loggedUid);
+    } catch (err) {
+      const errorCode =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code ?? 'unknown')
+          : 'unknown';
+      const errorMessage = err instanceof Error ? err.message : String(err);
+
+      logger.error('auth:google-oauth', 'Google OAuth authentication attempt failed', {
+        code: errorCode,
+        message: errorMessage,
+        statePrefix,
+        durationMs: Date.now() - startedAt,
+      });
+      setBannerError(
+        errorCode === 'auth/popup-closed-by-user'
+          ? 'Окно входа Google было закрыто до завершения авторизации.'
+          : 'Ошибка входа через Google. Проверьте подключение и повторите попытку.'
+      );
     }
   };
 
@@ -1016,7 +1080,8 @@ export default function App() {
 
   const handleDeleteAccountAndAllData = async () => {
     clearMemoryCache();
-    wipeAllLocalAppData();
+    clearDecryptedSecretsFromMemory();
+    await wipeAllLocalAppData();
     clearDemoStrategyOverrides();
     setDemoStrategyOverrides({});
     if (isSignedIn) {
@@ -1459,8 +1524,17 @@ export default function App() {
   };
 
   const handleOpenPairOnMarket = useCallback(
-    (symbol: string, marketType: MarketType) => {
-      setMarketSelection({ symbol, marketType, nonce: Date.now() });
+    (
+      symbol: string,
+      marketType: MarketType,
+      signalOverlay?: ActiveStrategySignalOverlay | null
+    ) => {
+      setMarketSelection({
+        symbol,
+        marketType,
+        nonce: Date.now(),
+        signalOverlay: signalOverlay ?? null,
+      });
       handleSwitchTab('market');
     },
     [handleSwitchTab]
@@ -1485,7 +1559,7 @@ export default function App() {
             initialTimeframe={standaloneWidget.tf}
             portfolioReport={paperPortfolio.report}
             holdingsCount={paperPortfolio.holdings.length}
-            strategies={strategies}
+            strategies={effectiveStrategies}
             onChangeWidget={launchStandaloneWidget}
             onExitToTerminal={exitStandaloneWidget}
           />
@@ -1517,6 +1591,8 @@ export default function App() {
               <img
                 src="/brand/vernier-lockup.svg"
                 alt="Vernier"
+                width={120}
+                height={28}
                 className="h-7 w-auto shrink-0"
               />
             </motion.button>
@@ -1640,6 +1716,8 @@ export default function App() {
               <img
                 src="/brand/vernier-lockup.svg"
                 alt="Vernier"
+                width={96}
+                height={22}
                 className="h-5.5 w-auto shrink-0"
               />
             </motion.button>
@@ -1716,6 +1794,9 @@ export default function App() {
                   .join(' · ')
               : undefined
           }
+          exchangeKeys={exchangeKeys}
+          exchangeSyncCache={exchangeSyncCache}
+          exchangeSyncErrorLogs={exchangeSyncErrorLogs}
           onOpenExchangeIntegrations={() => {
             setSecuritySectionSelection({ section: 'exchanges', nonce: Date.now() });
             handleSwitchTab('security');
@@ -1729,6 +1810,10 @@ export default function App() {
           }}
           onClearPortfolio={paperPortfolio.clearHoldings}
           onResetDemo={paperPortfolio.resetDemoPortfolio}
+          onOpenKnowledgeBase={() => {
+            setSecuritySectionSelection({ section: 'audit', sub: 'faq', nonce: Date.now() });
+            handleSwitchTab('security');
+          }}
           bottomSlot={<TickerTape embedded />}
           rightActions={
             <>
@@ -1878,6 +1963,7 @@ export default function App() {
                   handleSwitchTab('security');
                 }}
                 onPlaceExchangeOrder={handlePlaceExchangeOrderProtected}
+                portfolioBalanceUsdt={paperPortfolio.report.totalValue}
               />
             )}
 
@@ -1892,8 +1978,14 @@ export default function App() {
                 onOpenPairOnMarket={handleOpenPairOnMarket}
                 holdings={paperPortfolio.holdings}
                 portfolioReport={paperPortfolio.report}
+                portfolioSource={paperPortfolio.portfolioSource}
+                exchangeKeys={exchangeKeys}
                 activeTarget={activePortfolioTarget}
                 onOpenPortfolioDetails={() => setPortfolioModalOpen(true)}
+                onOpenExchangeIntegrations={() => {
+                  setSecuritySectionSelection({ section: 'exchanges', nonce: Date.now() });
+                  handleSwitchTab('security');
+                }}
                 onAddHolding={paperPortfolio.addHolding}
                 onUpdateHolding={paperPortfolio.updateHolding}
                 onRemoveHolding={paperPortfolio.removeHolding}
@@ -1911,8 +2003,15 @@ export default function App() {
                 privacyMode={privacyMode}
                 pushSubscribed={pushState.isSubscribed}
                 portfolioBalanceUsdt={paperPortfolio.report.totalValue}
+                exchangeKeys={exchangeKeys}
+                exchangeSyncCache={exchangeSyncCache}
+                exchangeSyncErrorLogs={exchangeSyncErrorLogs}
                 onOpenPushSettings={() => {
                   setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
+                  handleSwitchTab('security');
+                }}
+                onOpenExchangeIntegrations={() => {
+                  setSecuritySectionSelection({ section: 'exchanges', nonce: Date.now() });
                   handleSwitchTab('security');
                 }}
                 onRequireLogin={() => void handleLoginWithPush()}
@@ -1920,6 +2019,8 @@ export default function App() {
                 onConsumeCredits={handleConsumeCreditsUnified}
                 onOpenPairOnMarket={handleOpenPairOnMarket}
                 onSaveStrategy={handleProtectedStrategySave}
+                onPlaceExchangeOrder={handlePlaceExchangeOrderProtected}
+                onSignalEmitted={handleSignalEmitted}
                 externalSection={strategiesSectionSelection}
               />
             )}
@@ -2051,23 +2152,27 @@ export default function App() {
         })}
       </nav>
 
-      <PricingModal
-        open={pricingOpen}
-        onClose={() => setPricingOpen(false)}
-        proUntil={effectiveProfile?.proUntil}
-        currentPlan={getActivePlanTier(effectiveProfile)}
-        initialTier={pricingTier}
-        initialMaxMultiplier={pricingMaxMultiplier}
-        onActivateDemoTier={(tier, maxMult) => {
-          handleChangeDemoPlan({ tier, maxMultiplier: maxMult ?? 10 });
-          setPaymentNotice(
-            `Демо-режим переключён на тариф ${tier.toUpperCase()}${
-              tier === 'max' ? ` ×${maxMult ?? 10}` : ''
-            }. Все функции этого уровня разблокированы.`
-          );
-          setPricingOpen(false);
-        }}
-      />
+      {pricingOpen && (
+        <Suspense fallback={null}>
+          <PricingModal
+            open={pricingOpen}
+            onClose={() => setPricingOpen(false)}
+            proUntil={effectiveProfile?.proUntil}
+            currentPlan={getActivePlanTier(effectiveProfile)}
+            initialTier={pricingTier}
+            initialMaxMultiplier={pricingMaxMultiplier}
+            onActivateDemoTier={(tier, maxMult) => {
+              handleChangeDemoPlan({ tier, maxMultiplier: maxMult ?? 10 });
+              setPaymentNotice(
+                `Демо-режим переключён на тариф ${tier.toUpperCase()}${
+                  tier === 'max' ? ` ×${maxMult ?? 10}` : ''
+                }. Все функции этого уровня разблокированы.`
+              );
+              setPricingOpen(false);
+            }}
+          />
+        </Suspense>
+      )}
 
       {/* Mandatory Onboarding / Auth 4-Checkbox Legal Consent Gate (UA Law / GDPR / Google Play) */}
       <LegalConsentModal
@@ -2100,6 +2205,8 @@ export default function App() {
           expectedPinHash={pinHash}
           antiPhishingCode={antiPhishingCode}
           onUnlocked={() => setIsPinLocked(false)}
+          onPinMigrated={(newHash) => setPinHashState(newHash)}
+          onEmergencyWipeVault={handleDeleteAccountAndAllData}
         />
       )}
 
@@ -2231,42 +2338,50 @@ export default function App() {
               maxWidthClass="sm:max-w-2xl"
               bodyClassName="p-3.5 sm:p-4"
             >
-              <BottomSheetItem index={0}>
-                <QuickAnswersCard
-                  inSheet
-                  isSignedIn={isSignedIn}
-                  userEmail={firebaseUser?.email || privateSecurity?.email || ''}
-                  supportTickets={supportTickets}
-                  onRequireLogin={() => {
-                    setAssistantSheetOpen(false);
-                    void handleLoginWithPush();
-                  }}
-                  onCreateSupportTicket={createSupportTicket}
-                  onOpenPushSettings={() => {
-                    setAssistantSheetOpen(false);
-                    setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
-                    handleSwitchTab('security');
-                  }}
-                  onOpenAiSection={() => {
-                    setAssistantSheetOpen(false);
-                    handleSwitchTab('market');
-                  }}
-                  onUpgradePro={() => {
-                    setAssistantSheetOpen(false);
-                    setPricingTier('pro');
-                    setPricingOpen(true);
-                  }}
-                  onOpenFullFaq={() => {
-                    setAssistantSheetOpen(false);
-                    setSecuritySectionSelection({ section: 'audit', sub: 'faq', nonce: Date.now() });
-                    handleSwitchTab('security');
-                  }}
-                  onStartTour={() => {
-                    setAssistantSheetOpen(false);
-                    handleStartTour();
-                  }}
-                />
-              </BottomSheetItem>
+              {assistantSheetOpen && (
+                <Suspense
+                  fallback={
+                    <div className="h-56 rounded-2xl border border-white/8 bg-[var(--surface-1)] shimmer-skeleton" />
+                  }
+                >
+                  <BottomSheetItem index={0}>
+                    <QuickAnswersCard
+                      inSheet
+                      isSignedIn={isSignedIn}
+                      userEmail={firebaseUser?.email || privateSecurity?.email || ''}
+                      supportTickets={supportTickets}
+                      onRequireLogin={() => {
+                        setAssistantSheetOpen(false);
+                        void handleLoginWithPush();
+                      }}
+                      onCreateSupportTicket={createSupportTicket}
+                      onOpenPushSettings={() => {
+                        setAssistantSheetOpen(false);
+                        setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
+                        handleSwitchTab('security');
+                      }}
+                      onOpenAiSection={() => {
+                        setAssistantSheetOpen(false);
+                        handleSwitchTab('market');
+                      }}
+                      onUpgradePro={() => {
+                        setAssistantSheetOpen(false);
+                        setPricingTier('pro');
+                        setPricingOpen(true);
+                      }}
+                      onOpenFullFaq={() => {
+                        setAssistantSheetOpen(false);
+                        setSecuritySectionSelection({ section: 'audit', sub: 'faq', nonce: Date.now() });
+                        handleSwitchTab('security');
+                      }}
+                      onStartTour={() => {
+                        setAssistantSheetOpen(false);
+                        handleStartTour();
+                      }}
+                    />
+                  </BottomSheetItem>
+                </Suspense>
+              )}
             </BottomSheet>
           </>
         );
@@ -2287,7 +2402,7 @@ export default function App() {
           onClose={() => setWidgetsModalOpen(false)}
           portfolioReport={paperPortfolio.report}
           holdingsCount={paperPortfolio.holdings.length}
-          strategies={strategies}
+          strategies={effectiveStrategies}
           onLaunchStandaloneWidget={launchStandaloneWidget}
         />
       </Suspense>

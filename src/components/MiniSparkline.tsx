@@ -9,7 +9,7 @@ interface MiniSparklineProps {
   className?: string;
 }
 
-export const MiniSparkline: React.FC<MiniSparklineProps> = ({
+export const MiniSparkline: React.FC<MiniSparklineProps> = React.memo(({
   data,
   changePct = null,
   width = 68,
@@ -119,4 +119,5 @@ export const MiniSparkline: React.FC<MiniSparklineProps> = ({
       <circle cx={geometry.lastX} cy={geometry.lastY} r={1.8} fill={strokeColor} />
     </svg>
   );
-};
+});
+MiniSparkline.displayName = 'MiniSparkline';

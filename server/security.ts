@@ -1,20 +1,53 @@
 import crypto from 'crypto';
+import { serverLogger } from './logger.ts';
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
-const FALLBACK_VAULT_SECRET = 'aegisquant-institutional-vault-2026';
-let fallbackVaultWarningShown = false;
+const MIN_MASTER_KEY_LEN = 32;
+let ephemeralDevMasterKey: Buffer | null = null;
+let devKeyWarningShown = false;
 
-function getVaultKey(uid: string): Buffer {
-  const configured = process.env.TOTP_MASTER_KEY || process.env.GEMINI_API_KEY;
-  if (!configured && !fallbackVaultWarningShown) {
-    fallbackVaultWarningShown = true;
-    console.warn(
-      '[security] TOTP_MASTER_KEY не задан: TOTP-секреты шифруются публичным запасным ключом. Задайте TOTP_MASTER_KEY в окружении.',
+function resolveMasterKeyMaterial(): Buffer {
+  const configured = (process.env.TOTP_MASTER_KEY || '').trim();
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (configured.length >= MIN_MASTER_KEY_LEN) {
+    return Buffer.from(configured, 'utf8');
+  }
+
+  if (isProduction) {
+    throw new Error(
+      '[security] FATAL: TOTP_MASTER_KEY не задан или короче 32 символов. Запуск в production без криптографического мастер-ключа запрещён.',
     );
   }
-  const master = configured || FALLBACK_VAULT_SECRET;
-  return crypto.createHash('sha256').update(`${master}:${uid}:totp-v1`).digest();
+
+  if (!ephemeralDevMasterKey) {
+    ephemeralDevMasterKey = crypto.randomBytes(32);
+  }
+  if (!devKeyWarningShown) {
+    devKeyWarningShown = true;
+    serverLogger.warn(
+      'security',
+      'DEV WARNING: TOTP_MASTER_KEY не задан (мин. 32 символа). Сгенерирован временный эфемерный ключ для текущей сессии процесса. Задайте TOTP_MASTER_KEY в .env.'
+    );
+  }
+  return ephemeralDevMasterKey;
+}
+
+export function assertSecurityEnvConfigured(): void {
+  resolveMasterKeyMaterial();
+}
+
+function getVaultKey(uid: string): Buffer {
+  const masterMaterial = resolveMasterKeyMaterial();
+  const derived = crypto.hkdfSync(
+    'sha256',
+    masterMaterial,
+    Buffer.from(`vernier:vault:${uid}`, 'utf8'),
+    Buffer.from('vernier-aes256gcm-v2', 'utf8'),
+    32,
+  );
+  return Buffer.from(derived);
 }
 
 export function generateBase32Secret(byteLength = 20): string {

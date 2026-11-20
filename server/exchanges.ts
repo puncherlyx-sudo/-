@@ -357,6 +357,31 @@ async function fetchOkxBalances(
   };
 }
 
+export const MAX_TESTNET_ORDER_USDT = (() => {
+  const configured = Number(process.env.MAX_TESTNET_ORDER_USDT);
+  if (Number.isFinite(configured) && configured >= 10 && configured <= 25_000) {
+    return Math.floor(configured);
+  }
+  return 5_000;
+})();
+
+export const REQUIRED_ORDER_CONFIRM_STATEMENT = 'VERNIER_API_ORDER_CONFIRMED';
+
+interface VerifiedKeyRecord {
+  uid: string;
+  exchange: ExchangeId;
+  permissions: ExchangeKeyPermissions;
+  testnet: boolean;
+  registeredAt: number;
+}
+
+// Серверный реестр прав ключей (клиентское поле permissions при исполнении ордера НЕ принимается).
+const serverVerifiedKeyRegistry = new Map<string, VerifiedKeyRecord>();
+
+function computeKeyRegistryId(uid: string, encryptedApiKey: string): string {
+  return crypto.createHash('sha256').update(`${uid}:${encryptedApiKey}`).digest('hex');
+}
+
 export async function connectAndEncryptExchange(params: {
   uid: string;
   exchange: ExchangeId;
@@ -371,6 +396,7 @@ export async function connectAndEncryptExchange(params: {
   encryptedApiKey: string;
   encryptedApiSecret: string;
   encryptedPassphrase: string;
+  effectivePermissions: ExchangeKeyPermissions;
   sync: ExchangeSyncResult;
 }> {
   const apiKey = params.apiKey.trim();
@@ -384,6 +410,10 @@ export async function connectAndEncryptExchange(params: {
     throw new ExchangeApiError('Некорректная длина API Secret (ожидается от 10 символов).', 400);
   }
 
+  // На живых аккаунтах (не Testnet) сервер принудительно ограничивает права до Read-Only.
+  const effectivePermissions: ExchangeKeyPermissions =
+    params.testnet && params.permissions === 'trade' ? 'trade' : 'read_only';
+
   let sync: ExchangeSyncResult;
   if (params.exchange === 'binance') {
     sync = await fetchBinanceBalances(apiKey, apiSecret, params.testnet);
@@ -393,11 +423,24 @@ export async function connectAndEncryptExchange(params: {
     sync = await fetchOkxBalances(apiKey, apiSecret, passphrase, params.testnet);
   }
 
+  const encryptedApiKey = encryptSecret(apiKey, params.uid);
+  const encryptedApiSecret = encryptSecret(apiSecret, params.uid);
+  const encryptedPassphrase = passphrase ? encryptSecret(passphrase, params.uid) : '';
+
+  serverVerifiedKeyRegistry.set(computeKeyRegistryId(params.uid, encryptedApiKey), {
+    uid: params.uid,
+    exchange: params.exchange,
+    permissions: effectivePermissions,
+    testnet: params.testnet,
+    registeredAt: Date.now(),
+  });
+
   return {
     apiKeyPreview: maskApiKey(apiKey),
-    encryptedApiKey: encryptSecret(apiKey, params.uid),
-    encryptedApiSecret: encryptSecret(apiSecret, params.uid),
-    encryptedPassphrase: passphrase ? encryptSecret(passphrase, params.uid) : '',
+    encryptedApiKey,
+    encryptedApiSecret,
+    encryptedPassphrase,
+    effectivePermissions,
     sync,
   };
 }
@@ -438,8 +481,9 @@ export async function executeEncryptedExchangeOrder(params: {
   encryptedApiKey: string;
   encryptedApiSecret: string;
   encryptedPassphrase?: string;
-  permissions: ExchangeKeyPermissions;
   testnet: boolean;
+  confirmResponsibility: boolean;
+  confirmStatement: string;
   symbol: string;
   marketType: MarketType;
   side: 'BUY' | 'SELL';
@@ -449,22 +493,87 @@ export async function executeEncryptedExchangeOrder(params: {
   stopLoss?: number;
   takeProfit?: number;
 }): Promise<ExchangeOrderResult> {
-  if (params.permissions !== 'trade') {
+  // 1. Жёсткий серверный запрет на исполнение реальных (Live) ордеров
+  if (!params.testnet) {
     throw new ExchangeApiError(
-      'Ключ подключён только в режиме чтения (Read-Only). Для отправки ордеров подключите ключ с правом торговли.',
+      'Исполнение реальных ордеров (Live Trade) отключено на уровне сервера. Доступны только режимы Read-Only и Testnet.',
       403
     );
+  }
+
+  // 2. Обязательное серверное подтверждение ответственности пользователя
+  if (
+    params.confirmResponsibility !== true ||
+    params.confirmStatement !== REQUIRED_ORDER_CONFIRM_STATEMENT
+  ) {
+    throw new ExchangeApiError(
+      'Необходимо подтвердить персональную финансовую ответственность перед отправкой ордера.',
+      400
+    );
+  }
+
+  // 3. Проверка прав ключа строго на стороне сервера (клиентские permissions игнорируются)
+  const keyRecord = serverVerifiedKeyRegistry.get(
+    computeKeyRegistryId(params.uid, params.encryptedApiKey),
+  );
+  if (keyRecord) {
+    if (keyRecord.uid !== params.uid || keyRecord.exchange !== params.exchange) {
+      throw new ExchangeApiError('Несоответствие владельца или биржи для API-ключа.', 403);
+    }
+    if (!keyRecord.testnet || keyRecord.permissions !== 'trade') {
+      throw new ExchangeApiError(
+        'Ключ зарегистрирован в режиме Read-Only. Отправка ордеров запрещена на сервере.',
+        403
+      );
+    }
   }
 
   const symbol = params.symbol.toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (!/^[A-Z0-9]{4,20}$/.test(symbol)) {
     throw new ExchangeApiError('Некорректный тикер торговой пары.', 400);
   }
-  if (!Number.isFinite(params.quantity) || params.quantity <= 0) {
-    throw new ExchangeApiError('Укажите корректное количество (> 0) для ордера.', 400);
+  if (!Number.isFinite(params.quantity) || params.quantity <= 0 || params.quantity > 100_000) {
+    throw new ExchangeApiError('Укажите корректное количество (> 0 и ≤ 100 000) для ордера.', 400);
   }
-  if (params.orderType === 'LIMIT' && (!Number.isFinite(params.limitPrice) || (params.limitPrice ?? 0) <= 0)) {
-    throw new ExchangeApiError('Для лимитного ордера укажите цену (> 0).', 400);
+  if (
+    params.orderType === 'LIMIT' &&
+    (!Number.isFinite(params.limitPrice) || (params.limitPrice ?? 0) <= 0 || (params.limitPrice ?? 0) > 10_000_000)
+  ) {
+    throw new ExchangeApiError('Для лимитного ордера укажите корректную цену (> 0).', 400);
+  }
+
+  // 4. Серверный лимит максимального объёма ордера и проверка непротиворечивости SL/TP
+  const priceMap = await getSpotPriceMap();
+  const baseAsset = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+  const referencePrice =
+    params.orderType === 'LIMIT' && params.limitPrice
+      ? params.limitPrice
+      : (priceMap.get(symbol) ?? priceMap.get(baseAsset) ?? 0);
+
+  if (referencePrice > 0) {
+    const estimatedNotional = params.quantity * referencePrice;
+    if (!Number.isFinite(estimatedNotional) || estimatedNotional > MAX_TESTNET_ORDER_USDT) {
+      throw new ExchangeApiError(
+        `Превышен серверный лимит Testnet-ордера: $${estimatedNotional.toFixed(2)} > $${MAX_TESTNET_ORDER_USDT} USDT.`,
+        400
+      );
+    }
+    if (params.stopLoss !== undefined && params.stopLoss > 0) {
+      if (params.side === 'BUY' && params.stopLoss >= referencePrice) {
+        throw new ExchangeApiError('Для LONG/BUY ордера Stop-Loss должен быть строго ниже цены входа.', 400);
+      }
+      if (params.side === 'SELL' && params.stopLoss <= referencePrice) {
+        throw new ExchangeApiError('Для SHORT/SELL ордера Stop-Loss должен быть строго выше цены входа.', 400);
+      }
+    }
+    if (params.takeProfit !== undefined && params.takeProfit > 0) {
+      if (params.side === 'BUY' && params.takeProfit <= referencePrice) {
+        throw new ExchangeApiError('Для LONG/BUY ордера Take-Profit должен быть строго выше цены входа.', 400);
+      }
+      if (params.side === 'SELL' && params.takeProfit >= referencePrice) {
+        throw new ExchangeApiError('Для SHORT/SELL ордера Take-Profit должен быть строго ниже цены входа.', 400);
+      }
+    }
   }
 
   let apiKey = '';

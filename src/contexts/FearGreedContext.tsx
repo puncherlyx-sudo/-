@@ -1,5 +1,7 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { FearAndGreedSnapshot } from '../types/domain';
+import { CACHE_TTL, fetchWithSWR, isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 
 interface FearGreedContextValue {
   data: FearAndGreedSnapshot | null;
@@ -55,22 +57,47 @@ export const FearGreedProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [data, setData] = useState<FearAndGreedSnapshot | null>(() => readCachedFearGreed());
   const [loading, setLoading] = useState<boolean>(() => !readCachedFearGreed());
 
+  const abortRef = useRef<AbortController | null>(null);
+
   const refresh = useCallback(async (forceRefresh = false) => {
     setLoading(true);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const url = forceRefresh ? '/api/market/fear-greed?refresh=1' : '/api/market/fear-greed';
-      const res = await fetch(url, { cache: 'no-store' });
-      if (res.ok) {
-        const json = (await res.json()) as FearAndGreedSnapshot;
-        if (typeof json?.value === 'number') {
-          setData(json);
-          writeCachedFearGreed(json);
+      const json = await fetchWithSWR<FearAndGreedSnapshot>(
+        'api:market:fear-greed',
+        async (signal) => {
+          const res = await fetch(url, { cache: 'no-store', signal });
+          const parsed = await parseJsonResponse<FearAndGreedSnapshot>(res);
+          if (!parsed.ok || !parsed.data) {
+            throw new Error(parsed.errorMessage || 'Fear & Greed fetch failed');
+          }
+          return parsed.data;
+        },
+        {
+          ttlMs: CACHE_TTL.FEAR_GREED_MS,
+          forceRefresh,
+          signal: controller.signal,
+          onBackgroundUpdate: (fresh) => {
+            if (typeof fresh?.value === 'number') {
+              setData(fresh);
+              writeCachedFearGreed(fresh);
+            }
+          },
         }
+      );
+      if (!controller.signal.aborted && typeof json?.value === 'number') {
+        setData(json);
+        writeCachedFearGreed(json);
       }
     } catch {
-      // Keep prior value on transient network failure
+      // Keep prior value on transient network failure or abort
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -116,19 +143,19 @@ export const FearGreedProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   useEffect(() => {
     void refresh(false);
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
+      if (isPageVisible()) {
         void refresh(false);
       }
-    }, 5 * 60_000);
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+    }, CACHE_TTL.FEAR_GREED_MS);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
         void refresh(false);
       }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
+    });
     return () => {
       window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', handleVisibility);
+      unsubVis();
+      abortRef.current?.abort();
     };
   }, [refresh]);
 

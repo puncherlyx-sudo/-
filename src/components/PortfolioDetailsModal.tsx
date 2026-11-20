@@ -8,9 +8,10 @@ import {
   BookOpen,
   CheckCircle2,
   History,
+  Link2,
   Lock,
   PieChart as PieChartIcon,
-  RotateCcw,
+  ShieldCheck,
   Target,
   Trash2,
   TrendingDown,
@@ -240,9 +241,9 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
   onOpenPushSettings,
   onSavePortfolioTarget,
   onDeletePortfolioTarget,
-  onRemoveHolding,
+  onRemoveHolding: _onRemoveHolding,
   onClearPortfolio,
-  onResetDemo,
+  onResetDemo: _onResetDemo,
 }) => {
   const { maskValue } = usePlan();
   const [activeTab, setActiveTab] = useState<ModalTab>('breakdown');
@@ -652,10 +653,14 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                 </div>
                 <div className="min-w-0">
                   <h2 className="text-base sm:text-lg font-bold text-white truncate">
-                    Портфель и история сделок
+                    Биржевой портфель и история сделок
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5 flex flex-wrap items-center gap-1.5">
-                    <span>Позиций: {report.rows.length}</span>
+                    <span className={portfolioSource?.mode === 'exchange' ? 'text-emerald-300 font-medium' : 'text-slate-400'}>
+                      {portfolioSource?.mode === 'exchange' && portfolioSource.exchange
+                        ? `Биржа: ${portfolioSource.exchange.toUpperCase()}${portfolioSource.label ? ` (${portfolioSource.label})` : ''}`
+                        : 'Биржа не подключена · Non-custodial'}
+                    </span>
                     <span aria-hidden="true">·</span>
                     <span>Активов: {report.allocations.length}</span>
                     <span aria-hidden="true">·</span>
@@ -849,31 +854,40 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
               {activeTab === 'breakdown' ? (
                 sortedAssetBreakdown.length === 0 ? (
                   <div className="py-10 text-center space-y-3">
-                    <div className="mx-auto w-12 h-12 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-slate-400">
-                      <Wallet className="w-6 h-6" />
+                    <div className="mx-auto w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center text-emerald-400">
+                      <Link2 className="w-6 h-6" />
                     </div>
-                    <h3 className="text-sm font-semibold text-white">В портфеле пока нет активов</h3>
+                    <h3 className="text-sm font-semibold text-white">Балансы бирж не синхронизированы</h3>
                     <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
-                      Добавьте позиции в разделе Скринера или восстановите демонстрационный портфель (BTC, ETH, SOL), чтобы отслеживать дневной и общий PnL.
+                      VERNIER — strictly non-custodial терминал: мы не храним деньги пользователей. В портфеле отображаются только реальные балансы, загруженные с ваших бирж (<strong className="text-slate-200">Binance, Bybit, OKX</strong>) по зашифрованному Read-Only или Trade API-ключу.
                     </p>
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.06] text-[11px] text-emerald-200">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>Для отображения баланса достаточно Read-Only ключа без прав на вывод</span>
+                    </div>
                     <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-                      <button
-                        type="button"
-                        onClick={onResetDemo}
-                        className="min-h-[40px] px-4 rounded-xl border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/20 text-xs font-semibold text-cyan-200 inline-flex items-center gap-1.5 transition-colors"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        <span>Восстановить демо</span>
-                      </button>
+                      {onOpenExchangeIntegrations && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onOpenExchangeIntegrations();
+                          }}
+                          className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors"
+                        >
+                          <Link2 className="w-3.5 h-3.5" />
+                          <span>Подключить биржу по API</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
                           onClose();
                           onManageInScreener();
                         }}
-                        className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors"
+                        className="min-h-[40px] px-4 rounded-xl border border-white/12 bg-white/5 hover:bg-white/10 text-xs font-semibold text-slate-200 inline-flex items-center gap-1.5 transition-colors"
                       >
-                        <span>Добавить в Скринере</span>
+                        <span>Открыть Скринер</span>
                         <ArrowRight className="w-3.5 h-3.5" />
                       </button>
                     </div>
@@ -1573,7 +1587,7 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                               </div>
                             </div>
 
-                            {/* Individual lots for this asset (allows removing a specific entry) */}
+                            {/* Synced exchange lot breakdown (read-only) */}
                             {asset.lots.length > 0 && (
                               <div className="pl-5 space-y-1">
                                 {asset.lots.map((lot) => {
@@ -1584,22 +1598,12 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                                       className="flex items-center justify-between gap-2 text-[11px] text-slate-400 py-1 px-2.5 rounded-lg bg-[#0B0F17]/75"
                                     >
                                       <span className="font-mono tabular-nums truncate">
-                                        Лот: {lot.amount} {lot.baseAsset} @ ${formatPrice(lot.avgEntryPrice)}
+                                        Биржа: {lot.amount} {lot.baseAsset} @ ${formatPrice(lot.avgEntryPrice)}
                                       </span>
-                                      <div className="flex items-center gap-3 shrink-0 font-mono tabular-nums">
-                                        <span className={lotPos ? 'text-emerald-400' : 'text-rose-400'}>
-                                          {formatSignedUsd(lot.pnlUsdt)} ({lotPos ? '+' : ''}
-                                          {lot.pnlPct.toFixed(1)}%)
-                                        </span>
-                                        <button
-                                          type="button"
-                                          onClick={() => onRemoveHolding(lot.id)}
-                                          aria-label={`Удалить лот ${lot.baseAsset}`}
-                                          className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
-                                        >
-                                          <Trash2 className="w-3.5 h-3.5" />
-                                        </button>
-                                      </div>
+                                      <span className={`shrink-0 font-mono tabular-nums ${lotPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                        {formatSignedUsd(lot.pnlUsdt)} ({lotPos ? '+' : ''}
+                                        {lot.pnlPct.toFixed(1)}%)
+                                      </span>
                                     </div>
                                   );
                                 })}
@@ -1872,17 +1876,23 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
             {/* Footer */}
             <footer className="px-4 sm:px-6 py-3 border-t border-white/8 bg-[#0E1420] flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose();
-                    onManageInScreener();
-                  }}
-                  className="min-h-[38px] px-3.5 rounded-xl border border-emerald-500/35 bg-emerald-500/12 hover:bg-emerald-500/20 text-xs font-semibold text-emerald-200 inline-flex items-center gap-1.5 transition-colors"
-                >
-                  <span>Редактировать состав</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
-                </button>
+                {onOpenExchangeIntegrations && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenExchangeIntegrations();
+                    }}
+                    className="min-h-[38px] px-3.5 rounded-xl border border-emerald-500/35 bg-emerald-500/15 hover:bg-emerald-500/25 text-xs font-semibold text-emerald-200 inline-flex items-center gap-1.5 transition-colors"
+                  >
+                    <Link2 className="w-3.5 h-3.5 text-emerald-300" />
+                    <span>
+                      {portfolioSource?.mode === 'exchange' && portfolioSource.exchange
+                        ? `Биржа: ${portfolioSource.exchange.toUpperCase()} · Обновить`
+                        : 'Подключить биржу (API)'}
+                    </span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -1894,26 +1904,10 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                   <BookOpen className="w-3.5 h-3.5 text-cyan-400" />
                   <span>Дневник сделок</span>
                 </button>
-                {onOpenExchangeIntegrations && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onClose();
-                      onOpenExchangeIntegrations();
-                    }}
-                    className="min-h-[38px] px-3.5 rounded-xl border border-cyan-500/35 bg-cyan-500/10 hover:bg-cyan-500/20 text-xs font-medium text-cyan-200 inline-flex items-center gap-1.5 transition-colors"
-                  >
-                    <span>
-                      {portfolioSource?.mode === 'exchange' && portfolioSource.exchange
-                        ? `Биржа: ${portfolioSource.exchange.toUpperCase()}`
-                        : 'Синхр. с биржей'}
-                    </span>
-                  </button>
-                )}
               </div>
 
               <div className="flex items-center gap-2 ml-auto">
-                {report.rows.length > 0 ? (
+                {report.rows.length > 0 && (
                   <button
                     type="button"
                     onClick={() => {
@@ -1932,16 +1926,7 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                     }`}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    <span>{confirmClear ? 'Подтвердить очистку' : 'Очистить портфель'}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={onResetDemo}
-                    className="min-h-[38px] px-3 rounded-xl border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-xs font-medium text-cyan-200 inline-flex items-center gap-1.5 transition-colors"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Демо-портфель</span>
+                    <span>{confirmClear ? 'Подтвердить сброс' : 'Сбросить кэш баланса'}</span>
                   </button>
                 )}
               </div>

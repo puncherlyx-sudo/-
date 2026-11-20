@@ -179,7 +179,10 @@ export const TiltGuardPanel: React.FC = () => {
                 <button
                   key={m}
                   type="button"
-                  onClick={() => updateCfg({ cooldownMinutes: m })}
+                  onClick={() => {
+                    triggerHaptic(8);
+                    updateCfg({ cooldownMinutes: m });
+                  }}
                   className={`min-h-[36px] rounded-lg font-mono font-bold transition-colors ${
                     cfg.cooldownMinutes === m
                       ? 'bg-amber-400 text-slate-950'
@@ -248,11 +251,11 @@ export const TiltGuardPanel: React.FC = () => {
             type="button"
             onClick={() => {
               triggerHaptic(12);
-              setCfg(triggerManualCooldown());
+              setCfg(triggerManualCooldown(cfg.cooldownMinutes));
             }}
             className="w-full min-h-[40px] rounded-xl border border-amber-400/35 bg-amber-500/10 hover:bg-amber-500/20 text-xs font-semibold text-amber-200 inline-flex items-center justify-center gap-1.5"
           >
-            <Flame className="w-3.5 h-3.5" />
+            <Flame className="w-3.5 h-3.5 shrink-0" />
             <span>Включить паузу «Остыть» на {cfg.cooldownMinutes} мин вручную</span>
           </button>
         )}

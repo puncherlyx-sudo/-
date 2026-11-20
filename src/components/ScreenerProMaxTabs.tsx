@@ -2,6 +2,8 @@ import React, { useMemo, useState } from 'react';
 import {
   ArrowUpRight,
   Calculator,
+  Check,
+  ChevronDown,
   Grid2x2,
   Radar,
   TrendingDown,
@@ -11,6 +13,7 @@ import { usePlan } from '../contexts/PlanContext';
 import { parseLocalePositiveNumber, triggerHaptic } from '../lib/securityDlp';
 import type { MarketType, TickerOverview } from '../types/domain';
 import { pluralRu } from '../utils/htmlEntities';
+import { BottomSheet, BottomSheetItem, BottomSheetList } from './BottomSheet';
 import { PaywallGate } from './PaywallGate';
 
 function fmtPrice(val: number): string {
@@ -221,6 +224,7 @@ export const SectorHeatmapCorrelationTab: React.FC<SectorHeatmapCorrelationTabPr
 }) => {
   const { isPro } = usePlan();
   const [activeCorrSymbol, setActiveCorrSymbol] = useState<string>('SOLUSDT');
+  const [corrSheetOpen, setCorrSheetOpen] = useState<boolean>(false);
 
   const tickerByAsset = useMemo(() => {
     const map = new Map<string, TickerOverview>();
@@ -359,19 +363,58 @@ export const SectorHeatmapCorrelationTab: React.FC<SectorHeatmapCorrelationTabPr
         <div className="rounded-xl border border-white/10 bg-[var(--surface-0)] p-3.5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-xs font-semibold text-white">Матрица корреляций (24ч)</div>
-            <select
-              value={activeCorrSymbol}
-              onChange={(e) => setActiveCorrSymbol(e.target.value)}
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setCorrSheetOpen(true);
+              }}
               aria-label="Выберите пару для корреляции"
-              className="min-h-[34px] rounded-lg border border-white/12 bg-[var(--surface-1)] px-2.5 text-xs font-mono text-white"
+              className="min-h-[34px] rounded-lg border border-white/12 bg-[var(--surface-1)] hover:border-emerald-500/40 px-3 text-xs font-mono font-semibold text-white inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
             >
-              {tickers.slice(0, 20).map((t) => (
-                <option key={t.symbol} value={t.symbol}>
-                  {t.baseAsset}/USDT
-                </option>
-              ))}
-            </select>
+              <span>{correlations.symbol.replace('USDT', '')}/USDT</span>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </button>
           </div>
+
+          <BottomSheet
+            open={corrSheetOpen}
+            onClose={() => setCorrSheetOpen(false)}
+            title="Пара для матрицы корреляций"
+            subtitle="Выберите актив из топ-20 по объёму"
+          >
+            <BottomSheetList className="space-y-1.5">
+              {tickers.slice(0, 20).map((t, idx) => {
+                const selected = t.symbol === activeCorrSymbol;
+                return (
+                  <BottomSheetItem key={t.symbol} index={idx}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        setActiveCorrSymbol(t.symbol);
+                        setCorrSheetOpen(false);
+                      }}
+                      className={`w-full min-h-[44px] px-3.5 rounded-xl border flex items-center justify-between gap-3 text-xs transition-colors ${
+                        selected
+                          ? 'border-emerald-500/45 bg-emerald-500/12 text-white'
+                          : 'border-white/8 bg-[var(--surface-0)] hover:border-white/15 text-slate-200'
+                      }`}
+                    >
+                      <span className="font-mono font-semibold">{t.baseAsset}/USDT</span>
+                      <div className="flex items-center gap-2 font-mono tabular-nums">
+                        <span className={t.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                          {t.change24hPct >= 0 ? '+' : ''}
+                          {t.change24hPct.toFixed(2)}%
+                        </span>
+                        {selected && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
+                      </div>
+                    </button>
+                  </BottomSheetItem>
+                );
+              })}
+            </BottomSheetList>
+          </BottomSheet>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             {correlations.rows.map((r) => (

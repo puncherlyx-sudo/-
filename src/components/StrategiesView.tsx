@@ -1,5 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
+  AlertTriangle,
   ArrowUpRight,
   BellRing,
   BookOpen,
@@ -7,21 +9,35 @@ import {
   Check,
   CheckCircle2,
   CircleOff,
+  Clock,
+  Copy,
   Crown,
+  Download,
   Gauge,
+  Info,
+  KeyRound,
   Layers,
+  LineChart,
+  Link2,
   Lock,
+  PauseCircle,
   Plus,
   Radar,
+  Radio,
   RefreshCw,
+  Send,
   ShieldCheck,
   Sliders,
   Sparkles,
   Trash2,
   TrendingUp,
   Webhook,
+  Wifi,
+  X,
+  Zap,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
+import { usePlan } from '../contexts/PlanContext';
 import {
   FREE_DAILY_SIGNAL_LIMIT,
   FREE_MAX_LEVERAGE,
@@ -46,14 +62,28 @@ import {
   isProSubscriptionExpired,
 } from '../data/strategies';
 import { authFetch } from '../lib/authFetch';
+import { downloadCsvWithBom } from '../lib/csvExport';
+import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
+import {
+  classifyExchangeSyncError,
+  type ExchangeSyncErrorLogEntry,
+} from '../lib/exchangeSyncErrorLog';
 import { triggerHaptic } from '../lib/securityDlp';
+import { runLocalLiveScanner } from '../lib/localAnalyticsEngine';
+import { useLiveMarketSnapshot, useLiveTicker } from '../stores/liveMarketStore';
+import { isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import type {
   AnalysisRecord,
+  ExchangeKeyRecord,
+  ExchangeOrderResult,
+  LiveScannerOpportunity,
   LiveScannerReport,
   MarketType,
   PlanTier,
   StrategyBreakdownResult,
   StrategyConfig,
+  StrategyLiveTelemetry,
   StrategyPerformanceReport,
   UserProfile,
 } from '../types/domain';
@@ -63,18 +93,164 @@ import {
   VERNIER_PRO_MAX_EVENT,
   type CustomNoCodeStrategy,
 } from '../lib/proMaxStore';
+import {
+  buildStrategySignalOverlay,
+  calculateSignalProgress,
+  ENGINE_STATE_META,
+  executeLiveStrategyOrder,
+  prepareLiveExecutionIntent,
+  readLiveExecutionPrefs,
+  resolveStrategyStatusBadge,
+  runPaperSimulationStep,
+  saveLiveExecutionPrefs,
+  strategyEventStream,
+  strategyStateMachine,
+  verifyLiveExchangeConnection,
+  type ActiveStrategySignalOverlay,
+  type StrategyEngineState,
+  type StrategyOperatingMode,
+  type StrategySignalEvent,
+  type StrategyStreamStatus,
+} from '../lib/strategyEngine';
 import { AdvancedMarketSentiment } from './AdvancedMarketSentiment';
+import { ExchangeApiGuideModal } from './ExchangeApiGuide';
 import { FeatureGuide } from './FeatureGuide';
-import { MonteCarloSimulator } from './MonteCarloSimulator';
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { PositionSizeCalculator } from './PositionSizeCalculator';
 import { StrategyPnlChart } from './StrategyPnlChart';
-import { NoCodeStrategyBuilderModal, StrategyComparisonPanel } from './StrategyProMaxTools';
-import { TradeJournal } from './TradeJournal';
+import { StrategyComparisonPanel } from './StrategyProMaxTools';
 import { NonCustodialRiskNotice } from './TradeRiskConfirmModal';
-import { WebhookBuilderModal } from './WebhookBuilderModal';
 
-export type StrategiesSection = 'catalog' | 'scanner' | 'sentiment' | 'analytics' | 'calculator' | 'journal' | 'plans';
+const MonteCarloSimulator = lazy(() =>
+  import('./MonteCarloSimulator').then((m) => ({ default: m.MonteCarloSimulator }))
+);
+const TradeJournal = lazy(() =>
+  import('./TradeJournal').then((m) => ({ default: m.TradeJournal }))
+);
+const NoCodeStrategyBuilderModal = lazy(() =>
+  import('./StrategyProMaxTools').then((m) => ({ default: m.NoCodeStrategyBuilderModal }))
+);
+const WebhookBuilderModal = lazy(() =>
+  import('./WebhookBuilderModal').then((m) => ({ default: m.WebhookBuilderModal }))
+);
+
+export type StrategiesSection =
+  | 'catalog'
+  | 'signals'
+  | 'scanner'
+  | 'sentiment'
+  | 'analytics'
+  | 'calculator'
+  | 'journal'
+  | 'plans';
+type StrategyExecutionMode = 'signals' | 'api_confirm';
+const EXEC_MODE_STORAGE_KEY = 'vernier_strategy_exec_mode_v1';
+const PLACED_ORDERS_STORAGE_KEY = 'vernier_strategy_placed_orders_v1';
+
+interface PlacedStrategyOrderRecord {
+  strategyKey: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  exchange: string;
+  orderId: string;
+  placedAt: string;
+}
+
+type ExchangeConnectionHealth = 'synced' | 'active' | 'paused' | 'reauth';
+
+interface ExchangeConnectionMeta {
+  health: ExchangeConnectionHealth;
+  labelRu: string;
+  detailRu: string;
+  syncedAt?: string;
+  balanceUsdt?: number;
+}
+
+function resolveExchangeConnectionStatus(
+  key: ExchangeKeyRecord,
+  syncCache?: ExchangeSyncCacheMap,
+  errorLogs: ExchangeSyncErrorLogEntry[] = []
+): ExchangeConnectionMeta {
+  const cached = syncCache?.[key.id];
+  const latestSyncIso = cached?.syncedAt || key.lastSyncedAt || '';
+  const latestSyncMs = latestSyncIso ? Date.parse(latestSyncIso) : 0;
+
+  // Проверяем последнюю запись лога по этому ключу
+  const latestKeyLog = errorLogs.find((entry) => entry.keyId === key.id);
+  const hasNewerAuthOrCriticalError = Boolean(
+    latestKeyLog &&
+      latestKeyLog.severity !== 'success' &&
+      (latestKeyLog.category === 'auth' || latestKeyLog.severity === 'critical') &&
+      (!Number.isFinite(latestSyncMs) || latestKeyLog.occurredAtMs >= latestSyncMs)
+  );
+  const inlineErrorCategory = key.lastSyncError ? classifyExchangeSyncError(key.lastSyncError) : null;
+
+  if (inlineErrorCategory === 'auth' || hasNewerAuthOrCriticalError) {
+    return {
+      health: 'reauth',
+      labelRu: 'Переавторизация',
+      detailRu:
+        latestKeyLog?.errorMessage ||
+        key.lastSyncError ||
+        'Ключ или подпись отклонены биржей — обновите API-ключ',
+      syncedAt: latestSyncIso || undefined,
+      balanceUsdt: cached?.totalBalanceUsdt ?? key.lastBalanceUsdt,
+    };
+  }
+
+  if (!key.enabled) {
+    return {
+      health: 'paused',
+      labelRu: 'На паузе',
+      detailRu: 'Ключ временно отключён пользователем',
+      syncedAt: latestSyncIso || undefined,
+      balanceUsdt: cached?.totalBalanceUsdt ?? key.lastBalanceUsdt,
+    };
+  }
+
+  if (latestSyncIso) {
+    const syncTimeText = Number.isFinite(latestSyncMs)
+      ? new Date(latestSyncMs).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+      : '';
+    return {
+      health: 'synced',
+      labelRu: 'Синхронизирован',
+      detailRu: syncTimeText ? `Синхр. в ${syncTimeText}` : 'Баланс синхронизирован',
+      syncedAt: latestSyncIso,
+      balanceUsdt: cached?.totalBalanceUsdt ?? key.lastBalanceUsdt,
+    };
+  }
+
+  return {
+    health: 'active',
+    labelRu: 'Активен',
+    detailRu: 'Подключён · ожидает первой синхронизации',
+    balanceUsdt: key.lastBalanceUsdt,
+  };
+}
+
+function readStoredPlacedOrders(): Record<string, PlacedStrategyOrderRecord> {
+  try {
+    const raw = window.localStorage.getItem(PLACED_ORDERS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, PlacedStrategyOrderRecord>;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return {};
+}
+
+function readStoredExecMode(): StrategyExecutionMode {
+  try {
+    const raw = window.localStorage.getItem(EXEC_MODE_STORAGE_KEY);
+    return raw === 'api_confirm' ? 'api_confirm' : 'signals';
+  } catch {
+    return 'signals';
+  }
+}
 
 interface StrategiesViewProps {
   profile: UserProfile | null;
@@ -85,11 +261,19 @@ interface StrategiesViewProps {
   privacyMode?: boolean;
   pushSubscribed?: boolean;
   portfolioBalanceUsdt?: number;
+  exchangeKeys?: ExchangeKeyRecord[];
+  exchangeSyncCache?: ExchangeSyncCacheMap;
+  exchangeSyncErrorLogs?: ExchangeSyncErrorLogEntry[];
   onOpenPushSettings?: () => void;
+  onOpenExchangeIntegrations?: () => void;
   onRequireLogin: () => void;
   onSwitchPlan: (target: PlanTier, maxMultiplier?: 10 | 20) => Promise<void> | void;
   onConsumeCredits?: (amount: number, auditReason?: string) => Promise<boolean>;
-  onOpenPairOnMarket?: (symbol: string, marketType: MarketType) => void;
+  onOpenPairOnMarket?: (
+    symbol: string,
+    marketType: MarketType,
+    signalOverlay?: ActiveStrategySignalOverlay | null
+  ) => void;
   onSaveStrategy: (
     strategyId: string,
     updates: {
@@ -101,6 +285,27 @@ interface StrategiesViewProps {
       pairs: string[];
     }
   ) => Promise<void>;
+  onPlaceExchangeOrder?: (
+    key: ExchangeKeyRecord,
+    orderParams: {
+      symbol: string;
+      marketType: MarketType;
+      side: 'BUY' | 'SELL';
+      orderType: 'MARKET' | 'LIMIT';
+      quantity: number;
+      limitPrice?: number;
+      stopLoss?: number;
+      takeProfit?: number;
+    }
+  ) => Promise<ExchangeOrderResult>;
+  onSignalEmitted?: (params: {
+    symbol: string;
+    marketType: MarketType;
+    direction: 'LONG' | 'SHORT' | 'WAIT';
+    confidence: number;
+    strategyName: string;
+    entryZone: string;
+  }) => Promise<void>;
   externalSection?: { section: StrategiesSection; nonce: number } | null;
 }
 
@@ -112,6 +317,1090 @@ function formatScannerPrice(value: number): string {
   return `$${value.toFixed(5)}`;
 }
 
+/**
+ * Живая панель активной стратегии с конечным автоматом (Idle / Monitoring / Execution):
+ * - Чёткий статус-бейдж состояния автомата и режима (Paper / Live API);
+ * - Изолированная подписка на тикер ведущей пары из liveMarketStore (60 FPS);
+ * - Живой трек прогресса SL -> Вход -> TP1 -> TP2 при сработавшем сигнале;
+ * - Кнопка «График сигнала (SL / Вход / TP)» доступна на каждой активной стратегии.
+ */
+const ActiveStrategyLiveProgress = React.memo(
+  ({
+    strategyKey,
+    strategyName,
+    leadSymbol,
+    pairsCount,
+    marketType,
+    minConfidence,
+    riskPerTradePct,
+    isMaxStrategy,
+    operatingMode,
+    engineState,
+    verifiedLive,
+    telemetry,
+    emittedSignal,
+    placedOrder,
+    isScanning,
+    hasTradeApiKey,
+    onOpenPairOnMarket,
+    onExecuteSignalViaApi,
+    onClearPlacedOrder,
+  }: {
+    strategyKey: string;
+    strategyName: string;
+    leadSymbol: string;
+    pairsCount: number;
+    marketType: MarketType;
+    minConfidence: number;
+    riskPerTradePct: number;
+    isMaxStrategy: boolean;
+    operatingMode: StrategyOperatingMode;
+    engineState: StrategyEngineState;
+    verifiedLive: boolean;
+    telemetry?: StrategyLiveTelemetry;
+    emittedSignal?: LiveScannerOpportunity;
+    placedOrder?: PlacedStrategyOrderRecord;
+    isScanning: boolean;
+    hasTradeApiKey: boolean;
+    onOpenPairOnMarket?: (
+      symbol: string,
+      marketType: MarketType,
+      signalOverlay?: ActiveStrategySignalOverlay | null
+    ) => void;
+    onExecuteSignalViaApi?: (opp: LiveScannerOpportunity) => void;
+    onClearPlacedOrder?: () => void;
+  }) => {
+    const watchSymbol = placedOrder?.symbol || emittedSignal?.symbol || telemetry?.bestSymbol || leadSymbol;
+    const ticker = useLiveTicker(watchSymbol, marketType);
+    const livePrice = ticker?.price ?? emittedSignal?.entryPrice ?? 0;
+
+    const statusBadge = useMemo(
+      () =>
+        resolveStrategyStatusBadge({
+          engineState,
+          hasPlacedOrder: Boolean(placedOrder),
+          hasEmittedSignal: Boolean(emittedSignal),
+        }),
+      [engineState, placedOrder, emittedSignal]
+    );
+
+    const signalOverlay = useMemo(
+      () =>
+        buildStrategySignalOverlay({
+          strategyKey,
+          strategyName,
+          symbol: watchSymbol,
+          marketType,
+          mode: operatingMode,
+          emittedSignal,
+          telemetry,
+          livePrice,
+          riskPerTradePct,
+          hasPlacedOrder: Boolean(placedOrder),
+        }),
+      [
+        strategyKey,
+        strategyName,
+        watchSymbol,
+        marketType,
+        operatingMode,
+        emittedSignal,
+        telemetry,
+        livePrice,
+        riskPerTradePct,
+        placedOrder,
+      ]
+    );
+
+    const signalProgress = useMemo(
+      () => calculateSignalProgress(signalOverlay, livePrice || signalOverlay.entryPrice),
+      [signalOverlay, livePrice]
+    );
+
+    const readyPct = emittedSignal
+      ? 100
+      : typeof telemetry?.readinessPct === 'number'
+        ? telemetry.readinessPct
+        : isScanning
+          ? 28
+          : 20;
+
+    const reasonText = placedOrder
+      ? `Ордер ${placedOrder.direction} ${placedOrder.symbol} размещён на ${placedOrder.exchange.toUpperCase()} (${new Date(placedOrder.placedAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}) · ID ${placedOrder.orderId}`
+      : emittedSignal
+        ? `Сигнал ${emittedSignal.direction} (${emittedSignal.confidence}%) по ${emittedSignal.symbol.replace('USDT', '/USDT')} · R:R 1:${emittedSignal.riskRewardRatio}`
+        : telemetry?.reasonRu || 'Ожидание закрытия свечи 1H и совпадения индикаторов';
+
+    const priceLabel =
+      ticker && ticker.price > 0
+        ? formatScannerPrice(ticker.price)
+        : emittedSignal
+          ? formatScannerPrice(emittedSignal.entryPrice)
+          : '—';
+    const changePct = ticker ? ticker.change24hPct : emittedSignal ? emittedSignal.change24hPct : null;
+
+    return (
+      <div
+        className={`mt-2.5 rounded-xl border p-2.5 space-y-2 ${
+          placedOrder
+            ? 'border-emerald-400/50 bg-emerald-500/[0.10]'
+            : emittedSignal
+              ? emittedSignal.direction === 'LONG'
+                ? 'border-emerald-400/45 bg-emerald-500/[0.08]'
+                : 'border-rose-400/45 bg-rose-500/[0.08]'
+              : isMaxStrategy
+                ? 'border-cyan-400/30 bg-cyan-500/[0.06]'
+                : 'border-emerald-500/25 bg-emerald-500/[0.05]'
+        }`}
+      >
+        {/* Строка 1: Динамический статус-бейдж (Idle / Monitoring Signal / Order Placed (Live)) + пара и цена */}
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+            {statusBadge.code === 'Order Placed (Live)' ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-emerald-400/55 bg-emerald-500/20 text-emerald-200 font-semibold text-[10px] shrink-0">
+                <CheckCircle2 className="w-3 h-3 text-emerald-300 shrink-0" />
+                <span>Order Placed (Live)</span>
+              </span>
+            ) : statusBadge.code === 'Idle' ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-white/10 bg-white/5 text-slate-400 font-semibold text-[10px] shrink-0">
+                <PauseCircle className="w-3 h-3 text-slate-500 shrink-0" />
+                <span>Idle</span>
+              </span>
+            ) : (
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-semibold text-[10px] shrink-0 ${
+                  statusBadge.hasSignalReady
+                    ? 'border-emerald-400/45 bg-emerald-500/18 text-emerald-200'
+                    : 'border-cyan-400/40 bg-cyan-500/15 text-cyan-200'
+                }`}
+              >
+                <span className="live-dot shrink-0" aria-hidden="true" />
+                <span>Monitoring Signal</span>
+              </span>
+            )}
+
+            {verifiedLive && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-emerald-400/45 bg-emerald-500/15 text-emerald-200 font-mono text-[9.5px] font-bold shrink-0">
+                <ShieldCheck className="w-3 h-3 text-emerald-300 shrink-0" />
+                <span>Verified Live</span>
+              </span>
+            )}
+
+            {emittedSignal && !placedOrder && (
+              <span
+                className={`px-1.5 py-0.5 rounded-md border font-mono text-[10px] font-bold shrink-0 ${
+                  emittedSignal.direction === 'LONG'
+                    ? 'border-emerald-400/45 bg-emerald-500/20 text-emerald-200'
+                    : 'border-rose-400/45 bg-rose-500/20 text-rose-200'
+                }`}
+              >
+                {emittedSignal.direction} · {emittedSignal.confidence}%
+              </span>
+            )}
+
+            <span className="inline-flex items-center gap-1 font-mono font-semibold text-white truncate">
+              <Activity className="w-3 h-3 text-slate-400 shrink-0" />
+              <span className="truncate">{watchSymbol.replace('USDT', '')}/USDT</span>
+              {pairsCount > 1 && (
+                <span className="text-[10px] text-slate-400">+{pairsCount - 1}</span>
+              )}
+            </span>
+          </div>
+
+          <span className="font-mono tabular-nums text-[11px] flex items-center gap-1.5 shrink-0">
+            <span className="text-slate-100 font-semibold">{priceLabel}</span>
+            {changePct !== null && (
+              <span className={changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                {changePct >= 0 ? '+' : ''}
+                {changePct.toFixed(2)}%
+              </span>
+            )}
+          </span>
+        </div>
+
+        {/* Строка 2: Телеметрия движка */}
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[10px]">
+          <span className="text-slate-400 leading-snug min-w-0 flex-1">{reasonText}</span>
+          <div className="flex items-center gap-1.5 shrink-0 font-mono tabular-nums">
+            <span className="px-1.5 py-0.5 rounded border border-white/10 bg-[#070B12]/80 text-slate-400">
+              {operatingMode === 'live' ? 'Live API' : 'Paper'}
+            </span>
+            {!placedOrder && (
+              <span className="px-1.5 py-0.5 rounded border border-white/10 bg-[#070B12]/80 text-slate-300">
+                Порог {minConfidence}% · <strong className="text-white">{readyPct}%</strong>
+              </span>
+            )}
+            {placedOrder && onClearPlacedOrder && (
+              <button
+                type="button"
+                onClick={onClearPlacedOrder}
+                className="font-sans text-[10px] text-slate-400 hover:text-white underline underline-offset-2"
+              >
+                Сбросить
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Живой трек прогресса сигнала (SL -> Вход -> TP1 -> TP2) + 4 уровня */}
+        {emittedSignal ? (
+          <div className="pt-1.5 border-t border-white/10 space-y-2">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2 text-[10px] font-mono tabular-nums">
+                <span className="font-sans text-slate-300 font-medium truncate">
+                  {signalProgress.phaseLabelRu}
+                </span>
+                <span
+                  className={`font-bold shrink-0 ${
+                    signalProgress.pnlFromEntryPct >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                  }`}
+                >
+                  {signalProgress.pnlFromEntryPct >= 0 ? '+' : ''}
+                  {signalProgress.pnlFromEntryPct.toFixed(2)}% от входа
+                </span>
+              </div>
+              <div className="relative h-2 rounded-full bg-[#070B12] border border-white/10 overflow-visible">
+                <div
+                  className="absolute inset-y-0 left-0 rounded-l-full bg-rose-500/25"
+                  style={{ width: `${signalProgress.entryMarkerPct}%` }}
+                />
+                <div
+                  className="absolute inset-y-0 right-0 rounded-r-full bg-emerald-500/25"
+                  style={{ left: `${signalProgress.entryMarkerPct}%` }}
+                />
+                <span
+                  aria-hidden="true"
+                  className="absolute -top-0.5 -bottom-0.5 w-[1.5px] bg-sky-300"
+                  style={{ left: `${signalProgress.entryMarkerPct}%` }}
+                />
+                <span
+                  aria-hidden="true"
+                  className="absolute top-0 bottom-0 w-[1.5px] bg-emerald-300/80"
+                  style={{ left: `${signalProgress.tp1MarkerPct}%` }}
+                />
+                <span
+                  aria-hidden="true"
+                  className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-2.5 h-2.5 rounded-full border border-white shadow-sm ${
+                    signalProgress.pnlFromEntryPct >= 0 ? 'bg-emerald-400' : 'bg-rose-400'
+                  }`}
+                  style={{ left: `${signalProgress.trackPct}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[9px] font-mono text-slate-500">
+                <span className="text-rose-400">SL</span>
+                <span className="text-sky-300">Вход</span>
+                <span className="text-emerald-300">TP1</span>
+                <span className="text-emerald-400">TP2</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px] font-mono tabular-nums">
+              <div className="rounded-lg bg-[#070B12]/90 px-2 py-1">
+                <div className="font-sans text-[9px] text-rose-400">Stop-Loss</div>
+                <div className="text-rose-300 font-semibold truncate">
+                  {formatScannerPrice(signalOverlay.stopLossPrice)}
+                </div>
+              </div>
+              <div className="rounded-lg bg-[#070B12]/90 px-2 py-1">
+                <div className="font-sans text-[9px] text-sky-400">Вход</div>
+                <div className="text-white font-semibold truncate">
+                  {formatScannerPrice(signalOverlay.entryPrice)}
+                </div>
+              </div>
+              <div className="rounded-lg bg-[#070B12]/90 px-2 py-1">
+                <div className="font-sans text-[9px] text-emerald-300">TP1</div>
+                <div className="text-emerald-300 font-semibold truncate">
+                  {formatScannerPrice(signalOverlay.tp1Price)}
+                </div>
+              </div>
+              <div className="rounded-lg bg-[#070B12]/90 px-2 py-1">
+                <div className="font-sans text-[9px] text-emerald-400">TP2</div>
+                <div className="text-emerald-400 font-semibold truncate">
+                  {formatScannerPrice(signalOverlay.takeProfitPrice)}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Кнопки действий активной стратегии: вход в график с SL / Входом / TP доступен всегда */}
+        <div className="pt-1 border-t border-white/8 flex flex-wrap items-center gap-1.5">
+          {onOpenPairOnMarket && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                onOpenPairOnMarket(signalOverlay.symbol, signalOverlay.marketType, signalOverlay);
+              }}
+              className="flex-1 min-h-[30px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/22 text-[11px] font-semibold text-cyan-100 inline-flex items-center justify-center gap-1.5 transition-colors"
+            >
+              <LineChart className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+              <span>
+                {emittedSignal ? 'График сигнала (SL/Вход/TP)' : 'Открыть график (SL/Вход/TP)'}
+              </span>
+              <ArrowUpRight className="w-3 h-3 shrink-0" />
+            </button>
+          )}
+          {emittedSignal && onExecuteSignalViaApi && (
+            <button
+              type="button"
+              onClick={() => onExecuteSignalViaApi(emittedSignal)}
+              className={`min-h-[30px] px-2.5 rounded-lg text-[11px] font-semibold inline-flex items-center justify-center gap-1 transition-colors shrink-0 ${
+                hasTradeApiKey
+                  ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                  : 'border border-amber-400/40 bg-amber-500/15 hover:bg-amber-500/25 text-amber-200'
+              }`}
+            >
+              <Send className="w-3 h-3" />
+              <span>{hasTradeApiKey ? 'Через API' : 'Подкл. API'}</span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+);
+ActiveStrategyLiveProgress.displayName = 'ActiveStrategyLiveProgress';
+
+/**
+ * Карточка одного сигнала в потоке LiveSignalFeed:
+ * Подписывается на тикер пары (60 FPS) и отображает живой прогресс SL -> Вход -> TP1 -> TP2.
+ */
+const LiveSignalFeedRow = React.memo(
+  ({
+    event,
+    isBusy,
+    isPushDone,
+    isOrderPlaced,
+    pushSubscribed,
+    hasTradeApiKey,
+    onOpenChart,
+    onSendPush,
+    onExecuteApi,
+  }: {
+    event: StrategySignalEvent;
+    isBusy: boolean;
+    isPushDone: boolean;
+    isOrderPlaced: boolean;
+    pushSubscribed: boolean;
+    hasTradeApiKey: boolean;
+    onOpenChart?: (overlay: ActiveStrategySignalOverlay) => void;
+    onSendPush: (opp: LiveScannerOpportunity) => void;
+    onExecuteApi: (opp: LiveScannerOpportunity) => void;
+  }) => {
+    const ticker = useLiveTicker(event.symbol, event.marketType);
+    const livePrice = ticker?.price ?? event.entryPrice;
+    const [copied, setCopied] = useState(false);
+
+    const handleCopySignal = async () => {
+      const pair = `${event.symbol.replace('USDT', '')}/USDT`;
+      const text = [
+        `VERNIER · ${pair} (${event.marketType === 'futures' ? 'Futures' : 'Spot'}) · ${event.direction}`,
+        `Стратегия: ${event.strategyName} (${event.confidence}%)`,
+        `Вход: ${formatScannerPrice(event.entryPrice)} (${formatScannerPrice(event.entryZoneLow)}–${formatScannerPrice(event.entryZoneHigh)})`,
+        `Stop-Loss: ${formatScannerPrice(event.stopLossPrice)}`,
+        `TP1: ${formatScannerPrice(event.tp1Price)} · TP2: ${formatScannerPrice(event.takeProfitPrice)} (R:R 1:${event.riskRewardRatio})`,
+      ].join('\n');
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+        }
+        triggerHaptic(8);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1800);
+      } catch {
+        // ignore clipboard denial
+      }
+    };
+
+    const overlay: ActiveStrategySignalOverlay = useMemo(
+      () => ({
+        strategyKey: event.strategyKey,
+        strategyName: event.strategyName,
+        symbol: event.symbol,
+        marketType: event.marketType,
+        direction: event.direction,
+        confidence: event.confidence,
+        entryPrice: event.entryPrice,
+        stopLossPrice: event.stopLossPrice,
+        tp1Price: event.tp1Price,
+        takeProfitPrice: event.takeProfitPrice,
+        riskRewardRatio: event.riskRewardRatio,
+        engineState: 'Execution',
+        mode: event.mode,
+        emittedAt: event.emittedAt,
+        isProjected: false,
+      }),
+      [event]
+    );
+
+    const progress = useMemo(
+      () => calculateSignalProgress(overlay, livePrice),
+      [overlay, livePrice]
+    );
+
+    const tsFormatted = new Date(event.emittedAt).toLocaleString('ru-RU', {
+      day: '2-digit',
+      month: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+    return (
+      <article
+        className={`rounded-xl border bg-[#0B0F17] p-3.5 space-y-3 ${
+          event.direction === 'LONG' ? 'border-emerald-500/35' : 'border-rose-500/35'
+        }`}
+      >
+        {/* Заголовок события + номер потока и время */}
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-mono text-[10px] text-slate-500">#{event.seq}</span>
+              <span className="font-mono text-sm font-bold text-white">
+                {event.symbol.replace('USDT', '')}/USDT
+              </span>
+              <span
+                className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-bold border ${
+                  event.direction === 'LONG'
+                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                    : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                }`}
+              >
+                {event.direction}
+              </span>
+              <span className="px-1.5 py-0.5 rounded bg-white/8 text-[10px] font-mono text-slate-300">
+                {event.marketType === 'futures' ? 'Futures' : 'Spot'}
+              </span>
+              <span className="px-1.5 py-0.5 rounded border border-white/10 bg-white/[0.04] text-[10px] font-mono text-slate-300">
+                {event.mode === 'live' ? 'Live API' : 'Paper'}
+              </span>
+              {(isOrderPlaced || event.orderId) && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-emerald-400/45 bg-emerald-500/20 text-[10px] font-semibold text-emerald-200">
+                  <CheckCircle2 className="w-3 h-3 shrink-0" />
+                  <span>Ордер отправлен</span>
+                </span>
+              )}
+            </div>
+            <div className="text-xs text-slate-300 font-medium">{event.strategyName}</div>
+          </div>
+
+          <div className="text-right shrink-0 space-y-0.5">
+            <div className="font-mono text-sm font-bold text-cyan-300">
+              {event.confidence}% увер.
+            </div>
+            <div className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-400">
+              <Clock className="w-3 h-3 shrink-0" />
+              <span>{tsFormatted}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Живой трек прогресса сигнала (SL -> Вход -> TP1 -> TP2) */}
+        <div className="rounded-lg border border-white/8 bg-[#070B12]/90 p-2.5 space-y-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <span className="text-slate-200 font-medium">{progress.phaseLabelRu}</span>
+            <span className="font-mono tabular-nums flex items-center gap-2">
+              <span className="text-slate-400">
+                Сейчас: <strong className="text-white">{formatScannerPrice(livePrice)}</strong>
+              </span>
+              <span
+                className={`font-bold ${
+                  progress.pnlFromEntryPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                }`}
+              >
+                {progress.pnlFromEntryPct >= 0 ? '+' : ''}
+                {progress.pnlFromEntryPct.toFixed(2)}%
+              </span>
+            </span>
+          </div>
+          <div className="relative h-2 rounded-full bg-white/[0.06] border border-white/10 overflow-visible">
+            <div
+              className="absolute inset-y-0 left-0 rounded-l-full bg-rose-500/25"
+              style={{ width: `${progress.entryMarkerPct}%` }}
+            />
+            <div
+              className="absolute inset-y-0 right-0 rounded-r-full bg-emerald-500/25"
+              style={{ left: `${progress.entryMarkerPct}%` }}
+            />
+            <span
+              aria-hidden="true"
+              className="absolute -top-0.5 -bottom-0.5 w-[2px] bg-sky-300"
+              style={{ left: `${progress.entryMarkerPct}%` }}
+            />
+            <span
+              aria-hidden="true"
+              className="absolute top-0 bottom-0 w-[1.5px] bg-emerald-300/80"
+              style={{ left: `${progress.tp1MarkerPct}%` }}
+            />
+            <span
+              aria-hidden="true"
+              className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full border-2 border-white shadow ${
+                progress.pnlFromEntryPct >= 0 ? 'bg-emerald-400' : 'bg-rose-400'
+              }`}
+              style={{ left: `${progress.trackPct}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-[9px] font-mono text-slate-500">
+            <span className="text-rose-400">SL ({formatScannerPrice(event.stopLossPrice)})</span>
+            <span className="text-sky-300">Вход</span>
+            <span className="text-emerald-300">TP1</span>
+            <span className="text-emerald-400">TP2 ({formatScannerPrice(event.takeProfitPrice)})</span>
+          </div>
+        </div>
+
+        {/* Целевые ценовые зоны (Зона входа / SL / TP1 / TP2) */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] font-mono tabular-nums">
+          <div className="rounded-lg border border-white/8 bg-white/[0.03] px-2.5 py-1.5">
+            <div className="font-sans text-[10px] text-slate-500">Зона входа</div>
+            <div className="text-white font-semibold text-[10.5px] leading-snug mt-0.5">
+              {formatScannerPrice(event.entryZoneLow)} – {formatScannerPrice(event.entryZoneHigh)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-rose-500/20 bg-rose-500/[0.04] px-2.5 py-1.5">
+            <div className="font-sans text-[10px] text-slate-500">Stop-Loss</div>
+            <div className="text-rose-400 font-semibold mt-0.5">
+              {formatScannerPrice(event.stopLossPrice)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.04] px-2.5 py-1.5">
+            <div className="font-sans text-[10px] text-slate-500">Цель TP1 (50%)</div>
+            <div className="text-emerald-300 font-semibold mt-0.5">
+              {formatScannerPrice(event.tp1Price)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.08] px-2.5 py-1.5">
+            <div className="font-sans text-[10px] text-slate-500">
+              Цель TP2 · R:R 1:{event.riskRewardRatio}
+            </div>
+            <div className="text-emerald-400 font-bold mt-0.5">
+              {formatScannerPrice(event.takeProfitPrice)}
+            </div>
+          </div>
+        </div>
+
+        {/* Что «думает» движок */}
+        <div className="rounded-lg border border-white/6 bg-white/[0.02] px-2.5 py-2 text-[11px] text-slate-300 space-y-1">
+          <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-slate-400">
+            <span>
+              RSI(14): <strong className="text-slate-200">{event.rsi14}</strong>
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              Тренд:{' '}
+              <strong
+                className={
+                  event.trendBias === 'BULLISH'
+                    ? 'text-emerald-300'
+                    : event.trendBias === 'BEARISH'
+                      ? 'text-rose-300'
+                      : 'text-amber-300'
+                }
+              >
+                {event.trendBias}
+              </strong>
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              24ч:{' '}
+              <strong className={event.change24hPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                {event.change24hPct >= 0 ? '+' : ''}
+                {event.change24hPct.toFixed(2)}%
+              </strong>
+            </span>
+          </div>
+          {event.summary && <p className="text-slate-300 leading-relaxed">{event.summary}</p>}
+        </div>
+
+        {/* Действия по сигналу */}
+        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+          {onOpenChart && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                onOpenChart(overlay);
+              }}
+              className="min-h-[32px] px-3 rounded-lg border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/22 text-xs font-semibold text-cyan-100 inline-flex items-center gap-1.5 transition-colors"
+            >
+              <LineChart className="w-3.5 h-3.5 text-cyan-300" />
+              <span>График сигнала</span>
+              <ArrowUpRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void handleCopySignal()}
+            className={`min-h-[32px] px-2.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1 transition-colors ${
+              copied
+                ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-200'
+                : 'border-white/12 bg-white/5 hover:bg-white/10 text-slate-200'
+            }`}
+          >
+            {copied ? (
+              <Check className="w-3.5 h-3.5 text-emerald-300" />
+            ) : (
+              <Copy className="w-3.5 h-3.5 text-slate-300" />
+            )}
+            <span>{copied ? 'Скопировано' : 'Копировать'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onSendPush(event.opportunity)}
+            className="min-h-[32px] px-3 rounded-lg border border-white/12 bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 inline-flex items-center gap-1 transition-colors"
+          >
+            <BellRing className="w-3.5 h-3.5 text-cyan-300" />
+            <span>{isPushDone ? 'Отправлено' : pushSubscribed ? 'В Push' : 'Вкл. Push'}</span>
+          </button>
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={() => onExecuteApi(event.opportunity)}
+            className={`ml-auto min-h-[32px] px-3 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-colors ${
+              hasTradeApiKey
+                ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                : 'border border-amber-400/40 bg-amber-500/15 hover:bg-amber-500/25 text-amber-200'
+            }`}
+          >
+            <Send className="w-3.5 h-3.5" />
+            <span>
+              {isBusy ? 'Отправка…' : hasTradeApiKey ? 'Исполнить через API' : 'Подключить API'}
+            </span>
+          </button>
+        </div>
+      </article>
+    );
+  }
+);
+LiveSignalFeedRow.displayName = 'LiveSignalFeedRow';
+
+/**
+ * Компонент LiveSignalFeed:
+ * Подписывается на WebSocket-подобный поток событий `strategyEventStream` из `src/lib/strategyEngine.ts`
+ * и в реальном времени выводит сигналы LONG / SHORT с метками времени, зонами целей и прогрессом.
+ */
+const LiveSignalFeed: React.FC<{
+  activeCount: number;
+  analyses: AnalysisRecord[];
+  operatingMode: StrategyOperatingMode;
+  verifiedLive: boolean;
+  verifiedExchangeLabel?: string | null;
+  monitorLoading: boolean;
+  apiOrderBusyKey: string | null;
+  pushSentKeys: Record<string, boolean>;
+  placedOrdersByStrategy: Record<string, PlacedStrategyOrderRecord>;
+  pushSubscribed: boolean;
+  hasTradeApiKey: boolean;
+  exchangeStrip: React.ReactNode;
+  onRefreshStream: () => void;
+  onOpenModeInfo: () => void;
+  onOpenApiGuide?: () => void;
+  onGoToCatalog: () => void;
+  onOpenPairOnMarket?: (
+    symbol: string,
+    marketType: MarketType,
+    signalOverlay?: ActiveStrategySignalOverlay | null
+  ) => void;
+  onSendSignalPush: (opp: LiveScannerOpportunity) => void;
+  onExecuteSignalViaApi: (opp: LiveScannerOpportunity) => void;
+}> = ({
+  activeCount,
+  analyses,
+  operatingMode,
+  verifiedLive,
+  verifiedExchangeLabel,
+  monitorLoading,
+  apiOrderBusyKey,
+  pushSentKeys,
+  placedOrdersByStrategy,
+  pushSubscribed,
+  hasTradeApiKey,
+  exchangeStrip,
+  onRefreshStream,
+  onOpenModeInfo,
+  onOpenApiGuide,
+  onGoToCatalog,
+  onOpenPairOnMarket,
+  onSendSignalPush,
+  onExecuteSignalViaApi,
+}) => {
+  const [events, setEvents] = useState<StrategySignalEvent[]>(() => strategyEventStream.getEvents());
+  const [streamStatus, setStreamStatus] = useState<StrategyStreamStatus>(
+    () => strategyEventStream.getStatus().status
+  );
+  const [lastHeartbeatAt, setLastHeartbeatAt] = useState<string | null>(
+    () => strategyEventStream.getStatus().lastHeartbeatAt
+  );
+  const [directionFilter, setDirectionFilter] = useState<'all' | 'LONG' | 'SHORT'>('all');
+  const [csvDownloadedCount, setCsvDownloadedCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    return strategyEventStream.subscribe((nextEvents, nextStatus, nextHeartbeat) => {
+      setEvents(nextEvents);
+      setStreamStatus(nextStatus);
+      setLastHeartbeatAt(nextHeartbeat);
+    });
+  }, []);
+
+  const filteredEvents = useMemo(() => {
+    if (directionFilter === 'all') return events;
+    return events.filter((ev) => ev.direction === directionFilter);
+  }, [events, directionFilter]);
+
+  const historicalExportableAnalyses = useMemo(() => {
+    return analyses.filter((rec) => {
+      if (rec.direction !== 'LONG' && rec.direction !== 'SHORT') return false;
+      if (directionFilter !== 'all' && rec.direction !== directionFilter) return false;
+      return true;
+    });
+  }, [analyses, directionFilter]);
+
+  const totalExportableSignals = filteredEvents.length + historicalExportableAnalyses.length;
+
+  const handleDownloadSignalsCsv = () => {
+    if (totalExportableSignals === 0) return;
+    triggerHaptic(10);
+
+    const normalizeCreatedIso = (raw: unknown): string => {
+      if (typeof raw === 'string' && raw.trim()) return raw;
+      if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw.toISOString();
+      if (typeof raw === 'number' && Number.isFinite(raw)) return new Date(raw).toISOString();
+      if (raw && typeof raw === 'object') {
+        const obj = raw as { toDate?: () => Date; seconds?: number };
+        if (typeof obj.toDate === 'function') return obj.toDate().toISOString();
+        if (typeof obj.seconds === 'number') return new Date(obj.seconds * 1000).toISOString();
+      }
+      return new Date().toISOString();
+    };
+
+    const headers = [
+      'Timestamp (ISO)',
+      'Source',
+      'Strategy',
+      'Symbol',
+      'Market',
+      'Direction',
+      'Confidence (%)',
+      'Entry',
+      'Stop-Loss',
+      'TP1',
+      'TP2',
+      'R:R',
+      'Mode',
+      'Order ID',
+      'RSI(14)',
+      'Trend',
+      'Summary',
+    ];
+
+    const streamRows = filteredEvents.map((ev) => {
+      const placed = placedOrdersByStrategy[ev.strategyKey];
+      const orderId =
+        ev.orderId ||
+        (placed && placed.symbol === ev.symbol && placed.direction === ev.direction
+          ? placed.orderId
+          : '');
+      return [
+        ev.emittedAt,
+        'Live Stream',
+        ev.strategyName,
+        ev.symbol,
+        ev.marketType.toUpperCase(),
+        ev.direction,
+        ev.confidence,
+        ev.entryPrice,
+        ev.stopLossPrice,
+        ev.tp1Price,
+        ev.takeProfitPrice,
+        `1:${ev.riskRewardRatio}`,
+        ev.mode === 'live' ? 'Live API' : 'Paper',
+        orderId,
+        ev.rsi14,
+        ev.trendBias,
+        ev.summary || '',
+      ];
+    });
+
+    const historicalRows = historicalExportableAnalyses.map((rec) => [
+      normalizeCreatedIso(rec.createdAt),
+      'Historical Analysis',
+      rec.strategyName,
+      rec.symbol,
+      rec.marketType.toUpperCase(),
+      rec.direction,
+      rec.confidence,
+      rec.entryZone,
+      rec.stopLoss,
+      rec.takeProfits?.[0] ?? '',
+      rec.takeProfits?.[1] ?? rec.takeProfits?.[0] ?? '',
+      rec.riskReward || '',
+      'Historical',
+      '',
+      '',
+      rec.newsSentiment || '',
+      rec.summary || '',
+    ]);
+
+    const allRows = [...streamRows, ...historicalRows];
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    downloadCsvWithBom(`vernier-signals-${dateStamp}.csv`, headers, allRows);
+    setCsvDownloadedCount(allRows.length);
+    window.setTimeout(() => setCsvDownloadedCount(null), 2600);
+  };
+
+  const longCount = useMemo(() => events.filter((e) => e.direction === 'LONG').length, [events]);
+  const shortCount = useMemo(() => events.filter((e) => e.direction === 'SHORT').length, [events]);
+
+  const heartbeatText = lastHeartbeatAt
+    ? new Date(lastHeartbeatAt).toLocaleTimeString('ru-RU', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })
+    : null;
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-2xl border border-emerald-500/25 bg-[#111827] card-surface-glow p-4 sm:p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                <Radio className="w-4 h-4 text-emerald-400 animate-pulse shrink-0" />
+                <span>Поток живых сигналов (Live Signal Feed)</span>
+              </h2>
+                <span
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border font-mono text-[10px] font-bold whitespace-nowrap shrink-0 ${
+                  streamStatus === 'connected'
+                    ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                    : streamStatus === 'connecting'
+                      ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-200'
+                      : 'border-white/10 bg-white/5 text-slate-400'
+                }`}
+                title={heartbeatText ? `Последний сигнал: ${heartbeatText}` : undefined}
+              >
+                <Wifi className="w-3 h-3 shrink-0" />
+                <span>
+                  {streamStatus === 'connected'
+                    ? heartbeatText
+                      ? `Live · ${heartbeatText}`
+                      : 'Live'
+                    : streamStatus === 'connecting'
+                      ? 'Синхр.'
+                      : 'Ожидание'}
+                </span>
+              </span>
+              {verifiedLive ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-emerald-400/50 bg-emerald-500/20 font-mono text-[10px] font-bold text-emerald-200 whitespace-nowrap">
+                  <ShieldCheck className="w-3 h-3 text-emerald-300 shrink-0" />
+                  <span>
+                    Verified Live{verifiedExchangeLabel ? ` · ${verifiedExchangeLabel}` : ''}
+                  </span>
+                </span>
+              ) : (
+                <span className="px-2 py-0.5 rounded-md border border-white/12 bg-white/[0.04] font-mono text-[10px] font-semibold text-slate-200 whitespace-nowrap">
+                  {operatingMode === 'live' ? 'Read-Only / Testnet API' : 'Paper Trading'}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
+              Событийный поток сигналов LONG / SHORT от активных стратегий с точным временем, целевыми зонами и живым прогрессом отработки SL → Вход → TP1 → TP2.
+            </p>
+          </div>
+
+          <div className="w-full sm:w-auto flex flex-col sm:flex-row sm:flex-wrap items-stretch sm:items-center gap-2 shrink-0">
+            <div className="grid grid-cols-3 sm:flex sm:flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                disabled={totalExportableSignals === 0}
+                onClick={handleDownloadSignalsCsv}
+                title={
+                  totalExportableSignals > 0
+                    ? `Экспортировать ${totalExportableSignals} сигналов в CSV для внешнего анализа`
+                    : 'Пока нет сигналов для экспорта в CSV'
+                }
+                className={`min-h-[36px] px-2 sm:px-3 rounded-xl border text-[11px] sm:text-xs font-semibold inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${
+                  csvDownloadedCount !== null
+                    ? 'border-emerald-400/55 bg-emerald-500/20 text-emerald-100'
+                    : 'border-emerald-500/35 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-200'
+                }`}
+              >
+                {csvDownloadedCount !== null ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                ) : (
+                  <Download className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span className="truncate">
+                  {csvDownloadedCount !== null
+                    ? `CSV (${csvDownloadedCount})`
+                    : totalExportableSignals > 0
+                      ? `CSV (${totalExportableSignals})`
+                      : 'Экспорт CSV'}
+                </span>
+              </button>
+              {onOpenApiGuide && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    onOpenApiGuide();
+                  }}
+                  className="min-h-[36px] px-2 sm:px-3 rounded-xl border border-white/12 bg-white/5 hover:bg-white/10 text-slate-200 text-[11px] sm:text-xs font-medium inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors"
+                >
+                  <BookOpen className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+                  <span className="truncate">Гайд по API</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic(8);
+                  onOpenModeInfo();
+                }}
+                className="min-h-[36px] px-2 sm:px-3 rounded-xl border border-cyan-500/35 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 text-[11px] sm:text-xs font-medium inline-flex items-center justify-center gap-1 whitespace-nowrap transition-colors"
+              >
+                <Info className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Paper vs Live</span>
+              </button>
+            </div>
+            <button
+              type="button"
+              disabled={monitorLoading || activeCount === 0}
+              onClick={onRefreshStream}
+              className="min-h-[36px] px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center justify-center gap-1.5 whitespace-nowrap transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${monitorLoading ? 'animate-spin' : ''}`} />
+              <span>{monitorLoading ? 'Синхр.…' : 'Обновить поток'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Статус подключённых бирж */}
+        {exchangeStrip}
+
+        {/* Фильтры потока */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+          <div className="inline-flex items-center p-1 rounded-xl bg-[#0B0F17] border border-white/8 text-xs">
+            {(
+              [
+                { id: 'all', label: `Все (${events.length})` },
+                { id: 'LONG', label: `LONG (${longCount})` },
+                { id: 'SHORT', label: `SHORT (${shortCount})` },
+              ] as const
+            ).map((tab) => {
+              const active = directionFilter === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setDirectionFilter(tab.id)}
+                  className={`min-h-[32px] px-3 rounded-lg font-medium transition-colors whitespace-nowrap ${
+                    active
+                      ? tab.id === 'LONG'
+                        ? 'bg-emerald-600 text-white'
+                        : tab.id === 'SHORT'
+                          ? 'bg-rose-600 text-white'
+                          : 'bg-white/12 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {events.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                strategyEventStream.clear();
+              }}
+              className="min-h-[32px] px-2.5 rounded-lg border border-white/10 bg-white/5 hover:bg-rose-500/15 hover:border-rose-500/35 text-xs text-slate-400 hover:text-rose-200 inline-flex items-center gap-1.5 transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Очистить</span>
+            </button>
+          )}
+        </div>
+
+        {filteredEvents.length === 0 ? (
+          <div className="rounded-xl border border-white/8 bg-[#0B0F17] p-6 text-center space-y-3">
+            <div className="mx-auto w-11 h-11 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center text-emerald-400">
+              <Radio className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-sm font-semibold text-white">
+                {activeCount === 0
+                  ? 'Нет активных стратегий в мониторинге'
+                  : 'Новых событий по заданному порогу пока нет'}
+              </h3>
+              <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+                {activeCount === 0
+                  ? 'Активируйте стратегии в «Каталоге» — конечный автомат переведёт их в состояние Monitoring, и каждый найденный LONG / SHORT сигнал сразу появится в этом потоке.'
+                  : `Сейчас ${activeCount} активн. стратегий находятся в состоянии Monitoring. Как только свечной сигнал превысит порог уверенности, запись с зонами входа, SL и TP мгновенно придёт сюда.`}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+              {activeCount === 0 ? (
+                <button
+                  type="button"
+                  onClick={onGoToCatalog}
+                  className="min-h-[38px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
+                >
+                  Перейти в Каталог стратегий
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={monitorLoading}
+                  onClick={onRefreshStream}
+                  className="min-h-[38px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${monitorLoading ? 'animate-spin' : ''}`} />
+                  <span>Проверить свечи сейчас</span>
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {filteredEvents.map((event) => {
+              const opKey = `${event.strategyKey}-${event.symbol}-${event.direction}`;
+              const placedForStrat = placedOrdersByStrategy[event.strategyKey];
+              const isOrderPlaced = Boolean(
+                placedForStrat &&
+                  placedForStrat.symbol === event.symbol &&
+                  placedForStrat.direction === event.direction
+              );
+              return (
+                <LiveSignalFeedRow
+                  key={event.id}
+                  event={event}
+                  isBusy={apiOrderBusyKey === opKey}
+                  isPushDone={Boolean(pushSentKeys[opKey])}
+                  isOrderPlaced={isOrderPlaced}
+                  pushSubscribed={pushSubscribed}
+                  hasTradeApiKey={hasTradeApiKey}
+                  onOpenChart={
+                    onOpenPairOnMarket
+                      ? (overlay) => onOpenPairOnMarket(overlay.symbol, overlay.marketType, overlay)
+                      : undefined
+                  }
+                  onSendPush={onSendSignalPush}
+                  onExecuteApi={onExecuteSignalViaApi}
+                />
+              );
+            })}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+};
+
 export const StrategiesView: React.FC<StrategiesViewProps> = ({
   profile,
   strategies,
@@ -121,22 +1410,106 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   privacyMode = false,
   pushSubscribed = false,
   portfolioBalanceUsdt,
+  exchangeKeys = [],
+  exchangeSyncCache,
+  exchangeSyncErrorLogs = [],
   onOpenPushSettings,
+  onOpenExchangeIntegrations,
   onRequireLogin,
   onSwitchPlan,
   onConsumeCredits,
   onOpenPairOnMarket,
   onSaveStrategy,
+  onPlaceExchangeOrder,
+  onSignalEmitted,
   externalSection,
 }) => {
+  const planCtx = usePlan();
   const [section, setSection] = useState<StrategiesSection>('catalog');
+  const [scannerSubTab, setScannerSubTab] = useState<'scanner' | 'signals'>('scanner');
+  const [executionMode, setExecutionMode] = useState<StrategyExecutionMode>(() => readStoredExecMode());
+  const [liveExecutionEnabled, setLiveExecutionEnabled] = useState<boolean>(
+    () => readLiveExecutionPrefs().enabled || readStoredExecMode() === 'api_confirm'
+  );
+  const [selectedExchangeKeyId, setSelectedExchangeKeyId] = useState<string | null>(
+    () => readLiveExecutionPrefs().selectedKeyId
+  );
+  const operatingMode: StrategyOperatingMode =
+    liveExecutionEnabled || executionMode === 'api_confirm' ? 'live' : 'paper';
+  const [modeInfoOpen, setModeInfoOpen] = useState(false);
+  const [apiGuideOpen, setApiGuideOpen] = useState(false);
+  const [strategyModeTooltipOpen, setStrategyModeTooltipOpen] = useState(false);
+  const [placedOrdersByStrategy, setPlacedOrdersByStrategy] = useState<
+    Record<string, PlacedStrategyOrderRecord>
+  >(() => readStoredPlacedOrders());
+  const [signalStreamCount, setSignalStreamCount] = useState<number>(
+    () => strategyEventStream.getEvents().length
+  );
   const [selectedMaxMultiplier, setSelectedMaxMultiplier] = useState<10 | 20>(() =>
     profile?.maxMultiplier === 20 ? 20 : 10
   );
+  const dispatchedLiveSignalsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    return strategyEventStream.subscribe((events) => {
+      setSignalStreamCount(events.length);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!modeInfoOpen && !strategyModeTooltipOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setModeInfoOpen(false);
+        setStrategyModeTooltipOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [modeInfoOpen, strategyModeTooltipOpen]);
+
+  const handleSetExecutionMode = useCallback(
+    (next: StrategyExecutionMode) => {
+      triggerHaptic(10);
+      setExecutionMode(next);
+      const nextLive = next === 'api_confirm';
+      setLiveExecutionEnabled(nextLive);
+      saveLiveExecutionPrefs({ enabled: nextLive, selectedKeyId: selectedExchangeKeyId });
+      try {
+        window.localStorage.setItem(EXEC_MODE_STORAGE_KEY, next);
+      } catch {
+        // ignore storage quota errors
+      }
+    },
+    [selectedExchangeKeyId]
+  );
+
+  const handleSelectExchangeKey = useCallback(
+    (nextKeyId: string | null) => {
+      triggerHaptic(6);
+      setSelectedExchangeKeyId(nextKeyId);
+      saveLiveExecutionPrefs({ enabled: liveExecutionEnabled, selectedKeyId: nextKeyId });
+    },
+    [liveExecutionEnabled]
+  );
+
+  const persistPlacedOrders = useCallback((next: Record<string, PlacedStrategyOrderRecord>) => {
+    setPlacedOrdersByStrategy(next);
+    try {
+      window.localStorage.setItem(PLACED_ORDERS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // ignore storage quota errors
+    }
+  }, []);
 
   useEffect(() => {
     if (externalSection?.section) {
-      setSection(externalSection.section);
+      if (externalSection.section === 'signals') {
+        setSection('scanner');
+        setScannerSubTab('signals');
+      } else {
+        setSection(externalSection.section);
+      }
     }
   }, [externalSection]);
 
@@ -197,7 +1570,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   // Real OHLCV backtest breakdown for catalog comparison badges (never fabricated)
   const [catalogBacktest, setCatalogBacktest] = useState<Record<string, StrategyBreakdownResult>>({});
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     const payload = {
       interval: '1h',
       depositUsdt: 2500,
@@ -217,19 +1590,20 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     })
-      .then((res) => (res.ok ? (res.json() as Promise<StrategyPerformanceReport>) : null))
-      .then((report) => {
-        if (cancelled || !report?.breakdown) return;
+      .then((res) => parseJsonResponse<StrategyPerformanceReport>(res))
+      .then((parsed) => {
+        if (controller.signal.aborted || !parsed.ok || !parsed.data?.breakdown) return;
         const map: Record<string, StrategyBreakdownResult> = {};
-        for (const item of report.breakdown) {
+        for (const item of parsed.data.breakdown) {
           map[item.strategyKey] = item;
         }
         setCatalogBacktest(map);
       })
       .catch(() => undefined);
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, []);
 
@@ -260,56 +1634,431 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     return values.reduce((acc, v) => acc + v, 0) / values.length;
   }, [catalogBacktest]);
 
-  const activePlanTier = getActivePlanTier(profile);
-  const isPro = isProSubscriptionActive(profile);
-  const isMax = isMaxSubscriptionActive(profile);
-  const isExpiredPro = isProSubscriptionExpired(profile);
+  const activePlanTier: PlanTier =
+    planCtx.plan === 'MAX' ? 'max' : planCtx.plan === 'PRO' ? 'pro' : getActivePlanTier(profile);
+  const isMax = planCtx.isMax || isMaxSubscriptionActive(profile);
+  const isPro = planCtx.isPro || isProSubscriptionActive(profile) || isMax;
+  const isExpiredPro = !isPro && isProSubscriptionExpired(profile);
   const totalCreditQuota = getCreditQuotaForProfile(profile);
   const tierLabel = getTierDisplayName(activePlanTier);
-  const isCreditsExhausted = Boolean(isSignedIn && profile && profile.creditsRemaining <= 0);
+  const isCreditsExhausted = Boolean(isSignedIn && !planCtx.isDemoOverride && profile && profile.creditsRemaining <= 0);
+
+  // Верификация Live Execution и выбор активного Trade API-ключа биржи
+  const liveVerification = useMemo(
+    () =>
+      verifyLiveExchangeConnection({
+        liveExecutionEnabled,
+        selectedExchangeKeyId,
+        exchangeKeys,
+        errorLogs: exchangeSyncErrorLogs,
+      }),
+    [liveExecutionEnabled, selectedExchangeKeyId, exchangeKeys, exchangeSyncErrorLogs]
+  );
+  const activeTradeApiKey = liveVerification.selectedKey;
+  const hasAnyExchangeKey = exchangeKeys.some((k) => k.enabled);
+
+  // Статусы подключения каждой добавленной биржи (Синхронизирован / Активен / Пауза / Требуется переавторизация)
+  const exchangeConnections = useMemo(
+    () =>
+      exchangeKeys.map((key) => ({
+        key,
+        meta: resolveExchangeConnectionStatus(key, exchangeSyncCache, exchangeSyncErrorLogs),
+      })),
+    [exchangeKeys, exchangeSyncCache, exchangeSyncErrorLogs]
+  );
+
+  // Живой движок сигналов активных стратегий (реальные свечные индикаторы + телеметрия совпадения)
+  const [activeMonitorReport, setActiveMonitorReport] = useState<LiveScannerReport | null>(null);
+  const [monitorLoading, setMonitorLoading] = useState(false);
+  const [apiOrderBusyKey, setApiOrderBusyKey] = useState<string | null>(null);
+  const [pushSentKeys, setPushSentKeys] = useState<Record<string, boolean>>({});
+  const monitorAbortRef = useRef<AbortController | null>(null);
+
+  const activeStrategiesForMonitor = useMemo(
+    () => strategies.filter((s) => s.enabled && canAccessStrategy(s.strategyKey, activePlanTier)),
+    [strategies, activePlanTier]
+  );
+
+  const activeMonitorSignature = useMemo(
+    () =>
+      activeStrategiesForMonitor
+        .map((s) => `${s.strategyKey}:${s.minConfidence}:${s.pairs.join(',')}`)
+        .sort()
+        .join('|'),
+    [activeStrategiesForMonitor]
+  );
+
+  const runActiveStrategiesMonitor = useCallback(async () => {
+    if (activeStrategiesForMonitor.length === 0) {
+      setActiveMonitorReport(null);
+      strategyEventStream.setStatus('idle');
+      return;
+    }
+    if (monitorAbortRef.current) {
+      monitorAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    monitorAbortRef.current = controller;
+    setMonitorLoading(true);
+    strategyEventStream.setStatus('connecting');
+    try {
+      const minConfAcrossActive = Math.min(
+        ...activeStrategiesForMonitor.map((s) => Math.max(55, Math.min(90, s.minConfidence || 70)))
+      );
+      const res = await authFetch('/api/strategies/scanner', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          timeframe: '1h',
+          minConfidence: minConfAcrossActive,
+          marketFilter: 'all',
+          ...(activePlanTier !== 'free' ? { demoTier: activePlanTier } : {}),
+          activeStrategyConfigs: activeStrategiesForMonitor.map((s) => ({
+            strategyKey: s.strategyKey,
+            minConfidence: s.minConfidence,
+            pairs: s.pairs,
+          })),
+        }),
+        signal: controller.signal,
+      });
+      const parsed = await parseJsonResponse<LiveScannerReport & { error?: string }>(res);
+      if (!controller.signal.aborted && parsed.ok && parsed.data) {
+        setActiveMonitorReport(parsed.data);
+        if (Array.isArray(parsed.data.opportunities) && parsed.data.opportunities.length > 0) {
+          strategyEventStream.publishOpportunities(parsed.data.opportunities, operatingMode);
+        } else {
+          strategyEventStream.heartbeat();
+        }
+      }
+    } catch {
+      // Non-blocking background monitor
+    } finally {
+      if (!controller.signal.aborted) {
+        setMonitorLoading(false);
+      }
+    }
+  }, [activeStrategiesForMonitor, activePlanTier, operatingMode]);
+
+  useEffect(() => {
+    if (activeStrategiesForMonitor.length === 0) {
+      setActiveMonitorReport(null);
+      strategyEventStream.setStatus('idle');
+      return;
+    }
+    void runActiveStrategiesMonitor();
+    const intervalId = window.setInterval(() => {
+      if (isPageVisible()) {
+        void runActiveStrategiesMonitor();
+      }
+    }, 60_000);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
+        void runActiveStrategiesMonitor();
+      }
+    });
+    return () => {
+      window.clearInterval(intervalId);
+      unsubVis();
+      monitorAbortRef.current?.abort();
+    };
+  }, [activeMonitorSignature, activePlanTier, runActiveStrategiesMonitor, activeStrategiesForMonitor.length]);
+
+  // Конечный автомат стратегий (Idle / Monitoring / Execution) и simulation runner
+  const simulationSnapshot = useMemo(
+    () =>
+      runPaperSimulationStep({
+        strategies,
+        opportunities: activeMonitorReport?.opportunities ?? [],
+        placedOrders: placedOrdersByStrategy,
+        machine: strategyStateMachine,
+      }),
+    [strategies, activeMonitorReport, placedOrdersByStrategy]
+  );
+
+  const handleExecuteSignalViaApi = useCallback(
+    async (opp: LiveScannerOpportunity, overrideKeyId?: string | null) => {
+      triggerHaptic(12);
+      const stratCfg = strategies.find((s) => s.strategyKey === opp.strategyKey);
+      const intent = prepareLiveExecutionIntent({
+        opportunity: opp,
+        strategyConfig: stratCfg,
+        exchangeKeys,
+        selectedExchangeKeyId: overrideKeyId ?? liveVerification.selectedKey?.id ?? selectedExchangeKeyId,
+        portfolioBalanceUsdt,
+      });
+      if (!intent.ready || !intent.exchangeKey || !onPlaceExchangeOrder) {
+        setFeedback({
+          text: `${intent.reasonRu} VERNIER никогда не открывает сделки без вашего подтверждения.`,
+          tone: 'error',
+        });
+        onOpenExchangeIntegrations?.();
+        return;
+      }
+      const opKey = `${opp.strategyKey}-${opp.symbol}-${opp.direction}`;
+      setApiOrderBusyKey(opKey);
+      setFeedback(null);
+      try {
+        const result = await executeLiveStrategyOrder({
+          intent,
+          onPlaceExchangeOrder,
+        });
+        const orderRecord: PlacedStrategyOrderRecord = {
+          strategyKey: opp.strategyKey,
+          symbol: opp.symbol,
+          direction: opp.direction,
+          exchange: intent.exchangeKey.exchange,
+          orderId: result.orderId || 'OK',
+          placedAt: result.submittedAt || new Date().toISOString(),
+        };
+        persistPlacedOrders({
+          ...placedOrdersByStrategy,
+          [opp.strategyKey]: orderRecord,
+        });
+        strategyEventStream.markOrderExecuted({
+          strategyKey: opp.strategyKey,
+          symbol: opp.symbol,
+          direction: opp.direction,
+          orderId: orderRecord.orderId,
+          exchange: intent.exchangeKey.exchange,
+        });
+        setFeedback({
+          text: `Order Placed (Live): ${opp.direction} ${opp.symbol} на ${intent.exchangeKey.exchange.toUpperCase()} (${intent.exchangeKey.label}) · ID: ${result.orderId || 'OK'}.`,
+          tone: 'success',
+        });
+      } catch (err) {
+        setFeedback({
+          text: err instanceof Error ? err.message : 'Отправка ордера через API отменена или завершилась ошибкой.',
+          tone: 'error',
+        });
+      } finally {
+        setApiOrderBusyKey(null);
+      }
+    },
+    [
+      exchangeKeys,
+      liveVerification.selectedKey?.id,
+      selectedExchangeKeyId,
+      onPlaceExchangeOrder,
+      onOpenExchangeIntegrations,
+      portfolioBalanceUsdt,
+      strategies,
+      persistPlacedOrders,
+      placedOrdersByStrategy,
+    ]
+  );
+
+  // При включённом Live Execution + Verified Live:
+  // инициируем размещение ордера в реальном времени по новому входящему сигналу (всегда через защищённое окно подтверждения).
+  useEffect(() => {
+    if (!liveExecutionEnabled || !liveVerification.verifiedLive || !liveVerification.selectedKey) {
+      return;
+    }
+    if (apiOrderBusyKey) return;
+    const incomingOpps = activeMonitorReport?.opportunities ?? [];
+    if (incomingOpps.length === 0) return;
+
+    const nextCandidate = incomingOpps.find((opp) => {
+      const dispatchKey = `${opp.strategyKey}|${opp.symbol}|${opp.direction}`;
+      if (dispatchedLiveSignalsRef.current.has(dispatchKey)) return false;
+      const placed = placedOrdersByStrategy[opp.strategyKey];
+      if (placed && placed.symbol === opp.symbol && placed.direction === opp.direction) return false;
+      return true;
+    });
+
+    if (!nextCandidate) return;
+    const dispatchKey = `${nextCandidate.strategyKey}|${nextCandidate.symbol}|${nextCandidate.direction}`;
+    dispatchedLiveSignalsRef.current.add(dispatchKey);
+    void handleExecuteSignalViaApi(nextCandidate, liveVerification.selectedKey.id);
+  }, [
+    liveExecutionEnabled,
+    liveVerification.verifiedLive,
+    liveVerification.selectedKey,
+    activeMonitorReport,
+    placedOrdersByStrategy,
+    apiOrderBusyKey,
+    handleExecuteSignalViaApi,
+  ]);
+
+  const handleToggleLiveExecution = useCallback(() => {
+    triggerHaptic(12);
+    const next = !liveExecutionEnabled;
+    if (next && liveVerification.availableTradeKeys.length === 0) {
+      setLiveExecutionEnabled(true);
+      setExecutionMode('api_confirm');
+      saveLiveExecutionPrefs({ enabled: true, selectedKeyId: null });
+      setFeedback({
+        text: 'Для активации Verified Live подключите API-ключ биржи с правом «Торговля» в «Защита → Биржи API».',
+        tone: 'error',
+      });
+      return;
+    }
+    const keyToUse =
+      selectedExchangeKeyId && liveVerification.availableTradeKeys.some((k) => k.id === selectedExchangeKeyId)
+        ? selectedExchangeKeyId
+        : liveVerification.availableTradeKeys[0]?.id ?? null;
+    setLiveExecutionEnabled(next);
+    setExecutionMode(next ? 'api_confirm' : 'signals');
+    setSelectedExchangeKeyId(keyToUse);
+    saveLiveExecutionPrefs({ enabled: next, selectedKeyId: keyToUse });
+    try {
+      window.localStorage.setItem(EXEC_MODE_STORAGE_KEY, next ? 'api_confirm' : 'signals');
+    } catch {
+      // ignore
+    }
+    if (next && keyToUse) {
+      const chosen = liveVerification.availableTradeKeys.find((k) => k.id === keyToUse);
+      setFeedback({
+        text: `Live Execution включён · Verified Live (${chosen?.exchange.toUpperCase() ?? 'API'} · ${chosen?.label ?? ''}). Входящие сигналы инициируют размещение ордера через выбранный API-ключ с обязательным подтверждением.`,
+        tone: 'success',
+      });
+    } else {
+      setFeedback({
+        text: 'Live Execution выключен — стратегии переведены в безопасный режим Paper Trading.',
+        tone: 'success',
+      });
+    }
+  }, [liveExecutionEnabled, liveVerification.availableTradeKeys, selectedExchangeKeyId]);
+
+  const handleSendSignalPush = useCallback(
+    async (opp: LiveScannerOpportunity) => {
+      triggerHaptic(10);
+      if (!pushSubscribed || !onSignalEmitted) {
+        onOpenPushSettings?.();
+        return;
+      }
+      const key = `${opp.strategyKey}-${opp.symbol}-${opp.direction}`;
+      await onSignalEmitted({
+        symbol: opp.symbol,
+        marketType: opp.marketType,
+        direction: opp.direction,
+        confidence: opp.confidence,
+        strategyName: opp.strategyName,
+        entryZone: `${formatScannerPrice(opp.entryPrice)} · SL ${formatScannerPrice(opp.stopLossPrice)} · TP ${formatScannerPrice(opp.takeProfitPrice)}`,
+      });
+      setPushSentKeys((prev) => ({ ...prev, [key]: true }));
+      setFeedback({
+        text: `Push-сигнал ${opp.direction} ${opp.symbol} (${opp.strategyName}) отправлен на ваше устройство.`,
+        tone: 'success',
+      });
+    },
+    [pushSubscribed, onSignalEmitted, onOpenPushSettings]
+  );
 
   // Live Multi-Pair Setup Scanner state (PRO: TOP-16, MAX: ALL 44 + 4H)
+  const spotLiveSnap = useLiveMarketSnapshot('spot');
+  const futuresLiveSnap = useLiveMarketSnapshot('futures');
+  const spotTickersRef = useRef(spotLiveSnap.tickers);
+  const futuresTickersRef = useRef(futuresLiveSnap.tickers);
+  useEffect(() => {
+    spotTickersRef.current = spotLiveSnap.tickers;
+  }, [spotLiveSnap.tickers]);
+  useEffect(() => {
+    futuresTickersRef.current = futuresLiveSnap.tickers;
+  }, [futuresLiveSnap.tickers]);
+
   const [scannerTf, setScannerTf] = useState<'1h' | '4h'>('1h');
   const [scannerMarket, setScannerMarket] = useState<'all' | MarketType>('all');
   const [scannerMinConf, setScannerMinConf] = useState<number>(72);
   const [scannerReport, setScannerReport] = useState<LiveScannerReport | null>(null);
+  const [scannerIsLocal, setScannerIsLocal] = useState(false);
   const [scannerLoading, setScannerLoading] = useState(false);
   const [scannerError, setScannerError] = useState<string | null>(null);
+  const scannerInitRef = useRef(false);
+  const scannerReqIdRef = useRef(0);
 
   const runLiveScanner = useCallback(
-    async (tfOverride?: '1h' | '4h') => {
+    async (
+      tfOverride?: '1h' | '4h',
+      opts?: { minConf?: number; market?: 'all' | MarketType; forceLocal?: boolean }
+    ) => {
       const targetTf = tfOverride ?? (isMax ? scannerTf : '1h');
+      const targetMinConf = opts?.minConf ?? scannerMinConf;
+      const targetMarket = opts?.market ?? scannerMarket;
+      const reqId = ++scannerReqIdRef.current;
+
+      if (opts?.forceLocal) {
+        const local = runLocalLiveScanner({
+          tier: activePlanTier,
+          timeframe: targetTf,
+          minConfidence: targetMinConf,
+          marketFilter: targetMarket,
+          spotTickers: spotTickersRef.current,
+          futuresTickers: futuresTickersRef.current,
+          totalPairsAvailable: TRADING_PAIRS.length,
+        });
+        setScannerReport(local);
+        setScannerIsLocal(true);
+        setScannerError(null);
+        setScannerLoading(false);
+        return;
+      }
+
       setScannerLoading(true);
       setScannerError(null);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 2200);
+
       try {
         const res = await authFetch('/api/strategies/scanner', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             timeframe: targetTf,
-            minConfidence: scannerMinConf,
-            marketFilter: scannerMarket,
+            minConfidence: targetMinConf,
+            marketFilter: targetMarket,
+            ...(activePlanTier !== 'free' ? { demoTier: activePlanTier } : {}),
           }),
+          signal: controller.signal,
         });
-        const data = (await res.json()) as LiveScannerReport & { error?: string };
-        if (!res.ok) {
-          throw new Error(data.error || 'Не удалось выполнить сканирование рынка');
+        const parsed = await parseJsonResponse<LiveScannerReport & { error?: string }>(res);
+        if (reqId !== scannerReqIdRef.current) return;
+        if (!parsed.ok || !parsed.data || !Array.isArray(parsed.data.opportunities)) {
+          throw new Error(parsed.errorMessage || 'Fallback to local scanner');
         }
-        setScannerReport(data);
-      } catch (err) {
-        setScannerError(err instanceof Error ? err.message : 'Ошибка сканера торговых сетапов');
+        setScannerReport(parsed.data);
+        setScannerIsLocal(false);
+        setScannerError(null);
+      } catch {
+        if (reqId !== scannerReqIdRef.current) return;
+        // Мгновенный (<10 мс) локальный расчёт сетапов — кнопка никогда не зависает
+        const local = runLocalLiveScanner({
+          tier: activePlanTier,
+          timeframe: targetTf,
+          minConfidence: targetMinConf,
+          marketFilter: targetMarket,
+          spotTickers: spotTickersRef.current,
+          futuresTickers: futuresTickersRef.current,
+          totalPairsAvailable: TRADING_PAIRS.length,
+        });
+        setScannerReport(local);
+        setScannerIsLocal(true);
+        setScannerError(null);
       } finally {
-        setScannerLoading(false);
+        window.clearTimeout(timeoutId);
+        if (reqId === scannerReqIdRef.current) {
+          setScannerLoading(false);
+        }
       }
     },
-    [isMax, scannerTf, scannerMinConf, scannerMarket]
+    [isMax, scannerTf, scannerMinConf, scannerMarket, activePlanTier]
   );
 
+  // Однократный автозапуск при первом входе в «AI-сканер» (без бесконечного цикла при ошибке)
   useEffect(() => {
-    if (section === 'scanner' && !scannerReport && !scannerLoading) {
+    if (section === 'scanner' && !scannerInitRef.current) {
+      scannerInitRef.current = true;
       void runLiveScanner();
     }
-  }, [section, scannerReport, scannerLoading, runLiveScanner]);
+  }, [section, runLiveScanner]);
+
+  // Мгновенное обновление выдачи при изменении фильтра рынка или порога уверенности
+  useEffect(() => {
+    if (section !== 'scanner' || !scannerInitRef.current) return;
+    const timer = window.setTimeout(() => {
+      void runLiveScanner(undefined, { forceLocal: scannerIsLocal });
+    }, 140);
+    return () => window.clearTimeout(timer);
+  }, [section, scannerMarket, scannerMinConf, scannerIsLocal, runLiveScanner]);
 
   useEffect(() => {
     const handleTourFocus = (evt: Event) => {
@@ -383,23 +2132,45 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
     }
   };
 
-  const displayList = STRATEGY_CATALOG.filter(
-    (tpl) =>
-      (marketFilter === 'all' || tpl.marketType === marketFilter) &&
-      (tierFilter === 'all' || tpl.tier === tierFilter)
-  )
-    .map((tpl) => {
-      const existing = strategies.find((s) => s.strategyKey === tpl.key);
-      return { tpl, cfg: existing };
-    })
-    .filter(({ cfg }) => {
-      if (statusFilter === 'all') return true;
-      const isEnabled = Boolean(cfg?.enabled);
-      return statusFilter === 'active' ? isEnabled : !isEnabled;
-    });
+  const scopedCatalog = useMemo(
+    () =>
+      STRATEGY_CATALOG.filter(
+        (tpl) =>
+          (marketFilter === 'all' || tpl.marketType === marketFilter) &&
+          (tierFilter === 'all' || tpl.tier === tierFilter)
+      ).map((tpl) => {
+        const existing = strategies.find((s) => s.strategyKey === tpl.key);
+        const isLockedForUser = !canAccessStrategy(tpl.key, activePlanTier);
+        const isEnabled = Boolean(existing?.enabled) && !isLockedForUser;
+        return { tpl, cfg: existing, isEnabled };
+      }),
+    [marketFilter, tierFilter, strategies, activePlanTier]
+  );
 
-  const activeStrategies = strategies.filter(
-    (s) => s.enabled && canAccessStrategy(s.strategyKey, activePlanTier)
+  const statusCounts = useMemo(() => {
+    let active = 0;
+    for (const item of scopedCatalog) {
+      if (item.isEnabled) active += 1;
+    }
+    return {
+      total: scopedCatalog.length,
+      active,
+      inactive: scopedCatalog.length - active,
+    };
+  }, [scopedCatalog]);
+
+  const displayList = useMemo(
+    () =>
+      scopedCatalog.filter(({ isEnabled }) => {
+        if (statusFilter === 'all') return true;
+        return statusFilter === 'active' ? isEnabled : !isEnabled;
+      }),
+    [scopedCatalog, statusFilter]
+  );
+
+  const activeStrategies = useMemo(
+    () => strategies.filter((s) => s.enabled && canAccessStrategy(s.strategyKey, activePlanTier)),
+    [strategies, activePlanTier]
   );
   const activeCount = activeStrategies.length;
   const hasUnlimitedProSignals = isPro && activeStrategies.some((s) => s.dailySignalLimit === 0);
@@ -420,7 +2191,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         id: 'scanner' as const,
         label: 'AI-сканер',
         icon: <Radar className="w-3.5 h-3.5 text-cyan-400" />,
-        meta: isMax ? '44' : isPro ? 'PRO' : undefined,
+        meta: signalStreamCount > 0 ? String(signalStreamCount) : isMax ? '44' : isPro ? 'PRO' : undefined,
       },
       {
         id: 'sentiment' as const,
@@ -444,7 +2215,113 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         icon: <BookOpen className="w-3.5 h-3.5 text-emerald-400" />,
       },
     ],
-    [activeCount, isMax, isPro]
+    [activeCount, signalStreamCount, isMax, isPro]
+  );
+
+  // Компактный блок «Статус подключённых бирж» (используется в Движке и в Ленте сигналов)
+  const renderExchangeConnectionStrip = () => (
+    <div className="rounded-xl border border-white/10 bg-[#0B0F17]/90 p-3 space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-200">
+          <Link2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+          <span>Статус подключённых бирж</span>
+          <span className="font-mono text-[10px] text-slate-400">
+            ({exchangeConnections.length})
+          </span>
+        </div>
+        {onOpenExchangeIntegrations && (
+          <button
+            type="button"
+            onClick={() => {
+              triggerHaptic(8);
+              onOpenExchangeIntegrations();
+            }}
+            className="text-[11px] font-semibold text-emerald-300 hover:text-emerald-200 transition-colors"
+          >
+            {exchangeConnections.length > 0 ? 'Управлять API →' : '+ Подключить биржу'}
+          </button>
+        )}
+      </div>
+
+      {exchangeConnections.length === 0 ? (
+        <div className="text-[11px] text-slate-400 leading-relaxed">
+          Биржи не подключены — стратегии работают в режиме <strong className="text-slate-200">Paper / Сигналы</strong>. Для Live-ордеров и отображения реального баланса подключите Binance, Bybit или OKX в «Защита → Биржи API».
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {exchangeConnections.map(({ key, meta }) => {
+            const badgeStyle =
+              meta.health === 'synced'
+                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                : meta.health === 'reauth'
+                  ? 'border-rose-500/45 bg-rose-500/15 text-rose-300'
+                  : meta.health === 'paused'
+                    ? 'border-amber-500/35 bg-amber-500/12 text-amber-200'
+                    : 'border-cyan-500/40 bg-cyan-500/15 text-cyan-200';
+            return (
+              <div
+                key={key.id}
+                className={`rounded-lg border px-2.5 py-2 flex items-center justify-between gap-2 text-[11px] ${
+                  meta.health === 'reauth'
+                    ? 'border-rose-500/35 bg-rose-500/[0.06]'
+                    : 'border-white/8 bg-white/[0.02]'
+                }`}
+              >
+                <div className="min-w-0 space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono font-bold text-white uppercase">
+                      {key.exchange}
+                    </span>
+                    <span className="text-slate-400 truncate max-w-[110px]">{key.label}</span>
+                    <span
+                      className={`px-1 py-0.5 rounded font-mono text-[9px] font-semibold ${
+                        key.permissions === 'trade'
+                          ? 'bg-cyan-500/15 text-cyan-200 border border-cyan-400/30'
+                          : 'bg-white/8 text-slate-300 border border-white/10'
+                      }`}
+                    >
+                      {key.permissions === 'trade' ? 'Trade' : 'Read-Only'}
+                    </span>
+                    {key.testnet && (
+                      <span className="px-1 py-0.5 rounded font-mono text-[9px] bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                        Testnet
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-400 truncate">
+                    {meta.detailRu}
+                    {typeof meta.balanceUsdt === 'number' && meta.balanceUsdt > 0 && meta.health !== 'reauth' && (
+                      <span className="font-mono text-slate-300">
+                        {' '}· {privacyMode ? '•••••' : `$${meta.balanceUsdt.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-semibold whitespace-nowrap ${badgeStyle}`}>
+                    {meta.health === 'synced' && <CheckCircle2 className="w-3 h-3 shrink-0" />}
+                    {meta.health === 'reauth' && <AlertTriangle className="w-3 h-3 shrink-0" />}
+                    {meta.health === 'paused' && <PauseCircle className="w-3 h-3 shrink-0" />}
+                    {meta.health === 'active' && <Activity className="w-3 h-3 shrink-0" />}
+                    <span>{meta.labelRu}</span>
+                  </span>
+                  {meta.health === 'reauth' && onOpenExchangeIntegrations && (
+                    <button
+                      type="button"
+                      onClick={onOpenExchangeIntegrations}
+                      className="px-2 py-0.5 rounded-md bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/40 text-[10px] font-semibold text-rose-100 transition-colors"
+                    >
+                      Обновить
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 
   const dailySignalsLabel = isPro
@@ -529,6 +2406,8 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
           <img
             src="/src/assets/images/terminal_icon_strategy_1794855842754.jpg"
             alt="Стратегии Vernier"
+            width={32}
+            height={32}
             referrerPolicy="no-referrer"
             className="w-8 h-8 rounded-lg object-cover border border-amber-500/25"
           />
@@ -643,9 +2522,9 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                 <div className="inline-flex items-center p-1 rounded-xl bg-[#111827] border border-white/8">
                   {(
                     [
-                      { id: 'all', label: 'Все статусы' },
-                      { id: 'active', label: 'Активные' },
-                      { id: 'inactive', label: 'Неактивные' },
+                      { id: 'all', label: `Все (${statusCounts.total})` },
+                      { id: 'active', label: `Активные (${statusCounts.active})` },
+                      { id: 'inactive', label: `Неактивные (${statusCounts.inactive})` },
                     ] as const
                   ).map((st) => {
                     const active = statusFilter === st.id;
@@ -655,7 +2534,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                         type="button"
                         onClick={() => setStatusFilter(st.id)}
                         className={`min-h-[34px] px-3 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
-                          active ? 'bg-white/12 text-white' : 'text-slate-400 hover:text-slate-200'
+                          active
+                            ? st.id === 'active'
+                              ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/35'
+                              : 'bg-white/12 text-white'
+                            : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
                         {st.label}
@@ -703,13 +2586,418 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
               )}
             </div>
 
+            {/* Движок работы активных стратегий: прозрачный режим + лента живых сигналов */}
+            {(() => {
+              const activeSignals = activeMonitorReport?.opportunities ?? [];
+              const watchedPairsCount = new Set(activeStrategies.flatMap((s) => s.pairs)).size;
+              return (
+                <section className="rounded-2xl border border-emerald-500/25 bg-gradient-to-br from-emerald-500/[0.07] via-[#0E1522] to-[#0B0F17] p-4 space-y-3.5">
+                  <div className="flex flex-wrap items-start justify-between gap-2.5">
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-300">
+                          <Radio className="w-3.5 h-3.5 animate-pulse shrink-0" />
+                          <span>Движок активных стратегий</span>
+                        </span>
+                        {liveVerification.verifiedLive && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-emerald-400/55 bg-emerald-500/20 font-mono text-[10px] font-bold text-emerald-200 shadow-[0_0_12px_-4px_rgba(16,185,129,0.75)]">
+                            <ShieldCheck className="w-3 h-3 text-emerald-300 shrink-0" />
+                            <span>Verified Live</span>
+                          </span>
+                        )}
+                        <span className="px-2 py-0.5 rounded-md border border-emerald-500/35 bg-emerald-500/15 font-mono text-[10px] font-bold text-emerald-200">
+                          {activeCount} / {STRATEGY_CATALOG.length} акт.
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md border border-white/10 bg-white/5 font-mono text-[10px] text-slate-300">
+                          {watchedPairsCount} пар
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded-md border font-mono text-[10px] font-bold ${
+                            Object.keys(placedOrdersByStrategy).length > 0
+                              ? 'border-emerald-400/45 bg-emerald-500/20 text-emerald-200'
+                              : 'border-white/10 bg-white/5 text-slate-400'
+                          }`}
+                          title={ENGINE_STATE_META.Execution.descriptionRu}
+                        >
+                          Order Placed (Live): {Object.keys(placedOrdersByStrategy).length}
+                        </span>
+                        <span
+                          className="px-2 py-0.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 font-mono text-[10px] text-cyan-200"
+                          title={ENGINE_STATE_META.Monitoring.descriptionRu}
+                        >
+                          Monitoring Signal: {simulationSnapshot.counts.monitoring + simulationSnapshot.counts.execution}
+                        </span>
+                        <span
+                          className="px-2 py-0.5 rounded-md border border-white/10 bg-white/5 font-mono text-[10px] text-slate-400"
+                          title={ENGINE_STATE_META.Idle.descriptionRu}
+                        >
+                          Idle: {simulationSnapshot.counts.idle}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 leading-relaxed">
+                        {liveVerification.verifiedLive
+                          ? liveVerification.detailRu
+                          : 'Включите «Live Execution» для подключения к выбранному API-ключу биржи и реального размещения ордеров, либо работайте в безопасном режиме симуляции Paper Trading.'}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic(8);
+                          setModeInfoOpen(true);
+                        }}
+                        className="min-h-[34px] px-2.5 rounded-xl border border-cyan-500/35 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                      >
+                        <Info className="w-3.5 h-3.5 shrink-0" />
+                        <span>Paper vs Live</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={monitorLoading || activeCount === 0}
+                        onClick={() => void runActiveStrategiesMonitor()}
+                        className="min-h-[34px] px-3 rounded-xl border border-emerald-500/35 bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-50 text-emerald-200 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${monitorLoading ? 'animate-spin' : ''}`} />
+                        <span>{monitorLoading ? 'Проверяем свечи…' : 'Проверить сигналы'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Явный переключатель Live Execution + выбор API-ключа биржи + бейдж Verified Live */}
+                  <div
+                    className={`rounded-xl border p-3 space-y-2.5 transition-colors ${
+                      liveVerification.verifiedLive
+                        ? 'border-emerald-400/50 bg-emerald-500/[0.09]'
+                        : liveExecutionEnabled
+                          ? 'border-amber-400/45 bg-amber-500/[0.07]'
+                          : 'border-white/10 bg-[#0B0F17]/95'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2.5">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={liveExecutionEnabled}
+                          aria-label="Включить Live Execution (реальное исполнение ордеров через API биржи)"
+                          onClick={handleToggleLiveExecution}
+                          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors ${
+                            liveExecutionEnabled
+                              ? liveVerification.verifiedLive
+                                ? 'border-emerald-400/60 bg-emerald-500'
+                                : 'border-amber-400/60 bg-amber-500'
+                              : 'border-white/15 bg-white/10'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                              liveExecutionEnabled ? 'translate-x-5' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5 text-xs font-semibold text-white">
+                            <span>Live Execution (Реальное исполнение)</span>
+                            {liveVerification.verifiedLive ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-emerald-400/55 bg-emerald-500/20 font-mono text-[10px] font-bold text-emerald-200">
+                                <ShieldCheck className="w-3 h-3 text-emerald-300 shrink-0" />
+                                <span>Verified Live</span>
+                              </span>
+                            ) : liveExecutionEnabled ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-amber-400/45 bg-amber-500/15 font-mono text-[10px] font-bold text-amber-200">
+                                <AlertTriangle className="w-3 h-3 shrink-0" />
+                                <span>{liveVerification.statusLabel}</span>
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-md border border-white/10 bg-white/5 font-mono text-[10px] text-slate-400">
+                                Paper Mode
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-400 leading-snug mt-0.5">
+                            {liveVerification.detailRu}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        {liveVerification.availableTradeKeys.length > 0 ? (
+                          <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-300">
+                            <KeyRound className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+                            <select
+                              aria-label="Выбор API-ключа биржи для Live Execution"
+                              value={liveVerification.selectedKey?.id ?? ''}
+                              onChange={(e) => handleSelectExchangeKey(e.target.value || null)}
+                              className="min-h-[32px] rounded-lg border border-white/15 bg-[#070B12] px-2.5 text-xs font-mono text-white focus:border-emerald-400 focus:outline-none"
+                            >
+                              {liveVerification.availableTradeKeys.map((k) => (
+                                <option key={k.id} value={k.id}>
+                                  {k.exchange.toUpperCase()} · {k.label}
+                                  {k.testnet ? ' (Testnet)' : ' (Mainnet)'}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        ) : (
+                          onOpenExchangeIntegrations && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                triggerHaptic(8);
+                                onOpenExchangeIntegrations();
+                              }}
+                              className="min-h-[32px] px-3 rounded-lg border border-amber-400/45 bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                            >
+                              <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                              <span>Подключить Trade API</span>
+                            </button>
+                          )
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic(8);
+                            setApiGuideOpen(true);
+                          }}
+                          className="min-h-[32px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                        >
+                          <BookOpen className="w-3.5 h-3.5 shrink-0" />
+                          <span>Гайд по API</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Индикатор статуса подключённых бирж */}
+                  {renderExchangeConnectionStrip()}
+
+                  {/* Переключатель режима работы стратегий */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSetExecutionMode('signals')}
+                      className={`text-left rounded-xl border p-2.5 transition-colors ${
+                        !liveExecutionEnabled
+                          ? 'border-emerald-400/50 bg-emerald-500/12 text-white'
+                          : 'border-white/8 bg-[#0B0F17] text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-xs font-semibold">
+                        <span className="inline-flex items-center gap-1.5">
+                          <BellRing className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>1. Paper Trading (Симуляция + Push)</span>
+                        </span>
+                        {!liveExecutionEnabled && (
+                          <span className="text-[10px] font-mono text-emerald-300">АКТИВЕН</span>
+                        )}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-400">
+                        Симуляция без риска для средств: вы получаете точки входа, SL и TP и отслеживаете прогресс на графике.
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleSetExecutionMode('api_confirm')}
+                      className={`text-left rounded-xl border p-2.5 transition-colors ${
+                        liveExecutionEnabled
+                          ? 'border-cyan-400/50 bg-cyan-500/12 text-white'
+                          : 'border-white/8 bg-[#0B0F17] text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-xs font-semibold">
+                        <span className="inline-flex items-center gap-1.5">
+                          <KeyRound className="w-3.5 h-3.5 text-cyan-300" />
+                          <span>2. Live Execution (API + подтверждение)</span>
+                        </span>
+                        {liveExecutionEnabled && (
+                          <span className="text-[10px] font-mono text-cyan-200">
+                            {liveVerification.verifiedLive ? 'VERIFIED LIVE' : 'АКТИВЕН'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-400">
+                        {activeTradeApiKey
+                          ? `Выбран ключ: ${activeTradeApiKey.exchange.toUpperCase()} (${activeTradeApiKey.label}${activeTradeApiKey.testnet ? ' · Testnet' : ''})`
+                          : hasAnyExchangeKey
+                            ? 'Подключён Read-Only ключ — для Live-ордеров нужен ключ с правом «Торговля».'
+                            : 'Ключ биржи не подключён — добавьте в «Защита → Биржи API».'}
+                      </div>
+                    </button>
+                  </div>
+
+                  {/* Лента живых сигналов, сгенерированных активными стратегиями */}
+                  {activeCount === 0 ? (
+                    <div className="rounded-xl border border-white/8 bg-[#0B0F17] px-3 py-2.5 text-xs text-slate-400">
+                      Включите хотя бы одну стратегию в каталоге ниже (кнопка «Выкл → Активен»), чтобы движок начал мониторить её пары и выдавать сигналы.
+                    </div>
+                  ) : activeSignals.length > 0 ? (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                        <span className="font-semibold text-white inline-flex items-center gap-1.5">
+                          <Zap className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Живые сигналы ваших стратегий ({activeSignals.length})</span>
+                        </span>
+                        <div className="flex items-center gap-2.5">
+                          {activeMonitorReport?.updatedAt && (
+                            <span className="font-mono text-[10px] text-slate-400">
+                              Скан: {new Date(activeMonitorReport.updatedAt).toLocaleTimeString('ru-RU')}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSection('scanner');
+                              setScannerSubTab('signals');
+                            }}
+                            className="text-emerald-300 hover:text-emerald-200 font-semibold whitespace-nowrap"
+                          >
+                            Вся лента ({signalStreamCount}) →
+                          </button>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                        {activeSignals.slice(0, 6).map((opp) => {
+                          const opKey = `${opp.strategyKey}-${opp.symbol}-${opp.direction}`;
+                          const isBusy = apiOrderBusyKey === opKey;
+                          const isPushDone = Boolean(pushSentKeys[opKey]);
+                          const stratCfg = strategies.find((s) => s.strategyKey === opp.strategyKey);
+                          return (
+                            <div
+                              key={opKey}
+                              className={`rounded-xl border bg-[#0B0F17] p-3 space-y-2 ${
+                                opp.direction === 'LONG' ? 'border-emerald-500/35' : 'border-rose-500/35'
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="font-mono text-xs font-bold text-white">{opp.symbol}</span>
+                                    <span
+                                      className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold ${
+                                        opp.direction === 'LONG'
+                                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/35'
+                                          : 'bg-rose-500/20 text-rose-300 border border-rose-500/35'
+                                      }`}
+                                    >
+                                      {opp.direction}
+                                    </span>
+                                    <span className="font-mono text-[10px] text-slate-400">
+                                      {opp.marketType === 'futures'
+                                        ? `Futures ${stratCfg?.leverage ?? 3}x`
+                                        : 'Spot'}{' '}
+                                      · Риск {stratCfg?.riskPerTradePct ?? 1.5}%
+                                    </span>
+                                  </div>
+                                  <div className="mt-0.5 text-[11px] text-slate-300 truncate">{opp.strategyName}</div>
+                                </div>
+                                <span className="font-mono text-xs font-bold text-cyan-300 shrink-0">
+                                  {opp.confidence}%
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-3 gap-1.5 text-[10px] font-mono tabular-nums">
+                                <div className="rounded-lg border border-white/6 bg-white/[0.03] px-2 py-1">
+                                  <div className="font-sans text-[9px] text-slate-500">Вход</div>
+                                  <div className="text-white font-semibold truncate">{formatScannerPrice(opp.entryPrice)}</div>
+                                </div>
+                                <div className="rounded-lg border border-white/6 bg-white/[0.03] px-2 py-1">
+                                  <div className="font-sans text-[9px] text-slate-500">Stop-Loss</div>
+                                  <div className="text-rose-400 font-semibold truncate">{formatScannerPrice(opp.stopLossPrice)}</div>
+                                </div>
+                                <div className="rounded-lg border border-white/6 bg-white/[0.03] px-2 py-1">
+                                  <div className="font-sans text-[9px] text-slate-500">Take-Profit</div>
+                                  <div className="text-emerald-400 font-semibold truncate">{formatScannerPrice(opp.takeProfitPrice)}</div>
+                                </div>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                                {onOpenPairOnMarket && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onOpenPairOnMarket(
+                                        opp.symbol,
+                                        opp.marketType,
+                                        buildStrategySignalOverlay({
+                                          strategyKey: opp.strategyKey,
+                                          strategyName: opp.strategyName,
+                                          symbol: opp.symbol,
+                                          marketType: opp.marketType,
+                                          mode: operatingMode,
+                                          emittedSignal: opp,
+                                        })
+                                      )
+                                    }
+                                    className="min-h-[30px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/22 text-[11px] font-semibold text-cyan-100 inline-flex items-center gap-1 transition-colors"
+                                  >
+                                    <LineChart className="w-3 h-3 text-cyan-300" />
+                                    <span>График</span>
+                                    <ArrowUpRight className="w-3 h-3" />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => void handleSendSignalPush(opp)}
+                                  className="min-h-[30px] px-2.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-[11px] font-medium text-cyan-200 inline-flex items-center gap-1 transition-colors"
+                                >
+                                  <BellRing className="w-3 h-3" />
+                                  <span>{isPushDone ? 'Отправлено' : pushSubscribed ? 'В Push' : 'Вкл. Push'}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => void handleExecuteSignalViaApi(opp)}
+                                  className={`ml-auto min-h-[30px] px-2.5 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 transition-colors ${
+                                    activeTradeApiKey
+                                      ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                                      : 'border border-amber-400/40 bg-amber-500/15 hover:bg-amber-500/25 text-amber-200'
+                                  }`}
+                                >
+                                  <Send className="w-3 h-3" />
+                                  <span>
+                                    {isBusy
+                                      ? 'Отправка…'
+                                      : activeTradeApiKey
+                                        ? 'Через API'
+                                        : 'Подкл. API'}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-white/8 bg-[#0B0F17] px-3 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className="text-slate-300">
+                        {monitorLoading
+                          ? `Сканируем свечи 1H по ${watchedPairsCount} парам для ${activeCount} активных стратегий…`
+                          : `Сейчас ни одна из ${activeCount} активных стратегий не достигла порога уверенности. Реальный % близости и причина ожидания указаны на каждой активной карточке ниже.`}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSection('scanner')}
+                        className="text-cyan-300 hover:text-cyan-200 font-semibold whitespace-nowrap"
+                      >
+                        Сканировать все пары →
+                      </button>
+                    </div>
+                  )}
+                </section>
+              );
+            })()}
+
             <FeatureGuide
               title="Как работает Каталог стратегий (Спот + Фьючерсы)"
-              summary="Включайте и настраивайте 27 алгоритмических стратегий под свой риск, плечо и список пар. Бейдж Win Rate рассчитывается на реальных исторических свечах 1H."
+              summary="Включайте и настраивайте 27 алгоритмических стратегий под свой риск, плечо и список пар. Прогресс на активной карточке показывает реальное совпадение индикаторов до срабатывания сигнала."
               steps={[
-                'Фильтруйте стратегии по рынку (Спот / Фьючерсы), тарифу (Free / PRO / MAX) и статусу.',
-                'Нажмите «Настроить», чтобы изменить риск на сделку, плечо, порог уверенности и пары.',
-                'В Demo-режиме (вкладка «Защита» или бейдж тарифа сверху) можно свободно тестировать все PRO и MAX стратегии с локальным сохранением.',
+                'Включите нужные стратегии и выберите режим: «Сигналы (Экран + Push / TG)» или «API биржи (вход в 1 клик с обязательным подтверждением)».',
+                'Нажмите «Настроить», чтобы задать % риска на сделку, плечо, порог уверенности (например 65–75%) и отслеживаемые пары.',
+                'Когда условия на свечах совпадают выше вашего порога — сигнал сразу появляется в «Ленте живых сигналов» сверху и на самой карточке стратегии.',
               ]}
               compact
             />
@@ -833,6 +3121,109 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
               </motion.div>
             )}
 
+            {/* Заголовок списка стратегий с поясняющей подсказкой Strategy Mode (Paper vs Live) */}
+            <div className="relative rounded-xl border border-white/8 bg-[#111827]/90 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <span className="text-xs font-semibold text-white">Список стратегий</span>
+                <span className="text-[11px] font-mono text-slate-400">
+                  ({displayList.length} из {STRATEGY_CATALOG.length})
+                </span>
+                <span className="text-slate-600" aria-hidden="true">·</span>
+                <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-300">
+                  <span>Режим:</span>
+                  <strong
+                    className={
+                      operatingMode === 'live' ? 'text-cyan-300 font-semibold' : 'text-emerald-300 font-semibold'
+                    }
+                  >
+                    {operatingMode === 'live' ? 'Live Trading (API)' : 'Paper Trading'}
+                  </strong>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerHaptic(6);
+                      setStrategyModeTooltipOpen((prev) => !prev);
+                    }}
+                    aria-expanded={strategyModeTooltipOpen}
+                    aria-label="Пояснение режима работы стратегий: Paper Trading и Live Trading"
+                    className={`w-5 h-5 rounded-full inline-flex items-center justify-center border transition-colors ${
+                      strategyModeTooltipOpen
+                        ? 'border-cyan-400/60 bg-cyan-500/20 text-cyan-200'
+                        : 'border-white/15 bg-white/5 text-slate-300 hover:text-white hover:border-cyan-400/45'
+                    }`}
+                  >
+                    <Info className="w-3 h-3" />
+                  </button>
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono text-slate-400">
+                {liveVerification.verifiedLive && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-200 font-bold">
+                    <ShieldCheck className="w-3 h-3 text-emerald-300 shrink-0" />
+                    <span>Verified Live</span>
+                  </span>
+                )}
+                <span className="px-1.5 py-0.5 rounded bg-emerald-500/12 border border-emerald-500/25 text-emerald-300">
+                  В активной стратегии нажмите «График» → видны SL / Вход / TP
+                </span>
+              </div>
+
+              {strategyModeTooltipOpen && (
+                <div
+                  role="tooltip"
+                  className="w-full mt-1 rounded-xl border border-cyan-400/35 bg-[#070B12] p-3 text-xs space-y-2 shadow-xl"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="font-semibold text-white">
+                      Режим работы стратегий (Strategy Mode)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setStrategyModeTooltipOpen(false)}
+                      aria-label="Закрыть подсказку"
+                      className="text-slate-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] leading-relaxed">
+                    <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/[0.06] p-2.5">
+                      <div className="font-semibold text-emerald-300 mb-0.5">
+                        Paper Trading (Симуляция)
+                      </div>
+                      <p className="text-slate-300">
+                        Работает внутри симулированных данных терминала: движок генерирует сигналы (Вход, SL, TP1, TP2) и отслеживает их прогресс без использования реальных средств.
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/[0.06] p-2.5">
+                      <div className="font-semibold text-cyan-200 mb-0.5">
+                        Live Trading (Биржевые ордера)
+                      </div>
+                      <p className="text-slate-300">
+                        Требует активный API-ключ биржи (Binance / Bybit / OKX) с правами торговли для исполнения ордеров на вашей бирже с обязательным подтверждением каждого ордера.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                    <span className="text-[10px] text-slate-400">
+                      Состояния автомата: Idle (выкл) → Monitoring (поиск сигнала) → Execution (сигнал / ордер).
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStrategyModeTooltipOpen(false);
+                        setModeInfoOpen(true);
+                      }}
+                      className="text-[11px] font-semibold text-cyan-300 hover:text-cyan-200"
+                    >
+                      Подробное сравнение →
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <AnimatePresence mode="popLayout" initial={false}>
                 {displayList.map(({ tpl, cfg }, idx) => {
@@ -867,7 +3258,7 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                       exit={{ opacity: 0, y: -10, scale: 0.96 }}
                       whileHover={{ y: -2 }}
                       transition={{ duration: 0.22, delay: Math.min(idx * 0.02, 0.14), ease: [0.22, 1, 0.36, 1] }}
-                      className={`relative overflow-hidden rounded-2xl border card-surface-glow p-4 flex flex-col justify-between gap-3.5 transition-colors ${
+                      className={`cv-card-item relative overflow-hidden rounded-2xl border card-surface-glow p-4 flex flex-col justify-between gap-3.5 transition-colors ${
                         isMaxStrategy
                           ? 'bg-gradient-to-br from-cyan-500/[0.06] via-[#111827] to-emerald-500/[0.04]'
                           : 'bg-[#111827]'
@@ -1025,36 +3416,17 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                           </div>
 
                           {(isMaxStrategy || isHighWinRate) && (
-                            <div className="space-y-1">
-                              <div className="relative h-1.5 w-full rounded-full bg-white/8 overflow-hidden">
-                                <div
-                                  className={`progress-bar-shine h-full rounded-full transition-all duration-500 ${
-                                    isMaxStrategy
-                                      ? 'bg-gradient-to-r from-cyan-400 to-emerald-400'
-                                      : 'bg-emerald-400'
-                                  }`}
-                                  style={{ width: `${Math.min(100, Math.max(6, bt.winRatePct))}%` }}
-                                />
-                                {/* 55% Win Rate benchmark marker */}
-                                <span
-                                  aria-hidden="true"
-                                  title="Порог 55% Win Rate"
-                                  className="absolute top-0 bottom-0 w-[1.5px] bg-white/70"
-                                  style={{ left: '55%' }}
-                                />
-                              </div>
-                              <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] font-mono tabular-nums">
-                                <span className={isMaxStrategy ? 'text-cyan-300 font-semibold' : 'text-emerald-300'}>
-                                  {isMaxStrategy
-                                    ? `MAX High-WR · ${bt.winRatePct}% (порог 55%)`
-                                    : `Повышенный WR · ${bt.winRatePct}%`}
+                            <div className="flex flex-wrap items-center justify-between gap-1 pt-1 border-t border-white/6 text-[10px] font-mono tabular-nums">
+                              <span className={isMaxStrategy ? 'text-cyan-300 font-semibold' : 'text-emerald-300'}>
+                                {isMaxStrategy
+                                  ? `MAX High-WR · ${bt.winRatePct}% (порог 55%)`
+                                  : `Повышенный WR · ${bt.winRatePct}%`}
+                              </span>
+                              {wrDeltaVsFree !== null && wrDeltaVsFree > 0 && (
+                                <span className="text-emerald-300 font-semibold">
+                                  +{wrDeltaVsFree} п.п. к Free
                                 </span>
-                                {wrDeltaVsFree !== null && wrDeltaVsFree > 0 && (
-                                  <span className="text-emerald-300 font-semibold">
-                                    +{wrDeltaVsFree} п.п. к Free
-                                  </span>
-                                )}
-                              </div>
+                              )}
                             </div>
                           )}
 
@@ -1069,6 +3441,46 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                         <div className="mt-2.5 rounded-xl border border-cyan-400/20 bg-cyan-500/[0.05] px-2.5 py-2 flex items-center justify-between gap-2 text-[11px]">
                           <span className="text-cyan-200 font-medium">Профиль высокой точности MAX (WR 55%+)</span>
                           <span className="font-mono text-[10px] text-slate-400">Бэктест 1H…</span>
+                        </div>
+                      ) : null}
+
+                      {isActive && cfg ? (
+                        <ActiveStrategyLiveProgress
+                          strategyKey={tpl.key}
+                          strategyName={tpl.name}
+                          leadSymbol={cfg.pairs[0] || 'BTCUSDT'}
+                          pairsCount={cfg.pairs.length}
+                          marketType={tpl.marketType}
+                          minConfidence={cfg.minConfidence}
+                          riskPerTradePct={cfg.riskPerTradePct}
+                          isMaxStrategy={isMaxStrategy}
+                          operatingMode={operatingMode}
+                          engineState={simulationSnapshot.statesByKey[tpl.key] ?? 'Monitoring'}
+                          verifiedLive={liveVerification.verifiedLive}
+                          telemetry={activeMonitorReport?.strategyTelemetry?.[tpl.key]}
+                          emittedSignal={activeMonitorReport?.opportunities.find(
+                            (o) => o.strategyKey === tpl.key
+                          )}
+                          placedOrder={placedOrdersByStrategy[tpl.key]}
+                          isScanning={monitorLoading}
+                          hasTradeApiKey={Boolean(activeTradeApiKey)}
+                          onOpenPairOnMarket={onOpenPairOnMarket}
+                          onExecuteSignalViaApi={(opp) => void handleExecuteSignalViaApi(opp)}
+                          onClearPlacedOrder={() => {
+                            const next = { ...placedOrdersByStrategy };
+                            delete next[tpl.key];
+                            persistPlacedOrders(next);
+                          }}
+                        />
+                      ) : !isLockedForUser ? (
+                        <div className="mt-2.5 rounded-xl border border-white/8 bg-[#0B0F17]/70 px-2.5 py-2 flex items-center justify-between gap-2 text-[11px]">
+                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-white/10 bg-white/5 text-slate-400 font-semibold text-[10px]">
+                            <PauseCircle className="w-3 h-3 text-slate-500 shrink-0" />
+                            <span>Idle</span>
+                          </span>
+                          <span className="text-[10px] text-slate-500 truncate">
+                            Включите стратегию для перехода в Monitoring Signal
+                          </span>
                         </div>
                       ) : null}
                     </div>
@@ -1336,8 +3748,85 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
           </div>
         )}
 
-        {section === 'scanner' && (
+        {(section === 'scanner' || section === 'signals') && (
           <div className="space-y-4">
+            {/* Sub-tab Switcher: AI-Сканер | Лента сигналов (keeps main nav symmetric 2x3) */}
+            <div
+              role="tablist"
+              aria-label="Подраздел AI-сканера"
+              className="grid grid-cols-2 gap-1 p-1 rounded-xl border border-white/10 bg-[#0B0F17]"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={scannerSubTab === 'scanner' && section !== 'signals'}
+                onClick={() => {
+                  triggerHaptic(8);
+                  setSection('scanner');
+                  setScannerSubTab('scanner');
+                }}
+                className={`min-h-[38px] px-3 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-1.5 whitespace-nowrap transition-colors ${
+                  scannerSubTab === 'scanner' && section !== 'signals'
+                    ? 'bg-cyan-500 text-slate-950'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Radar className="w-3.5 h-3.5 shrink-0" />
+                <span>AI-сканер</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={scannerSubTab === 'signals' || section === 'signals'}
+                onClick={() => {
+                  triggerHaptic(8);
+                  setSection('scanner');
+                  setScannerSubTab('signals');
+                }}
+                className={`min-h-[38px] px-3 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-1.5 whitespace-nowrap transition-colors ${
+                  scannerSubTab === 'signals' || section === 'signals'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Radio className="w-3.5 h-3.5 shrink-0" />
+                <span>Лента сигналов</span>
+                {signalStreamCount > 0 && (
+                  <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-black/25">
+                    {signalStreamCount}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {scannerSubTab === 'signals' || section === 'signals' ? (
+              <LiveSignalFeed
+                activeCount={activeCount}
+                analyses={analyses}
+                operatingMode={operatingMode}
+                verifiedLive={liveVerification.verifiedLive}
+                verifiedExchangeLabel={
+                  liveVerification.selectedKey
+                    ? `${liveVerification.selectedKey.exchange.toUpperCase()} · ${liveVerification.selectedKey.label}`
+                    : null
+                }
+                monitorLoading={monitorLoading}
+                apiOrderBusyKey={apiOrderBusyKey}
+                pushSentKeys={pushSentKeys}
+                placedOrdersByStrategy={placedOrdersByStrategy}
+                pushSubscribed={pushSubscribed}
+                hasTradeApiKey={Boolean(activeTradeApiKey)}
+                exchangeStrip={renderExchangeConnectionStrip()}
+                onRefreshStream={() => void runActiveStrategiesMonitor()}
+                onOpenModeInfo={() => setModeInfoOpen(true)}
+                onOpenApiGuide={() => setApiGuideOpen(true)}
+                onGoToCatalog={() => setSection('catalog')}
+                onOpenPairOnMarket={onOpenPairOnMarket}
+                onSendSignalPush={(opp) => void handleSendSignalPush(opp)}
+                onExecuteSignalViaApi={(opp) => void handleExecuteSignalViaApi(opp)}
+              />
+            ) : (
+            <div className="space-y-4">
             <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-4 sm:p-5 space-y-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
@@ -1432,6 +3921,11 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
 
                 {scannerReport && (
                   <span className="ml-auto font-mono text-[11px] text-slate-400">
+                    {scannerIsLocal && (
+                      <span className="text-emerald-300 font-sans font-medium mr-1.5">
+                        Локальный расчёт ·
+                      </span>
+                    )}
                     Охват: {scannerReport.scannedPairsCount}/{scannerReport.totalPairsAvailable} пар · Найдено:{' '}
                     <strong className="text-white">{scannerReport.opportunities.length}</strong>
                   </span>
@@ -1463,13 +3957,41 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             </div>
 
             {scannerReport && scannerReport.opportunities.length === 0 && !scannerLoading && (
-              <div className="rounded-2xl border border-white/8 bg-[#111827] p-8 text-center space-y-2">
-                <p className="text-sm text-slate-300">
-                  При пороге уверенности {scannerMinConf}% активных сетапов по выбранным парам сейчас нет.
+              <div className="rounded-2xl border border-white/8 bg-[#111827] p-6 sm:p-8 text-center space-y-3">
+                <p className="text-sm font-semibold text-white">
+                  Сетапов с уверенностью ≥{scannerMinConf}% сейчас нет
                 </p>
-                <p className="text-xs text-slate-500">
-                  Понизьте порог уверенности или обновите сканер после закрытия следующей свечи.
+                <p className="text-xs text-slate-400">
+                  Понизьте минимальный порог уверенности или расширьте фильтр рынка до «Все рынки».
                 </p>
+                <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                  {scannerMinConf > 70 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        setScannerMinConf(70);
+                        void runLiveScanner(undefined, { minConf: 70, forceLocal: scannerIsLocal });
+                      }}
+                      className="min-h-[38px] px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-semibold transition-colors"
+                    >
+                      Снизить порог до 70%
+                    </button>
+                  )}
+                  {scannerMarket !== 'all' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        setScannerMarket('all');
+                        void runLiveScanner(undefined, { market: 'all', forceLocal: scannerIsLocal });
+                      }}
+                      className="min-h-[38px] px-4 rounded-xl border border-white/12 bg-white/5 hover:bg-white/10 text-slate-200 text-xs font-medium transition-colors"
+                    >
+                      Показать все рынки
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 
@@ -1543,17 +4065,47 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                         {opp.change24hPct.toFixed(1)}%
                       </span>
                     </div>
-                    {onOpenPairOnMarket && (
+                    <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                      {onOpenPairOnMarket && (
+                        <motion.button
+                          whileTap={{ scale: 0.96 }}
+                          type="button"
+                          onClick={() =>
+                            onOpenPairOnMarket(
+                              opp.symbol,
+                              opp.marketType,
+                              buildStrategySignalOverlay({
+                                strategyKey: opp.strategyKey,
+                                strategyName: opp.strategyName,
+                                symbol: opp.symbol,
+                                marketType: opp.marketType,
+                                mode: operatingMode,
+                                emittedSignal: opp,
+                              })
+                            )
+                          }
+                          className="font-sans min-h-[32px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 font-semibold inline-flex items-center justify-center gap-1 whitespace-nowrap shrink-0 transition-colors"
+                        >
+                          <LineChart className="w-3.5 h-3.5 shrink-0" />
+                          <span>На график</span>
+                          <ArrowUpRight className="w-3.5 h-3.5 shrink-0" />
+                        </motion.button>
+                      )}
                       <motion.button
                         whileTap={{ scale: 0.96 }}
                         type="button"
-                        onClick={() => onOpenPairOnMarket(opp.symbol, opp.marketType)}
-                        className="font-sans min-h-[32px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 font-semibold inline-flex items-center justify-center gap-1 whitespace-nowrap shrink-0 transition-colors"
+                        disabled={apiOrderBusyKey === `${opp.strategyKey}-${opp.symbol}-${opp.direction}`}
+                        onClick={() => void handleExecuteSignalViaApi(opp)}
+                        className={`font-sans min-h-[32px] px-2.5 rounded-lg font-semibold inline-flex items-center justify-center gap-1 whitespace-nowrap shrink-0 transition-colors ${
+                          activeTradeApiKey
+                            ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                            : 'border border-amber-400/35 bg-amber-500/12 hover:bg-amber-500/22 text-amber-200'
+                        }`}
                       >
-                        <span>На график</span>
-                        <ArrowUpRight className="w-3.5 h-3.5 shrink-0" />
+                        <Send className="w-3 h-3 shrink-0" />
+                        <span>{activeTradeApiKey ? 'Через API' : 'API биржи'}</span>
                       </motion.button>
-                    )}
+                    </div>
                   </div>
                 </motion.div>
               ))}
@@ -1562,6 +4114,8 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             <NonCustodialRiskNotice
               text="Сигналы Live-сканера носят аналитический характер. VERNIER не принимает и не хранит ваши деньги; любые реальные сделки на бирже (вручную или через API) открываются исключительно по вашему решению и под вашу финансовую ответственность."
             />
+            </div>
+            )}
           </div>
         )}
 
@@ -1593,11 +4147,17 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
             />
             {/* PRO #9: Сравнение 2 стратегий бок о бок с комиссией и проскальзыванием */}
             <StrategyComparisonPanel breakdown={Object.values(catalogBacktest)} />
-            {/* MAX #7: Симулятор Монте-Карло (500 прогонов) + Критерий Келли */}
-            <MonteCarloSimulator
-              isMax={isMax}
-              onUpgradeMax={() => void onSwitchPlan('max', selectedMaxMultiplier)}
-            />
+            {/* MAX #7: Симулятор Монте-Карло (500 прогонов) + Критерий Келли (ленивая загрузка) */}
+            <Suspense
+              fallback={
+                <div className="h-[340px] rounded-2xl border border-white/8 bg-[#111827] shimmer-skeleton" />
+              }
+            >
+              <MonteCarloSimulator
+                isMax={isMax}
+                onUpgradeMax={() => void onSwitchPlan('max', selectedMaxMultiplier)}
+              />
+            </Suspense>
           </div>
         )}
 
@@ -1613,14 +4173,20 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         )}
 
         {section === 'journal' && (
-          <TradeJournal
-            uid={isSignedIn ? uid : null}
-            isPro={isPro}
-            isMax={isMax}
-            privacyMode={privacyMode}
-            onUpgradePro={() => void onSwitchPlan('pro')}
-            onRequireLogin={onRequireLogin}
-          />
+          <Suspense
+            fallback={
+              <div className="h-[380px] rounded-2xl border border-white/8 bg-[#111827] shimmer-skeleton" />
+            }
+          >
+            <TradeJournal
+              uid={isSignedIn ? uid : null}
+              isPro={isPro}
+              isMax={isMax}
+              privacyMode={privacyMode}
+              onUpgradePro={() => void onSwitchPlan('pro')}
+              onRequireLogin={onRequireLogin}
+            />
+          </Suspense>
         )}
 
         {section === 'plans' && (
@@ -1829,23 +4395,233 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         )}
       </WorkspaceShell>
 
-      <NoCodeStrategyBuilderModal
-        open={builderOpen}
-        onClose={() => setBuilderOpen(false)}
-        onSaved={(nextList) => {
-          setCustomStrategies(nextList);
-          setFeedback({
-            text: `Пользовательская стратегия «${nextList[0]?.name ?? 'Новая'}» добавлена в каталог.`,
-            tone: 'success',
-          });
-        }}
-      />
+      {builderOpen && (
+        <Suspense fallback={null}>
+          <NoCodeStrategyBuilderModal
+            open={builderOpen}
+            onClose={() => setBuilderOpen(false)}
+            onSaved={(nextList) => {
+              setCustomStrategies(nextList);
+              setFeedback({
+                text: `Пользовательская стратегия «${nextList[0]?.name ?? 'Новая'}» добавлена в каталог.`,
+                tone: 'success',
+              });
+            }}
+          />
+        </Suspense>
+      )}
 
-      <WebhookBuilderModal
-        open={webhookOpen}
-        onClose={() => setWebhookOpen(false)}
-        sampleSymbol="BTCUSDT"
-        samplePrice={94250}
+      {webhookOpen && (
+        <Suspense fallback={null}>
+          <WebhookBuilderModal
+            open={webhookOpen}
+            onClose={() => setWebhookOpen(false)}
+            sampleSymbol="BTCUSDT"
+            samplePrice={94250}
+          />
+        </Suspense>
+      )}
+
+      {/* Информационная модалка: Paper Trading (Сигналы) vs Live Trading (API биржи) */}
+      <AnimatePresence>
+        {modeInfoOpen && (
+          <motion.div
+            key="strategy-mode-info-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            onClick={() => setModeInfoOpen(false)}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Сравнение режимов Paper Trading и Live Trading"
+            className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/80 backdrop-blur-sm p-0 sm:p-4"
+          >
+            <motion.div
+              key="strategy-mode-info-card"
+              initial={{ opacity: 0, y: 24, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 16, scale: 0.98 }}
+              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-xl max-h-[90dvh] flex flex-col rounded-t-2xl sm:rounded-2xl border border-white/12 bg-[#0E1420] shadow-2xl overflow-hidden"
+            >
+              <header className="px-4 sm:px-5 py-3.5 border-b border-white/8 flex items-center justify-between gap-3 bg-[#090D16]">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-9 h-9 rounded-xl bg-cyan-500/15 border border-cyan-500/35 flex items-center justify-center text-cyan-300 shrink-0">
+                    <Info className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-sm sm:text-base font-bold text-white truncate">
+                      Paper Trading vs Live Trading
+                    </h3>
+                    <p className="text-[11px] text-slate-400">
+                      Как именно работают ваши активные стратегии прямо сейчас
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setModeInfoOpen(false)}
+                  aria-label="Закрыть справку по режимам"
+                  className="min-h-[36px] min-w-[36px] rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 flex items-center justify-center shrink-0 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </header>
+
+              <div className="flex-1 overflow-y-auto px-4 sm:px-5 py-4 space-y-3.5 text-xs">
+                {/* Текущий статус */}
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/[0.08] px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-slate-200">
+                    Ваш текущий режим:{' '}
+                    <strong className={executionMode === 'api_confirm' ? 'text-cyan-300' : 'text-emerald-300'}>
+                      {executionMode === 'api_confirm'
+                        ? 'Live Trading (API биржи + подтверждение)'
+                        : 'Paper Trading / Сигналы'}
+                    </strong>
+                  </span>
+                  <span className="font-mono text-[10px] px-2 py-0.5 rounded bg-black/40 text-slate-300">
+                    {activeTradeApiKey
+                      ? `Trade API: ${activeTradeApiKey.exchange.toUpperCase()}`
+                      : 'Trade API не подключён'}
+                  </span>
+                </div>
+
+                {/* Карточка 1: Paper Trading / Сигналы */}
+                <div
+                  className={`rounded-xl border p-3.5 space-y-2 ${
+                    executionMode === 'signals'
+                      ? 'border-emerald-400/50 bg-emerald-500/[0.06]'
+                      : 'border-white/10 bg-[#111827]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-white inline-flex items-center gap-1.5 text-sm">
+                      <BellRing className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>1. Paper Trading / Режим сигналов</span>
+                    </span>
+                    {executionMode === 'signals' && (
+                      <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 border border-emerald-400/40 font-mono text-[10px] font-bold text-emerald-300">
+                        ВЫБРАН
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-300 leading-relaxed">
+                    Движок анализирует реальные биржевые свечи и публикует готовые сигналы (Зона входа, Stop-Loss, TP1, TP2) в «Ленте сигналов» и Push/Telegram-уведомлениях.
+                  </p>
+                  <ul className="space-y-1 text-slate-400">
+                    <li>• <strong className="text-slate-200">Нулевой риск реальных средств:</strong> ордера на биржу не отправляются.</li>
+                    <li>• Можно тестировать идеи на виртуальном тренажёре Paper Trading ($10,000) в разделе «Рынок» или открывать сделки вручную.</li>
+                    <li>• API-ключ биржи не требуется.</li>
+                  </ul>
+                  {executionMode !== 'signals' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleSetExecutionMode('signals');
+                        setModeInfoOpen(false);
+                      }}
+                      className="mt-1 min-h-[34px] px-3 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 font-semibold transition-colors"
+                    >
+                      Переключиться на Paper / Сигналы
+                    </button>
+                  )}
+                </div>
+
+                {/* Карточка 2: Read-Only / Testnet API (безопасный режим без реального автоисполнения) */}
+                <div
+                  className={`rounded-xl border p-3.5 space-y-2 ${
+                    executionMode === 'api_confirm'
+                      ? 'border-cyan-400/50 bg-cyan-500/[0.06]'
+                      : 'border-white/10 bg-[#111827]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-white inline-flex items-center gap-1.5 text-sm">
+                      <KeyRound className="w-4 h-4 text-cyan-400 shrink-0" />
+                      <span>2. Read-Only / Testnet API биржи</span>
+                    </span>
+                    {executionMode === 'api_confirm' && (
+                      <span className="px-2 py-0.5 rounded-md bg-cyan-500/20 border border-cyan-400/40 font-mono text-[10px] font-bold text-cyan-200">
+                        ВЫБРАН
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-300 leading-relaxed">
+                    Синхронизирует реальный баланс портфеля с Binance, Bybit или OKX по ключу Read-Only и позволяет проверять исполнение ордеров в безопасной песочнице Testnet.
+                  </p>
+                  <ul className="space-y-1 text-slate-400">
+                    <li>• <strong className="text-amber-200">Политика безопасности сервера:</strong> реальное автоисполнение ордеров на Mainnet отключено в целях защиты капитала.</li>
+                    <li>• <strong className="text-slate-200">Non-Custodial:</strong> деньги всегда остаются на вашей бирже — права на вывод средств (Withdrawals) никогда не запрашиваются.</li>
+                    <li>• Каждое тестовое действие в Testnet требует ручного подтверждения (+ 2FA при включении).</li>
+                  </ul>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    {executionMode !== 'api_confirm' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          handleSetExecutionMode('api_confirm');
+                          setModeInfoOpen(false);
+                        }}
+                        className="min-h-[34px] px-3 rounded-lg border border-cyan-500/40 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 font-semibold transition-colors"
+                      >
+                        Подключить Read-Only / Testnet API
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic(8);
+                        setModeInfoOpen(false);
+                        setApiGuideOpen(true);
+                      }}
+                      className="min-h-[34px] px-3 rounded-lg border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/20 text-cyan-200 font-medium inline-flex items-center gap-1.5 transition-colors"
+                    >
+                      <BookOpen className="w-3.5 h-3.5 shrink-0" />
+                      <span>Как получить API-ключ?</span>
+                    </button>
+                    {onOpenExchangeIntegrations && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setModeInfoOpen(false);
+                          window.requestAnimationFrame(() => {
+                            window.setTimeout(() => onOpenExchangeIntegrations(), 60);
+                          });
+                        }}
+                        className="min-h-[34px] px-3 rounded-lg border border-white/12 bg-white/5 hover:bg-white/10 text-slate-200 font-medium inline-flex items-center gap-1.5 transition-colors"
+                      >
+                        <Link2 className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Настроить API-ключи</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <footer className="px-4 sm:px-5 py-3 border-t border-white/8 bg-[#090D16] flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                <span className="inline-flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>Ключи шифруются AES-256-GCM · без прав на вывод</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setModeInfoOpen(false)}
+                  className="min-h-[34px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
+                >
+                  Понятно
+                </button>
+              </footer>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <ExchangeApiGuideModal
+        open={apiGuideOpen}
+        onClose={() => setApiGuideOpen(false)}
+        onOpenExchangeIntegrations={onOpenExchangeIntegrations}
       />
     </StaggerDeck>
   );

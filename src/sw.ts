@@ -1,9 +1,10 @@
 /// <reference lib="webworker" />
+import { CacheableResponsePlugin } from 'workbox-cacheable-response';
 import { clientsClaim } from 'workbox-core';
 import { ExpirationPlugin } from 'workbox-expiration';
 import { cleanupOutdatedCaches, precacheAndRoute } from 'workbox-precaching';
 import { registerRoute } from 'workbox-routing';
-import { CacheFirst } from 'workbox-strategies';
+import { CacheFirst, NetworkFirst } from 'workbox-strategies';
 
 declare let self: ServiceWorkerGlobalScope;
 
@@ -13,11 +14,54 @@ clientsClaim();
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST);
 
+// Cache-First для статических ассетов, иконок и изображений
+registerRoute(
+  ({ request, url }) =>
+    url.origin === self.location.origin &&
+    (request.destination === 'image' ||
+      request.destination === 'font' ||
+      url.pathname.startsWith('/assets/') ||
+      url.pathname.startsWith('/brand/')),
+  new CacheFirst({
+    cacheName: 'vernier-static-assets-v1',
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
+      new ExpirationPlugin({
+        maxEntries: 80,
+        maxAgeSeconds: 60 * 60 * 24 * 30,
+      }),
+    ],
+  })
+);
+
+// Network-First с безопасным фолбэком для публичных read-only API (котировки, новости, календарь, Fear & Greed)
+// Приватные эндпоинты (auth, security, exchanges, entitlements, billing) НИКОГДА не кэшируются!
+registerRoute(
+  ({ request, url }) =>
+    request.method === 'GET' &&
+    url.origin === self.location.origin &&
+    (url.pathname.startsWith('/api/market/') ||
+      url.pathname === '/api/news' ||
+      url.pathname === '/api/economic-calendar'),
+  new NetworkFirst({
+    cacheName: 'vernier-public-api-v1',
+    networkTimeoutSeconds: 5,
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [200] }),
+      new ExpirationPlugin({
+        maxEntries: 60,
+        maxAgeSeconds: 60 * 15,
+      }),
+    ],
+  })
+);
+
 registerRoute(
   /^https:\/\/fonts\.googleapis\.com\/.*/i,
   new CacheFirst({
     cacheName: 'google-fonts-cache',
     plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
       new ExpirationPlugin({
         maxEntries: 10,
         maxAgeSeconds: 60 * 60 * 24 * 365,
@@ -31,6 +75,7 @@ registerRoute(
   new CacheFirst({
     cacheName: 'gstatic-fonts-cache',
     plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
       new ExpirationPlugin({
         maxEntries: 10,
         maxAgeSeconds: 60 * 60 * 24 * 365,
@@ -52,7 +97,7 @@ self.addEventListener('push', (event: PushEvent) => {
   let payload: PushPayload = {
     title: 'Vernier · Рыночный сигнал',
     body: 'Зафиксировано важное движение рынка или новый торговый сигнал.',
-    tag: 'aegisquant-alert',
+    tag: 'vernier-alert',
     url: '/?tab=market',
     impact: 'MEDIUM',
   };
@@ -71,7 +116,7 @@ self.addEventListener('push', (event: PushEvent) => {
     body: payload.body,
     icon: '/pwa-192x192.png',
     badge: '/pwa-192x192.png',
-    tag: payload.tag || 'aegisquant-alert',
+    tag: payload.tag || 'vernier-alert',
     data: {
       url: payload.url || '/?tab=market',
       category: payload.category || 'market',

@@ -64,6 +64,8 @@ export const LockScreenOverlay: React.FC<LockScreenOverlayProps> = ({
           <img
             src="/src/assets/images/terminal_icon_vault_1794855844198.jpg"
             alt="2FA Защита Vernier"
+            width={64}
+            height={64}
             referrerPolicy="no-referrer"
             className="w-full h-full object-cover"
           />

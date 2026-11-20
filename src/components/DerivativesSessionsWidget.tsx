@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import {
   Clock,
   Flame,
@@ -10,10 +10,14 @@ import {
 import { useFearGreed } from '../contexts/FearGreedContext';
 import { usePlan } from '../contexts/PlanContext';
 import { triggerHaptic } from '../lib/securityDlp';
+import { isPageVisible, subscribePageVisibility } from '../utils/cache';
 import type { TickerOverview } from '../types/domain';
 import { FeatureGuide } from './FeatureGuide';
-import { LiquidationHeatmapWidget } from './LiquidationHeatmapWidget';
 import { PaywallGate } from './PaywallGate';
+
+const LiquidationHeatmapWidget = lazy(() =>
+  import('./LiquidationHeatmapWidget').then((m) => ({ default: m.LiquidationHeatmapWidget }))
+);
 
 interface DerivativesSessionsWidgetProps {
   activeTicker: TickerOverview | null;
@@ -77,6 +81,78 @@ function computeTradingSession(now: Date): SessionStatus {
   };
 }
 
+interface RadarRowItem {
+  symbol: string;
+  baseAsset: string;
+  price: number;
+  change24hPct: number;
+  fr: number;
+  oiChangePct: number;
+  cvdScore: number;
+  basisPct: number;
+  isHotFunding: boolean;
+  isOiDivergence: boolean;
+  isCvdAnomaly: boolean;
+  isHighBasis: boolean;
+  anomalyTag: string;
+  score: number;
+}
+
+const DerivativesRadarRow = React.memo(
+  ({
+    row,
+    onSelectSymbol,
+  }: {
+    row: RadarRowItem;
+    onSelectSymbol?: (symbol: string) => void;
+  }) => (
+    <tr
+      onClick={() => {
+        triggerHaptic(8);
+        onSelectSymbol?.(row.symbol);
+      }}
+      className="cv-list-item hover:bg-cyan-500/[0.07] cursor-pointer transition-colors"
+    >
+      <td className="py-2 px-1.5 min-w-0">
+        <div className="font-bold text-white flex items-center gap-0.5 truncate">
+          <span className="truncate">{row.baseAsset}</span>
+          <span className={row.change24hPct >= 0 ? 'text-emerald-400 shrink-0' : 'text-rose-400 shrink-0'}>
+            {row.change24hPct >= 0 ? (
+              <TrendingUp className="w-2.5 h-2.5 inline" />
+            ) : (
+              <TrendingDown className="w-2.5 h-2.5 inline" />
+            )}
+          </span>
+        </div>
+        <div className="font-sans text-[9.5px] text-cyan-300/90 truncate">{row.anomalyTag}</div>
+      </td>
+      <td className="py-2 px-1 text-right whitespace-nowrap">
+        <span className={Math.abs(row.fr) >= 0.025 ? 'text-amber-300 font-bold' : 'text-slate-200'}>
+          {row.fr >= 0 ? '+' : ''}
+          {row.fr.toFixed(2)}%
+        </span>
+      </td>
+      <td className="py-2 px-1 text-right whitespace-nowrap">
+        <span className={row.oiChangePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+          {row.oiChangePct >= 0 ? '+' : ''}
+          {row.oiChangePct}%
+        </span>
+      </td>
+      <td className="py-2 px-1 text-right whitespace-nowrap">
+        <span className={row.cvdScore >= 0 ? 'text-cyan-300' : 'text-rose-300'}>
+          {row.cvdScore >= 0 ? '+' : ''}
+          {row.cvdScore}
+        </span>
+      </td>
+      <td className="py-2 px-1.5 text-right whitespace-nowrap text-slate-200">
+        {row.basisPct >= 0 ? '+' : ''}
+        {row.basisPct}%
+      </td>
+    </tr>
+  )
+);
+DerivativesRadarRow.displayName = 'DerivativesRadarRow';
+
 export const DerivativesSessionsWidget: React.FC<DerivativesSessionsWidgetProps> = ({
   activeTicker,
   allTickers,
@@ -96,10 +172,36 @@ export const DerivativesSessionsWidget: React.FC<DerivativesSessionsWidgetProps>
   const [tab, setTab] = useState<WidgetTab>('sessions');
   const [radarFilter, setRadarFilter] = useState<RadarFilter>('ALL');
 
+  // Тикаем таймер только на вкладке «Сессии» и только когда вкладка браузера видима (экономия батареи)
   useEffect(() => {
-    const id = window.setInterval(() => setNow(new Date()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+    if (tab !== 'sessions') return;
+    let id: number | null = null;
+
+    const start = () => {
+      if (id !== null) return;
+      setNow(new Date());
+      id = window.setInterval(() => {
+        if (isPageVisible()) setNow(new Date());
+      }, 1000);
+    };
+    const stop = () => {
+      if (id !== null) {
+        window.clearInterval(id);
+        id = null;
+      }
+    };
+
+    if (isPageVisible()) start();
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) start();
+      else stop();
+    });
+
+    return () => {
+      stop();
+      unsubVis();
+    };
+  }, [tab]);
 
   const session = useMemo(() => computeTradingSession(now), [now]);
 
@@ -383,52 +485,11 @@ export const DerivativesSessionsWidget: React.FC<DerivativesSessionsWidgetProps>
                     </tr>
                   ) : (
                     radarRows.map((row) => (
-                      <tr
+                      <DerivativesRadarRow
                         key={row.symbol}
-                        onClick={() => {
-                          triggerHaptic(8);
-                          onSelectSymbol?.(row.symbol);
-                        }}
-                        className="hover:bg-cyan-500/[0.07] cursor-pointer transition-colors"
-                      >
-                        <td className="py-2 px-1.5 min-w-0">
-                          <div className="font-bold text-white flex items-center gap-0.5 truncate">
-                            <span className="truncate">{row.baseAsset}</span>
-                            <span className={row.change24hPct >= 0 ? 'text-emerald-400 shrink-0' : 'text-rose-400 shrink-0'}>
-                              {row.change24hPct >= 0 ? (
-                                <TrendingUp className="w-2.5 h-2.5 inline" />
-                              ) : (
-                                <TrendingDown className="w-2.5 h-2.5 inline" />
-                              )}
-                            </span>
-                          </div>
-                          <div className="font-sans text-[9.5px] text-cyan-300/90 truncate">
-                            {row.anomalyTag}
-                          </div>
-                        </td>
-                        <td className="py-2 px-1 text-right whitespace-nowrap">
-                          <span className={Math.abs(row.fr) >= 0.025 ? 'text-amber-300 font-bold' : 'text-slate-200'}>
-                            {row.fr >= 0 ? '+' : ''}
-                            {row.fr.toFixed(2)}%
-                          </span>
-                        </td>
-                        <td className="py-2 px-1 text-right whitespace-nowrap">
-                          <span className={row.oiChangePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                            {row.oiChangePct >= 0 ? '+' : ''}
-                            {row.oiChangePct}%
-                          </span>
-                        </td>
-                        <td className="py-2 px-1 text-right whitespace-nowrap">
-                          <span className={row.cvdScore >= 0 ? 'text-cyan-300' : 'text-rose-300'}>
-                            {row.cvdScore >= 0 ? '+' : ''}
-                            {row.cvdScore}
-                          </span>
-                        </td>
-                        <td className="py-2 px-1.5 text-right whitespace-nowrap text-slate-200">
-                          {row.basisPct >= 0 ? '+' : ''}
-                          {row.basisPct}%
-                        </td>
-                      </tr>
+                        row={row}
+                        onSelectSymbol={onSelectSymbol}
+                      />
                     ))
                   )}
                 </tbody>
@@ -438,14 +499,20 @@ export const DerivativesSessionsWidget: React.FC<DerivativesSessionsWidgetProps>
         </PaywallGate>
       )}
 
-      {/* MAX #2: Карта ликвидаций */}
+      {/* MAX #2: Карта ликвидаций (ленивая загрузка) */}
       {tab === 'liquidations' && (
-        <LiquidationHeatmapWidget
-          symbol={activeTicker?.symbol ?? 'BTCUSDT'}
-          currentPrice={activeTicker?.price ?? 94000}
-          volatilityPct={volatilityPct}
-          fundingRatePct={fundingPct}
-        />
+        <Suspense
+          fallback={
+            <div className="h-[240px] rounded-2xl border border-white/8 bg-[var(--surface-0)] shimmer-skeleton" />
+          }
+        >
+          <LiquidationHeatmapWidget
+            symbol={activeTicker?.symbol ?? 'BTCUSDT'}
+            currentPrice={activeTicker?.price ?? 94000}
+            volatilityPct={volatilityPct}
+            fundingRatePct={fundingPct}
+          />
+        </Suspense>
       )}
 
       <FeatureGuide

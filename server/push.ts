@@ -101,7 +101,7 @@ function loadOrCreateVapidKeys(): VapidKeys {
 }
 
 const vapidKeys = loadOrCreateVapidKeys();
-setVapidDetails('mailto:security@aegisquant.app', vapidKeys.publicKey, vapidKeys.privateKey);
+setVapidDetails('mailto:security@vernier-terminal.app', vapidKeys.publicKey, vapidKeys.privateKey);
 
 // Keyed by endpoint so each browser/device has a single canonical entry
 const subscriptionRegistry = new Map<string, StoredPushEntry>();

@@ -1,9 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { ChevronDown, ChevronUp, TrendingDown, TrendingUp } from 'lucide-react';
-import type { TickerOverview } from '../types/domain';
-import { fetchJsonWithBackoff, getCachedValue, setCachedValue, shouldApplyThrottledUpdate } from '../lib/marketCache';
+import { useLiveMarketSnapshot } from '../stores/liveMarketStore';
 
-const TICKER_CACHE_KEY = 'ticker_tape_spot_overview';
 const TICKER_COLLAPSED_KEY = 'vernier_ticker_collapsed_v1';
 
 function formatPrice(p: number): string {
@@ -18,9 +16,9 @@ interface TickerTapeProps {
 }
 
 export const TickerTape: React.FC<TickerTapeProps> = React.memo(({ embedded = false }) => {
-  const [tickers, setTickers] = useState<TickerOverview[]>(
-    () => getCachedValue<TickerOverview[]>(TICKER_CACHE_KEY)?.data ?? []
-  );
+  // Подписка на изолированный троттлированный стор живых котировок (не вызывает ререндер App.tsx)
+  const { tickers, isOnline: isOnlineStream } = useLiveMarketSnapshot('spot');
+
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     try {
@@ -29,37 +27,6 @@ export const TickerTape: React.FC<TickerTapeProps> = React.memo(({ embedded = fa
       return false;
     }
   });
-  const [isOnlineStream, setIsOnlineStream] = useState(false);
-  const mountedRef = useRef(true);
-
-  const loadTickers = useCallback(async () => {
-    const res = await fetchJsonWithBackoff<{ tickers?: TickerOverview[] }>(
-      '/api/market/overview?marketType=spot',
-      { retries: 1, timeoutMs: 8000 }
-    );
-    if (!mountedRef.current) return;
-    if (res.ok && res.data?.tickers?.length) {
-      setCachedValue(TICKER_CACHE_KEY, res.data.tickers, 25_000);
-      setIsOnlineStream(true);
-      if (shouldApplyThrottledUpdate('ticker-tape-render', 1000)) {
-        setTickers(res.data.tickers);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    void loadTickers();
-    const id = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void loadTickers();
-      }
-    }, 30_000);
-    return () => {
-      mountedRef.current = false;
-      window.clearInterval(id);
-    };
-  }, [loadTickers]);
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -75,11 +42,13 @@ export const TickerTape: React.FC<TickerTapeProps> = React.memo(({ embedded = fa
 
   const { leader, laggard } = useMemo(() => {
     if (tickers.length === 0) return { leader: null, laggard: null };
-    const sorted = [...tickers].sort((a, b) => b.change24hPct - a.change24hPct);
-    return {
-      leader: sorted[0] ?? null,
-      laggard: sorted[sorted.length - 1] ?? null,
-    };
+    let best = tickers[0];
+    let worst = tickers[0];
+    for (let i = 1; i < tickers.length; i += 1) {
+      if (tickers[i].change24hPct > best.change24hPct) best = tickers[i];
+      if (tickers[i].change24hPct < worst.change24hPct) worst = tickers[i];
+    }
+    return { leader: best, laggard: worst };
   }, [tickers]);
 
   if (tickers.length === 0) return null;
@@ -90,8 +59,8 @@ export const TickerTape: React.FC<TickerTapeProps> = React.memo(({ embedded = fa
     <div
       className={
         embedded
-          ? 'w-full border-t border-white/6 bg-[var(--surface-0)]/60 rounded-b-2xl'
-          : 'w-full border-b border-emerald-500/15 bg-[var(--surface-0)]/95 backdrop-blur-sm'
+          ? 'w-full border-t border-white/6 bg-[var(--surface-0)]/60'
+          : 'w-full border-b border-emerald-500/15 bg-[var(--surface-0)]'
       }
       aria-label="Лента котировок и пульс рынка"
     >
@@ -123,7 +92,7 @@ export const TickerTape: React.FC<TickerTapeProps> = React.memo(({ embedded = fa
           )}
         </div>
 
-        {/* Integrated Compact Marquee */}
+        {/* GPU-accelerated Marquee via translate3d + will-change: transform */}
         {!collapsed ? (
           <div className="flex-1 overflow-hidden relative min-w-0">
             <div className="ticker-tape items-center gap-5">

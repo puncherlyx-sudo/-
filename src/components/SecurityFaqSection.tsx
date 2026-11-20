@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { ChevronDown, Compass, Search, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 
-type FaqCategory = 'all' | '2fa' | 'credits' | 'pwa';
+type FaqCategory = 'all' | '2fa' | 'api' | 'credits' | 'pwa';
 
 interface FaqItem {
   id: string;
@@ -47,8 +47,35 @@ const FAQ_ITEMS: FaqItem[] = [
     categoryLabel: '2FA и защита',
     question: 'Имеет ли Vernier доступ к моим средствам на бирже?',
     answer:
-      'Нет. Терминал работает по Non-Custodial модели: для графиков, ставок фандинга и открытого интереса используются публичные рыночные данные, а торговые или выводные API-ключи бирж не запрашиваются и не хранятся.',
+      'Нет. Терминал работает по Non-Custodial модели: средства всегда остаются на вашей бирже, права на вывод средств (Withdrawals) строго запрещены, а ключи шифруются AES-256-GCM и используются только для чтения баланса или подтверждённых вами ордеров.',
     meta: 'Non-Custodial · Без ключей вывода',
+  },
+  {
+    id: 'api-how-to-connect',
+    category: 'api',
+    categoryLabel: 'API бирж',
+    question: 'Как безопасно создать API-ключ на Binance, Bybit или OKX?',
+    answer:
+      'Создайте в кабинете биржи системный HMAC-ключ, включите «Чтение» (Read) для балансов и — только при необходимости Live-ордеров — права Spot/Futures Trading (на Bybit: Unified Trading → Orders & Positions). Обязательно оставьте выключенными Withdrawals и Internal/Universal Transfer. Подробная пошаговая инструкция по каждой бирже доступна в разделе «Защита → Биржи API → Гайд по API».',
+    meta: 'Binance · Bybit V5 · OKX V5',
+  },
+  {
+    id: 'api-okx-passphrase-testnet',
+    category: 'api',
+    categoryLabel: 'API бирж',
+    question: 'Зачем нужен Passphrase на OKX и как протестировать торговлю на Testnet?',
+    answer:
+      'OKX требует три параметра: API Key, API Secret и созданный вами Passphrase (кодовую фразу, чувствительную к регистру). Для безопасного теста сначала создайте ключ на тестнете биржи (Binance Spot Testnet, Bybit Testnet или OKX Demo Trading) и включите тумблер «Режим Testnet / Demo» в форме добавления ключа VERNIER.',
+    meta: 'OKX Passphrase · Testnet / Demo',
+  },
+  {
+    id: 'api-other-exchanges',
+    category: 'api',
+    categoryLabel: 'API бирж',
+    question: 'Можно ли пользоваться сигналами, если я торгую на другой бирже (BingX, Bitget, KuCoin, MEXC)?',
+    answer:
+      'Да. Все графики, AI-анализ, бэктесты, сканер и лента сигналов работают без API-ключей. На карточке любого сигнала и на графике доступна кнопка «План» / «Копировать», которая копирует точные уровни Entry, Stop-Loss, TP1 и TP2 для переноса в терминал вашей биржи.',
+    meta: 'Универсально · Копирование плана в 1 клик',
   },
   {
     id: 'credits-weekly-quota',
@@ -109,6 +136,7 @@ const FAQ_ITEMS: FaqItem[] = [
 const CATEGORY_TABS: Array<{ id: FaqCategory; label: string }> = [
   { id: 'all', label: 'Все темы' },
   { id: '2fa', label: '2FA и защита' },
+  { id: 'api', label: 'API бирж' },
   { id: 'credits', label: 'Кредиты и PRO' },
   { id: 'pwa', label: 'PWA и Push' },
 ];

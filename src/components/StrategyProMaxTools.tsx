@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import {
   Check,
+  ChevronDown,
   GitCompare,
   Plus,
   Sparkles,
@@ -19,6 +20,7 @@ import {
 } from '../lib/proMaxStore';
 import { sanitizePlainText, triggerHaptic } from '../lib/securityDlp';
 import type { StrategyBreakdownResult } from '../types/domain';
+import { BottomSheet, BottomSheetItem, BottomSheetList } from './BottomSheet';
 import { PaywallGate } from './PaywallGate';
 
 // ============================================================================
@@ -76,6 +78,7 @@ export const StrategyComparisonPanel: React.FC<StrategyComparisonPanelProps> = (
 
   const [leftKey, setLeftKey] = useState<string>(() => items[0]?.key ?? '');
   const [rightKey, setRightKey] = useState<string>(() => items[1]?.key ?? items[0]?.key ?? '');
+  const [pickerSide, setPickerSide] = useState<'left' | 'right' | null>(null);
 
   const adjustWithCosts = (m: CompareMetric) => {
     // 2 стороны сделки (вход + выход) × (комиссия + проскальзывание) × число сделок
@@ -108,37 +111,81 @@ export const StrategyComparisonPanel: React.FC<StrategyComparisonPanelProps> = (
           </h3>
         </div>
 
-        {/* Селекторы пары стратегий */}
+        {/* Селекторы пары стратегий (BottomSheet) */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
-          <label className="space-y-1">
-            <span className="text-slate-400">Стратегия A</span>
-            <select
-              value={left.key}
-              onChange={(e) => setLeftKey(e.target.value)}
-              className="w-full min-h-[40px] rounded-xl border border-white/12 bg-[var(--surface-0)] px-3 text-white"
+          <div className="space-y-1">
+            <span className="text-slate-400 block">Стратегия A</span>
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setPickerSide('left');
+              }}
+              className="w-full min-h-[42px] rounded-xl border border-white/12 bg-[var(--surface-0)] hover:border-amber-400/40 px-3 text-left text-white flex items-center justify-between gap-2 transition-colors"
             >
-              {items.map((s) => (
-                <option key={s.key} value={s.key}>
-                  {s.name} ({s.marketType === 'futures' ? 'Фьючерсы' : 'Спот'})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="space-y-1">
-            <span className="text-slate-400">Стратегия B</span>
-            <select
-              value={right.key}
-              onChange={(e) => setRightKey(e.target.value)}
-              className="w-full min-h-[40px] rounded-xl border border-white/12 bg-[var(--surface-0)] px-3 text-white"
+              <span className="truncate font-medium">
+                {left.name} ({left.marketType === 'futures' ? 'Фьючерсы' : 'Спот'})
+              </span>
+              <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+            </button>
+          </div>
+          <div className="space-y-1">
+            <span className="text-slate-400 block">Стратегия B</span>
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setPickerSide('right');
+              }}
+              className="w-full min-h-[42px] rounded-xl border border-white/12 bg-[var(--surface-0)] hover:border-amber-400/40 px-3 text-left text-white flex items-center justify-between gap-2 transition-colors"
             >
-              {items.map((s) => (
-                <option key={s.key} value={s.key}>
-                  {s.name} ({s.marketType === 'futures' ? 'Фьючерсы' : 'Спот'})
-                </option>
-              ))}
-            </select>
-          </label>
+              <span className="truncate font-medium">
+                {right.name} ({right.marketType === 'futures' ? 'Фьючерсы' : 'Спот'})
+              </span>
+              <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+            </button>
+          </div>
         </div>
+
+        <BottomSheet
+          open={pickerSide !== null}
+          onClose={() => setPickerSide(null)}
+          title={pickerSide === 'left' ? 'Выберите Стратегию A' : 'Выберите Стратегию B'}
+          subtitle="Сравнение чистой доходности, просадки и Win Rate"
+        >
+          <BottomSheetList className="space-y-1.5">
+            {items.map((s, idx) => {
+              const selectedKey = pickerSide === 'left' ? left.key : right.key;
+              const isSelected = s.key === selectedKey;
+              return (
+                <BottomSheetItem key={s.key} index={idx}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerHaptic(8);
+                      if (pickerSide === 'left') setLeftKey(s.key);
+                      else if (pickerSide === 'right') setRightKey(s.key);
+                      setPickerSide(null);
+                    }}
+                    className={`w-full min-h-[46px] px-3.5 py-2 rounded-xl border flex items-center justify-between gap-3 text-left text-xs transition-colors ${
+                      isSelected
+                        ? 'border-amber-400/45 bg-amber-500/12 text-white'
+                        : 'border-white/8 bg-[var(--surface-0)] hover:border-white/15 text-slate-200'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="font-semibold text-white truncate">{s.name}</div>
+                      <div className="text-[11px] text-slate-400 font-mono">
+                        {s.marketType === 'futures' ? 'Фьючерсы' : 'Спот'} · WR {s.winRatePct}%
+                      </div>
+                    </div>
+                    {isSelected && <Check className="w-4 h-4 text-amber-400 shrink-0" />}
+                  </button>
+                </BottomSheetItem>
+              );
+            })}
+          </BottomSheetList>
+        </BottomSheet>
 
         {/* Ползунки комиссии (0.02%-0.1%) и проскальзывания */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 rounded-xl border border-white/8 bg-[var(--surface-0)] p-3 text-xs">

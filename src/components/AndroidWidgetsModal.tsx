@@ -414,6 +414,8 @@ export const AndroidWidgetsModal: React.FC<AndroidWidgetsModalProps> = ({
                   <img
                     src="/brand/vernier-app-icon.svg"
                     alt="Vernier"
+                    width={36}
+                    height={36}
                     className="w-9 h-9 rounded-xl object-cover"
                   />
                   <span className="text-slate-200">Vernier</span>
@@ -584,6 +586,8 @@ export const AndroidWidgetsModal: React.FC<AndroidWidgetsModalProps> = ({
                           <img
                             src={item.imageSrc}
                             alt={item.title}
+                            width={32}
+                            height={32}
                             referrerPolicy="no-referrer"
                             className="w-8 h-8 rounded-lg object-cover border border-white/12 shrink-0 mt-0.5"
                           />

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CalendarClock,
@@ -8,8 +8,9 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { EconomicCalendarEvent } from '../types/domain';
+import { CACHE_TTL, fetchWithSWR, isPageVisible, subscribePageVisibility } from '../utils/cache';
 import { decodeHtmlEntities, formatEventTimeToLocal } from '../utils/htmlEntities';
-import { safeFetchJson } from '../utils/safeFetchJson';
+import { parseJsonResponse, safeFetchJson } from '../utils/safeFetchJson';
 
 type CategoryFilter = 'all' | 'macro' | 'crypto' | 'derivatives';
 
@@ -17,7 +18,7 @@ interface EconomicCalendarWidgetProps {
   lang?: 'ru' | 'en';
 }
 
-const CAL_RU_CACHE_KEY = 'vernier_calendar_ru_cache_v1';
+const CAL_RU_CACHE_KEY = 'vernier_calendar_ru_cache_v2';
 
 function readCalRuCache(): Record<string, { title: string; summary: string }> {
   if (typeof window === 'undefined') return {};
@@ -58,48 +59,84 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all');
   const [highImpactOnly, setHighImpactOnly] = useState(false);
 
+  const abortRef = useRef<AbortController | null>(null);
+  const attemptedTranslateIdsRef = useRef<Set<string>>(new Set());
+
   const loadCalendar = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError(null);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const url = forceRefresh ? '/api/economic-calendar?refresh=1' : '/api/economic-calendar';
-      const result = await safeFetchJson<{
+      const data = await fetchWithSWR<{
         events?: EconomicCalendarEvent[];
         grounded?: boolean;
         notice?: string;
         updatedAt?: string;
         error?: string;
-      }>(url, { timeoutMs: 15000, cache: 'no-store' });
-      if (!result.ok || !result.data) {
-        throw new Error(result.errorMessage || 'Не удалось загрузить экономический календарь.');
+      }>(
+        'api:economic-calendar',
+        async (signal) => {
+          const res = await fetch(url, { cache: 'no-store', signal });
+          const parsed = await parseJsonResponse<{
+            events?: EconomicCalendarEvent[];
+            grounded?: boolean;
+            notice?: string;
+            updatedAt?: string;
+            error?: string;
+          }>(res);
+          if (!parsed.ok || !parsed.data) {
+            throw new Error(parsed.errorMessage || 'Не удалось загрузить экономический календарь.');
+          }
+          return parsed.data;
+        },
+        {
+          ttlMs: CACHE_TTL.NEWS_AND_CALENDAR_MS,
+          forceRefresh,
+          signal: controller.signal,
+          onBackgroundUpdate: (fresh) => {
+            setEvents(fresh.events || []);
+            setGrounded(Boolean(fresh.grounded));
+            setNotice(fresh.notice ?? null);
+            setLastUpdatedAt(fresh.updatedAt || new Date().toISOString());
+          },
+        }
+      );
+      if (!controller.signal.aborted) {
+        setEvents(data.events || []);
+        setGrounded(Boolean(data.grounded));
+        setNotice(data.notice ?? null);
+        setLastUpdatedAt(data.updatedAt || new Date().toISOString());
       }
-      setEvents(result.data.events || []);
-      setGrounded(Boolean(result.data.grounded));
-      setNotice(result.data.notice ?? null);
-      setLastUpdatedAt(result.data.updatedAt || new Date().toISOString());
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки календаря');
+      if (!controller.signal.aborted) {
+        setError(err instanceof Error ? err.message : 'Ошибка загрузки календаря');
+      }
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     void loadCalendar(false);
-    const intervalId = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+    const intervalId = window.setInterval(() => {
+      if (isPageVisible()) {
         void loadCalendar(false);
       }
-    }, 5 * 60_000);
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+    }, 10 * 60_000);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) {
         void loadCalendar(false);
       }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
+    });
     return () => {
-      clearInterval(intervalId);
-      document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearInterval(intervalId);
+      unsubVis();
+      abortRef.current?.abort();
     };
   }, [loadCalendar]);
 
@@ -107,40 +144,76 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
     if (isEn || events.length === 0) return;
     const untranslated = events
       .filter((ev) => {
+        if (attemptedTranslateIdsRef.current.has(ev.id)) return false;
         const cached = ruMap[ev.id];
         if (cached && hasCyrillic(cached.title)) return false;
         const cleanTitle = decodeHtmlEntities(ev.title);
         const cleanDesc = decodeHtmlEntities(ev.description || '');
         return !hasCyrillic(cleanTitle) || (Boolean(cleanDesc) && !hasCyrillic(cleanDesc));
       })
-      .slice(0, 20);
+      .slice(0, 10);
     if (untranslated.length === 0) return;
+    untranslated.forEach((ev) => attemptedTranslateIdsRef.current.add(ev.id));
+
     let cancelled = false;
-    fetch('/api/news/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        items: untranslated.map((ev) => ({
-          id: ev.id,
-          title: decodeHtmlEntities(ev.title),
-          summary: decodeHtmlEntities(ev.description || ''),
-        })),
-      }),
-    })
-      .then((res) => (res.ok ? (res.json() as Promise<{ translations?: Record<string, { title: string; summary: string }> }>) : null))
-      .then((data) => {
-        if (cancelled || !data?.translations || Object.keys(data.translations).length === 0) return;
-        setRuMap((prev) => {
-          const next = { ...prev, ...data.translations };
-          writeCalRuCache(next);
-          return next;
-        });
+    safeFetchJson<{ translations?: Record<string, { title: string; summary: string }> }>(
+      '/api/news/translate',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: untranslated.map((ev) => ({
+            id: ev.id,
+            title: decodeHtmlEntities(ev.title),
+            summary: decodeHtmlEntities(ev.description || ''),
+          })),
+        }),
+        timeoutMs: 12000,
+      }
+    )
+      .then((res) => {
+        if (cancelled) return;
+        const translations = res.ok ? res.data?.translations : undefined;
+        if (translations && Object.keys(translations).length > 0) {
+          const valid: Record<string, { title: string; summary: string }> = {};
+          for (const [id, entry] of Object.entries(translations)) {
+            if (entry?.title && hasCyrillic(entry.title)) {
+              valid[id] = {
+                title: entry.title.trim(),
+                summary: (entry.summary || '').trim(),
+              };
+            }
+          }
+          if (Object.keys(valid).length > 0) {
+            setRuMap((prev) => {
+              const next = { ...prev, ...valid };
+              writeCalRuCache(next);
+              return next;
+            });
+          }
+        }
       })
-      .catch(() => undefined);
+      .catch(() => {
+        // Keep clean original English text with EN badge when translation API is unavailable
+      });
     return () => {
       cancelled = true;
     };
   }, [events, isEn, ruMap]);
+
+  const highCount = useMemo(
+    () =>
+      events.filter(
+        (e) => (categoryFilter === 'all' || e.category === categoryFilter) && e.impact === 'HIGH'
+      ).length,
+    [events, categoryFilter]
+  );
+
+  useEffect(() => {
+    if (highImpactOnly && highCount === 0) {
+      setHighImpactOnly(false);
+    }
+  }, [highImpactOnly, highCount]);
 
   const filteredEvents = useMemo(() => {
     return events
@@ -151,17 +224,16 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
       })
       .map((ev) => {
         const cached = !isEn ? ruMap[ev.id] : undefined;
-        const title = decodeHtmlEntities(cached?.title || ev.title);
-        const description = decodeHtmlEntities(cached?.summary || ev.description || '');
+        const rawTitle = decodeHtmlEntities(ev.title);
+        const rawDesc = decodeHtmlEntities(ev.description || '');
+        const hasValidRu = Boolean(cached?.title && hasCyrillic(cached.title));
+        const title = !isEn && hasValidRu ? cached!.title : rawTitle;
+        const description = !isEn && hasValidRu ? cached!.summary || rawDesc : rawDesc;
+        const isUntranslatedEn = !isEn && !hasCyrillic(title);
         const { localTimeLabel } = formatEventTimeToLocal(ev.dateLabel, ev.timeUtcLabel, lang);
-        return { ...ev, title, description, localTimeLabel };
+        return { ...ev, title, description, isUntranslatedEn, localTimeLabel };
       });
   }, [events, categoryFilter, highImpactOnly, isEn, ruMap, lang]);
-
-  const highCount = useMemo(
-    () => events.filter((e) => e.impact === 'HIGH').length,
-    [events]
-  );
 
   const renderImpactLabel = (impact: EconomicCalendarEvent['impact']) => {
     if (impact === 'HIGH') {
@@ -244,7 +316,10 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
               <button
                 key={tab.id}
                 type="button"
-                onClick={() => setCategoryFilter(tab.id)}
+                onClick={() => {
+                  setCategoryFilter(tab.id);
+                  setHighImpactOnly(false);
+                }}
                 className={`min-h-[36px] px-3 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                   categoryFilter === tab.id
                     ? 'bg-emerald-600 text-white'
@@ -259,10 +334,14 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
           {/* High Impact Filter Toggle */}
           <button
             type="button"
-            onClick={() => setHighImpactOnly((v) => !v)}
+            disabled={highCount === 0}
+            onClick={() => {
+              if (highCount === 0) return;
+              setHighImpactOnly((v) => !v);
+            }}
             aria-pressed={highImpactOnly}
-            className={`min-h-[40px] px-3.5 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
-              highImpactOnly
+            className={`min-h-[40px] px-3.5 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${
+              highImpactOnly && highCount > 0
                 ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
                 : 'border-white/10 bg-[#0B0F17] text-slate-300 hover:text-white'
             }`}
@@ -356,7 +435,14 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
                     </td>
                     <td className="py-3.5 px-3 max-w-md">
                       <div className="font-semibold text-white leading-snug flex items-start gap-2">
-                        <span>{ev.title}</span>
+                        <span>
+                          {ev.isUntranslatedEn && (
+                            <span className="inline-block align-middle mr-1.5 px-1.5 py-0.5 rounded bg-white/10 text-[10px] font-mono font-semibold text-slate-300">
+                              EN
+                            </span>
+                          )}
+                          {ev.title}
+                        </span>
                         {ev.sourceUrl && (
                           <a
                             href={ev.sourceUrl}
@@ -400,7 +486,7 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
           {/* Mobile Responsive List (Android PWA) */}
           <div className="md:hidden divide-y divide-white/8 border-t border-white/8">
             {filteredEvents.map((ev) => (
-              <div key={ev.id} className="py-4 space-y-2 text-xs">
+              <div key={ev.id} className="cv-list-item py-4 space-y-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
                   <div className="font-mono tabular-nums text-slate-300">
                     <span className="text-white font-semibold">{ev.dateLabel}</span>
@@ -412,7 +498,14 @@ export const EconomicCalendarWidget: React.FC<EconomicCalendarWidgetProps> = ({ 
                   {renderImpactLabel(ev.impact)}
                 </div>
 
-                <div className="font-semibold text-sm text-white leading-snug">{ev.title}</div>
+                <div className="font-semibold text-sm text-white leading-snug">
+                  {ev.isUntranslatedEn && (
+                    <span className="inline-block align-middle mr-1.5 px-1.5 py-0.5 rounded bg-white/10 text-[10px] font-mono font-semibold text-slate-300">
+                      EN
+                    </span>
+                  )}
+                  <span>{ev.title}</span>
+                </div>
                 {ev.description && (
                   <p className="text-slate-400 leading-relaxed">{ev.description}</p>
                 )}

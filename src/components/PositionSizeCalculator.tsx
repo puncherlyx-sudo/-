@@ -21,6 +21,7 @@ import {
   readLocalTrades,
   VERNIER_TRADES_EVENT,
 } from '../lib/localDemoStore';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { parseLocalePositiveNumber, triggerHaptic } from '../lib/securityDlp';
 
 interface PositionSizeCalculatorProps {
@@ -73,6 +74,7 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
 
   const maxAllowedLev = isPro ? 20 : FREE_MAX_LEVERAGE;
   const effectiveLev = marketType === 'spot' ? 1 : Math.min(maxAllowedLev, Math.max(1, leverage));
+  const debouncedLev = useDebouncedValue(effectiveLev, 150);
 
   const deposit = parseLocalePositiveNumber(depositStr, 0);
   const riskPct = Math.min(25, parseLocalePositiveNumber(riskPctStr, 0));
@@ -90,10 +92,13 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
     const stopDistancePct = (stopDistance / entry) * 100;
     const invalidStopSide =
       (direction === 'LONG' && stop >= entry) || (direction === 'SHORT' && stop <= entry);
+    const invalidTpSide =
+      tp > 0 && ((direction === 'LONG' && tp <= entry) || (direction === 'SHORT' && tp >= entry));
+    const hasInvalidLevels = invalidStopSide || invalidTpSide;
 
     const qtyCoins = riskAmountUsdt / stopDistance;
     const positionSizeUsdt = qtyCoins * entry;
-    const marginRequiredUsdt = positionSizeUsdt / effectiveLev;
+    const marginRequiredUsdt = positionSizeUsdt / debouncedLev;
     const marginExceedsDeposit = marginRequiredUsdt > deposit;
 
     const roundTripFeeUsdt = positionSizeUsdt * ((feePct * 2) / 100);
@@ -103,9 +108,9 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
     const rrRatio = stopDistance > 0 ? tpDistance / stopDistance : 0;
 
     // Ориентировочная цена ликвидации для фьючерсов (с учётом maintenance margin ~0.5%)
-    const liqMoveFrac = Math.max(0.005, 1 / effectiveLev - 0.005);
+    const liqMoveFrac = Math.max(0.005, 1 / debouncedLev - 0.005);
     const liquidationPrice =
-      marketType === 'futures' && effectiveLev > 1
+      marketType === 'futures' && debouncedLev > 1
         ? direction === 'LONG'
           ? Math.max(0, entry * (1 - liqMoveFrac))
           : entry * (1 + liqMoveFrac)
@@ -128,6 +133,8 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
       riskAmountUsdt,
       stopDistancePct,
       invalidStopSide,
+      invalidTpSide,
+      hasInvalidLevels,
       qtyCoins,
       positionSizeUsdt,
       marginRequiredUsdt,
@@ -140,7 +147,37 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
       tp2,
       tp3,
     };
-  }, [deposit, riskPct, entry, stop, tp, feePct, direction, effectiveLev, marketType]);
+  }, [deposit, riskPct, entry, stop, tp, feePct, direction, debouncedLev, marketType]);
+
+  const formatInputPrice = (val: number): string => {
+    if (!Number.isFinite(val) || val <= 0) return '';
+    if (val >= 1000) return String(Number(val.toFixed(2)));
+    if (val >= 10) return String(Number(val.toFixed(3)));
+    if (val >= 1) return String(Number(val.toFixed(4)));
+    return String(Number(val.toFixed(5)));
+  };
+
+  const handleChangeDirection = (nextDir: 'LONG' | 'SHORT') => {
+    if (nextDir === direction) return;
+    triggerHaptic(8);
+    setDirection(nextDir);
+
+    if (entry > 0) {
+      const currentSlDist = stop > 0 && stop !== entry ? Math.abs(entry - stop) : entry * 0.02;
+      const currentTpDist = tp > 0 && tp !== entry ? Math.abs(tp - entry) : currentSlDist * 2.2;
+      const mirroredSl =
+        nextDir === 'LONG'
+          ? Math.max(entry * 0.05, entry - currentSlDist)
+          : entry + currentSlDist;
+      const mirroredTp =
+        nextDir === 'LONG'
+          ? entry + currentTpDist
+          : Math.max(entry * 0.05, entry - currentTpDist);
+
+      setStopStr(formatInputPrice(mirroredSl));
+      setTpStr(formatInputPrice(mirroredTp));
+    }
+  };
 
   const applyStrategyPreset = (cfg: StrategyConfig) => {
     setMarketType(cfg.marketType);
@@ -152,7 +189,7 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
   };
 
   const handleSaveToJournal = () => {
-    if (!calc || calc.invalidStopSide) return;
+    if (!calc || calc.hasInvalidLevels) return;
     triggerHaptic(12);
     addLocalTrade({
       symbol,
@@ -245,7 +282,7 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
               <div className="grid grid-cols-2 p-1 rounded-xl bg-[var(--surface-0)] border border-white/10">
                 <button
                   type="button"
-                  onClick={() => setDirection('LONG')}
+                  onClick={() => handleChangeDirection('LONG')}
                   className={`min-h-[32px] rounded-lg font-semibold inline-flex items-center justify-center gap-1 ${
                     direction === 'LONG' ? 'bg-emerald-600 text-white' : 'text-slate-400'
                   }`}
@@ -255,7 +292,7 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setDirection('SHORT')}
+                  onClick={() => handleChangeDirection('SHORT')}
                   className={`min-h-[32px] rounded-lg font-semibold inline-flex items-center justify-center gap-1 ${
                     direction === 'SHORT' ? 'bg-rose-600 text-white' : 'text-slate-400'
                   }`}
@@ -417,17 +454,61 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
             <div className="rounded-xl border border-white/8 bg-[var(--surface-0)] p-6 text-center text-xs text-slate-400">
               Введите корректные положительные значения депозита, входа и стоп-лосса.
             </div>
+          ) : calc.hasInvalidLevels ? (
+            <div className="space-y-3">
+              <div className="rounded-xl border border-rose-500/40 bg-rose-500/12 p-4 text-xs text-rose-200 space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    {calc.invalidStopSide && (
+                      <div className="font-semibold text-rose-100">
+                        Для {direction} Stop-Loss должен быть {direction === 'LONG' ? 'ниже' : 'выше'} цены входа.
+                      </div>
+                    )}
+                    {calc.invalidTpSide && (
+                      <div className="font-semibold text-rose-100">
+                        Для {direction} Take-Profit должен быть {direction === 'LONG' ? 'выше' : 'ниже'} цены входа.
+                      </div>
+                    )}
+                    <p className="text-[11px] text-rose-200/80 leading-relaxed">
+                      Расчёт объёма, копирование параметров и запись в дневник заблокированы до исправления уровней ордера.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerHaptic(8);
+                    const distSl = stop > 0 && stop !== entry ? Math.abs(entry - stop) : entry * 0.02;
+                    const distTp = tp > 0 && tp !== entry ? Math.abs(tp - entry) : distSl * 2.2;
+                    setStopStr(
+                      formatInputPrice(
+                        direction === 'LONG' ? Math.max(entry * 0.05, entry - distSl) : entry + distSl
+                      )
+                    );
+                    setTpStr(
+                      formatInputPrice(
+                        direction === 'LONG' ? entry + distTp : Math.max(entry * 0.05, entry - distTp)
+                      )
+                    );
+                  }}
+                  className="min-h-[36px] px-3.5 rounded-lg border border-rose-400/40 bg-rose-500/20 hover:bg-rose-500/30 text-white text-xs font-semibold transition-colors"
+                >
+                  Автоисправить уровни под {direction}
+                </button>
+              </div>
+
+              <button
+                type="button"
+                disabled
+                className="w-full min-h-[44px] rounded-xl bg-slate-800 text-slate-400 opacity-55 cursor-not-allowed text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2"
+              >
+                <BookOpen className="w-4 h-4" />
+                <span>Записать сетап в дневник сделок (исправьте уровни)</span>
+              </button>
+            </div>
           ) : (
             <>
-              {calc.invalidStopSide && (
-                <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 p-3 text-xs text-rose-200 flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                  <span>
-                    Для {direction} Stop-Loss должен быть {direction === 'LONG' ? 'ниже' : 'выше'} цены входа.
-                  </span>
-                </div>
-              )}
-
               <div className="grid grid-cols-2 gap-2.5 text-xs font-mono tabular-nums">
                 <div className="rounded-xl border border-emerald-500/25 bg-[var(--surface-0)] p-3">
                   <div className="font-sans text-slate-400">Объём позиции (USDT)</div>
@@ -532,7 +613,7 @@ export const PositionSizeCalculator: React.FC<PositionSizeCalculatorProps> = ({
 
               <button
                 type="button"
-                disabled={calc.invalidStopSide}
+                disabled={calc.hasInvalidLevels}
                 onClick={handleSaveToJournal}
                 className="w-full min-h-[44px] rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-45 text-white text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-2 transition-all active:scale-[0.99]"
               >

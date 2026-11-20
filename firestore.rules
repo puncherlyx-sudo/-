@@ -384,14 +384,15 @@ service cloud.firestore {
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
+        && incoming().plan == existing().plan
+        && incoming().creditsRemaining == existing().creditsRemaining
+        && incoming().weeklyQuota == existing().weeklyQuota
+        && incoming().nextResetAt == existing().nextResetAt
         && (
-          // Action 1: Consume or Reset Weekly Credits
-          (incoming().plan == existing().plan && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'nextResetAt', 'updatedAt'])) ||
-          // Action 1b: Migrate legacy Free weeklyQuota (10/15 -> 25) or weekly reset
-          (existing().plan == 'free' && incoming().plan == 'free' && incoming().weeklyQuota == 25 && incoming().diff(existing()).affectedKeys().hasOnly(['creditsRemaining', 'weeklyQuota', 'nextResetAt', 'updatedAt'])) ||
+          // Action 1 & 1b УДАЛЕНЫ: creditsRemaining, weeklyQuota, nextResetAt изменяет только сервер (server/entitlements.ts).
+          // Action 3 УДАЛЁН: тариф (plan), срок (proUntil) и maxMultiplier изменяет только сервер после оплаты (server/billing.ts).
           // Action 2: Toggle 2FA or Auto-Lock Timeout
           (incoming().diff(existing()).affectedKeys().hasOnly(['twoFactorEnabled', 'autoLockMinutes', 'updatedAt'])) ||
-          // Action 3 УДАЛЁН: тариф (plan) и срок (proUntil) меняет только сервер после оплаты.
           // Action 4: Update Display Name
           (incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
         );

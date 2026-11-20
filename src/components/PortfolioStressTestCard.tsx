@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { AlertTriangle, ShieldAlert, Sliders } from 'lucide-react';
 import { usePlan } from '../contexts/PlanContext';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { triggerHaptic } from '../lib/securityDlp';
 import { PaywallGate } from './PaywallGate';
 import { NonCustodialRiskNotice } from './TradeRiskConfirmModal';
@@ -43,6 +44,7 @@ export const PortfolioStressTestCard: React.FC<PortfolioStressTestCardProps> = (
   const { isMax, maskValue } = usePlan();
   const [scenario, setScenario] = useState<ScenarioId>('btc_crash');
   const [btcShockPct, setBtcShockPct] = useState<number>(-20);
+  const debouncedShockPct = useDebouncedValue(btcShockPct, 150);
 
   const effectiveHoldings = useMemo<StressTestHoldingInput[]>(() => {
     if (holdings.length > 0 && totalValueUsdt > 0) return holdings;
@@ -66,7 +68,7 @@ export const PortfolioStressTestCard: React.FC<PortfolioStressTestCardProps> = (
     for (const item of effectiveHoldings) {
       const clean = item.symbol.replace(/USDT$/i, '').toUpperCase();
       const beta = getBetaToBtc(clean);
-      let assetShockPct = btcShockPct * beta;
+      let assetShockPct = debouncedShockPct * beta;
 
       if (scenario === 'usdt_d_spike') {
         assetShockPct = STABLES.has(clean) ? 0 : clean === 'BTC' ? -14 : -24 * Math.min(1.4, beta / 1.2);
@@ -95,7 +97,7 @@ export const PortfolioStressTestCard: React.FC<PortfolioStressTestCardProps> = (
       extraDrawdownPct: Number(extraDrawdownPct.toFixed(1)),
       worstAsset,
     };
-  }, [effectiveHoldings, effectiveTotal, btcShockPct, scenario]);
+  }, [effectiveHoldings, effectiveTotal, debouncedShockPct, scenario]);
 
   const applyPreset = (id: ScenarioId, btcPct: number) => {
     triggerHaptic(8);

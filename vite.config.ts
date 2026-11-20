@@ -104,7 +104,7 @@ export default defineConfig(() => {
               short_name: 'График',
               description: 'Тренд, RSI(14) и ключевые уровни выбранной пары',
               tag: 'chart-widget',
-              template: 'aegis-chart',
+              template: 'vernier-chart',
               ms_ac_template: '/api/widgets/template/chart',
               data: '/api/widgets/feed?symbol=BTCUSDT',
               type: 'application/json',
@@ -116,7 +116,7 @@ export default defineConfig(() => {
               short_name: 'Цена',
               description: 'Актуальная цена и изменение за 24 часа',
               tag: 'price-widget',
-              template: 'aegis-price',
+              template: 'vernier-price',
               ms_ac_template: '/api/widgets/template/price',
               data: '/api/widgets/feed?symbol=BTCUSDT',
               type: 'application/json',
@@ -128,7 +128,7 @@ export default defineConfig(() => {
               short_name: 'Позиция',
               description: 'Расчет объема лота и риск на сделку',
               tag: 'position-widget',
-              template: 'aegis-position',
+              template: 'vernier-position',
               ms_ac_template: '/api/widgets/template/position',
               data: '/api/widgets/feed?symbol=BTCUSDT',
               type: 'application/json',
@@ -140,7 +140,7 @@ export default defineConfig(() => {
               short_name: 'Доходность',
               description: 'Сводка доходности, лидеров рынка и настроений',
               tag: 'pnl-widget',
-              template: 'aegis-pnl',
+              template: 'vernier-pnl',
               ms_ac_template: '/api/widgets/template/pnl',
               data: '/api/widgets/feed?symbol=BTCUSDT',
               type: 'application/json',
@@ -152,7 +152,7 @@ export default defineConfig(() => {
               short_name: 'Стратегии',
               description: 'Сигналы торговых стратегий и волатильность',
               tag: 'strategies-widget',
-              template: 'aegis-strategies',
+              template: 'vernier-strategies',
               ms_ac_template: '/api/widgets/template/strategies',
               data: '/api/widgets/feed?symbol=BTCUSDT',
               type: 'application/json',
@@ -190,16 +190,17 @@ export default defineConfig(() => {
       },
     ],
     build: {
-      // Библиотеки выносим в отдельные файлы: они меняются редко, поэтому после обновления приложения
-      // телефон перекачивает только изменившийся код, а не всё целиком.
+      // Разделяем стабильные vendor-чанки (React, иконки, Firebase, графики, анимации) для минимального обновления при релизах
       chunkSizeWarningLimit: 700,
       rolldownOptions: {
         output: {
           codeSplitting: {
             groups: [
+              { name: 'vendor-react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/, priority: 40 },
               { name: 'vendor-firebase', test: /node_modules[\\/](firebase|@firebase)[\\/]/, priority: 30 },
-              { name: 'vendor-charts', test: /node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor|internmap|decimal\.js-light)[\\/]/, priority: 20 },
-              { name: 'vendor-motion', test: /node_modules[\\/](framer-motion|motion|motion-dom|motion-utils)[\\/]/, priority: 10 },
+              { name: 'vendor-charts', test: /node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor|internmap|decimal\.js-light)[\\/]/, priority: 25 },
+              { name: 'vendor-motion', test: /node_modules[\\/](framer-motion|motion|motion-dom|motion-utils)[\\/]/, priority: 20 },
+              { name: 'vendor-icons', test: /node_modules[\\/]lucide-react[\\/]/, priority: 15 },
             ],
           },
         },
@@ -216,6 +217,21 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      headers: {
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+      },
+    },
+    preview: {
+      headers: {
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+        'Content-Security-Policy':
+          "default-src 'self'; script-src 'self' https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https://generativelanguage.googleapis.com https://*.googleapis.com https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com https://api.binance.com https://fapi.binance.com https://api.bybit.com https://www.okx.com https://api.alternative.me https://api.coingecko.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+      },
     },
   };
 });

@@ -12,6 +12,8 @@ const loaders = {
   widgets: () => import('./components/AndroidWidgetsModal'),
   portfolioModal: () => import('./components/PortfolioDetailsModal'),
   standalone: () => import('./components/StandaloneWidgetView'),
+  pricingModal: () => import('./components/PricingModal'),
+  quickAnswers: () => import('./components/QuickAnswersCard'),
 };
 
 export const MarketScreenerView = lazy(() =>
@@ -31,6 +33,12 @@ export const PortfolioDetailsModal = lazy(() =>
 export const StandaloneWidgetView = lazy(() =>
   loaders.standalone().then((m) => ({ default: m.StandaloneWidgetView }))
 );
+export const PricingModal = lazy(() =>
+  loaders.pricingModal().then((m) => ({ default: m.PricingModal }))
+);
+export const QuickAnswersCard = lazy(() =>
+  loaders.quickAnswers().then((m) => ({ default: m.QuickAnswersCard }))
+);
 
 /** Заранее подгружает остальные экраны, когда браузер свободен, чтобы переключение вкладок было мгновенным. */
 export function prefetchViews(): void {
@@ -40,8 +48,6 @@ export function prefetchViews(): void {
       loaders.strategies,
       loaders.news,
       loaders.security,
-      loaders.widgets,
-      loaders.portfolioModal,
     ]) {
       void load().catch(() => {
         // нет сети — подгрузится при первом открытии вкладки

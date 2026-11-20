@@ -1,4 +1,5 @@
 import React, { useMemo, useRef, useState } from 'react';
+import type { ChartSignalMarker } from '../lib/strategyEngine';
 import type { CandlePoint, PriceAlertRecord, RibbonPeriods, RibbonType } from '../types/domain';
 
 interface CandlestickChartProps {
@@ -11,7 +12,13 @@ interface CandlestickChartProps {
   ribbonPeriods?: RibbonPeriods;
   entryLevel?: number | null;
   stopLossLevel?: number | null;
+  takeProfit1Level?: number | null;
   takeProfitLevel?: number | null;
+  signalDirection?: 'LONG' | 'SHORT' | null;
+  activeSignalEmittedAt?: string | null;
+  signalMarkers?: ChartSignalMarker[];
+  selectedSignalId?: string | null;
+  onSelectSignalMarker?: (marker: ChartSignalMarker) => void;
   priceAlerts?: PriceAlertRecord[];
   draftAlertPrice?: number | null;
   onPickPriceFromChart?: (price: number) => void;
@@ -80,7 +87,13 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   ribbonPeriods = [8, 13, 21, 55],
   entryLevel,
   stopLossLevel,
+  takeProfit1Level,
   takeProfitLevel,
+  signalDirection = null,
+  activeSignalEmittedAt = null,
+  signalMarkers = [],
+  selectedSignalId = null,
+  onSelectSignalMarker,
   priceAlerts = [],
   draftAlertPrice,
   onPickPriceFromChart,
@@ -134,8 +147,12 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       }
     }
 
-    if (stopLossLevel && Number.isFinite(stopLossLevel)) minPrice = Math.min(minPrice, stopLossLevel);
-    if (takeProfitLevel && Number.isFinite(takeProfitLevel)) maxPrice = Math.max(maxPrice, takeProfitLevel);
+    for (const lvl of [entryLevel, stopLossLevel, takeProfit1Level, takeProfitLevel]) {
+      if (lvl && Number.isFinite(lvl) && lvl > 0) {
+        minPrice = Math.min(minPrice, lvl);
+        maxPrice = Math.max(maxPrice, lvl);
+      }
+    }
 
     const pad = (maxPrice - minPrice) * 0.08 || maxPrice * 0.01;
     minPrice -= pad;
@@ -143,7 +160,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     const maxVol = Math.max(...visibleCandles.map((c) => c.volume), 1);
 
     return { minPrice, maxPrice, maxVol };
-  }, [visibleCandles, showRibbon, ribbonSeries, stopLossLevel, takeProfitLevel]);
+  }, [visibleCandles, showRibbon, ribbonSeries, entryLevel, stopLossLevel, takeProfit1Level, takeProfitLevel]);
 
   const activeIdx =
     hoverIdx !== null && visibleCandles[hoverIdx] ? hoverIdx : Math.max(0, visibleCandles.length - 1);
@@ -327,6 +344,66 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       valPrice: bins[lo].low,
     };
   }, [showVpvr, visibleCandles, metrics]);
+
+  // Сопоставление маркеров исторических и входящих сигналов с ближайшей свечой на экране
+  const plottedSignalMarkers = useMemo(() => {
+    if (visibleCandles.length === 0 || signalMarkers.length === 0) return [];
+    const firstTs = visibleCandles[0].time;
+    const lastTs = visibleCandles[visibleCandles.length - 1].time;
+
+    const findNearestCandleIdx = (iso: string): number => {
+      const ts = Date.parse(iso);
+      if (!Number.isFinite(ts)) return visibleCandles.length - 1;
+      if (ts >= lastTs) return visibleCandles.length - 1;
+      if (ts <= firstTs) return 0;
+      let bestIdx = visibleCandles.length - 1;
+      let bestDiff = Infinity;
+      for (let i = 0; i < visibleCandles.length; i += 1) {
+        const diff = Math.abs(visibleCandles[i].time - ts);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    };
+
+    // Распределяем маркеры на одной свече, чтобы они не перекрывали друг друга
+    const usedSlots = new Map<number, number>();
+    return signalMarkers.map((marker) => {
+      let candleIdx = findNearestCandleIdx(marker.emittedAt);
+      const slot = usedSlots.get(candleIdx) ?? 0;
+      usedSlots.set(candleIdx, slot + 1);
+      if (slot > 0 && candleIdx >= slot) {
+        candleIdx = Math.max(0, candleIdx - slot * 2);
+      }
+      return {
+        marker,
+        candleIdx,
+        stackOffset: slot,
+      };
+    });
+  }, [visibleCandles, signalMarkers]);
+
+  const activeAnchorIdx = useMemo(() => {
+    if (visibleCandles.length === 0) return 0;
+    if (!activeSignalEmittedAt) return Math.max(0, visibleCandles.length - 4);
+    const ts = Date.parse(activeSignalEmittedAt);
+    if (!Number.isFinite(ts)) return Math.max(0, visibleCandles.length - 4);
+    if (ts >= visibleCandles[visibleCandles.length - 1].time) {
+      return Math.max(0, visibleCandles.length - 3);
+    }
+    let bestIdx = visibleCandles.length - 3;
+    let bestDiff = Infinity;
+    for (let i = 0; i < visibleCandles.length; i += 1) {
+      const diff = Math.abs(visibleCandles[i].time - ts);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }, [visibleCandles, activeSignalEmittedAt]);
 
   if (!metrics || visibleCandles.length === 0) {
     return (
@@ -808,7 +885,35 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             </g>
           )}
 
-          {/* Strategy Price Levels (Entry / SL / TP) */}
+          {/* Strategy Price Zones & Levels (Entry / Stop-Loss / TP1 / TP2) */}
+          {entryLevel &&
+            stopLossLevel &&
+            entryLevel >= metrics.minPrice &&
+            entryLevel <= metrics.maxPrice &&
+            stopLossLevel >= metrics.minPrice &&
+            stopLossLevel <= metrics.maxPrice && (
+              <rect
+                x={PAD_L}
+                y={Math.min(priceToY(entryLevel), priceToY(stopLossLevel))}
+                width={W - PAD_L - PAD_R}
+                height={Math.max(2, Math.abs(priceToY(stopLossLevel) - priceToY(entryLevel)))}
+                fill="rgba(239, 68, 68, 0.08)"
+              />
+            )}
+          {entryLevel &&
+            takeProfitLevel &&
+            entryLevel >= metrics.minPrice &&
+            entryLevel <= metrics.maxPrice &&
+            takeProfitLevel >= metrics.minPrice &&
+            takeProfitLevel <= metrics.maxPrice && (
+              <rect
+                x={PAD_L}
+                y={Math.min(priceToY(entryLevel), priceToY(takeProfitLevel))}
+                width={W - PAD_L - PAD_R}
+                height={Math.max(2, Math.abs(priceToY(takeProfitLevel) - priceToY(entryLevel)))}
+                fill="rgba(16, 185, 129, 0.09)"
+              />
+            )}
           {entryLevel && entryLevel >= metrics.minPrice && entryLevel <= metrics.maxPrice && (
             <g>
               <line
@@ -817,10 +922,27 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 x2={W - PAD_R}
                 y2={priceToY(entryLevel)}
                 stroke="#F59E0B"
-                strokeWidth="1.2"
+                strokeWidth="1.4"
                 strokeDasharray="5 4"
               />
-              <text x={PAD_L + 4} y={priceToY(entryLevel) - 4} fill="#F59E0B" fontSize="10" fontFamily="JetBrains Mono">
+              <rect
+                x={PAD_L + 3}
+                y={priceToY(entryLevel) - 14}
+                width={106}
+                height={13}
+                rx="3"
+                fill="rgba(11, 15, 23, 0.9)"
+                stroke="rgba(245, 158, 11, 0.55)"
+                strokeWidth="0.7"
+              />
+              <text
+                x={PAD_L + 7}
+                y={priceToY(entryLevel) - 4.5}
+                fill="#FBBF24"
+                fontSize="9.5"
+                fontWeight="700"
+                fontFamily="JetBrains Mono, monospace"
+              >
                 ВХОД {formatPrice(entryLevel)}
               </text>
             </g>
@@ -833,11 +955,61 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 x2={W - PAD_R}
                 y2={priceToY(stopLossLevel)}
                 stroke="#EF4444"
-                strokeWidth="1.2"
+                strokeWidth="1.4"
                 strokeDasharray="4 4"
               />
-              <text x={PAD_L + 4} y={priceToY(stopLossLevel) - 4} fill="#EF4444" fontSize="10" fontFamily="JetBrains Mono">
+              <rect
+                x={PAD_L + 3}
+                y={priceToY(stopLossLevel) - 14}
+                width={98}
+                height={13}
+                rx="3"
+                fill="rgba(11, 15, 23, 0.9)"
+                stroke="rgba(239, 68, 68, 0.55)"
+                strokeWidth="0.7"
+              />
+              <text
+                x={PAD_L + 7}
+                y={priceToY(stopLossLevel) - 4.5}
+                fill="#F87171"
+                fontSize="9.5"
+                fontWeight="700"
+                fontFamily="JetBrains Mono, monospace"
+              >
                 SL {formatPrice(stopLossLevel)}
+              </text>
+            </g>
+          )}
+          {takeProfit1Level && takeProfit1Level >= metrics.minPrice && takeProfit1Level <= metrics.maxPrice && (
+            <g>
+              <line
+                x1={PAD_L}
+                y1={priceToY(takeProfit1Level)}
+                x2={W - PAD_R}
+                y2={priceToY(takeProfit1Level)}
+                stroke="#22D3EE"
+                strokeWidth="1.2"
+                strokeDasharray="3 4"
+              />
+              <rect
+                x={PAD_L + 3}
+                y={priceToY(takeProfit1Level) - 14}
+                width={102}
+                height={13}
+                rx="3"
+                fill="rgba(11, 15, 23, 0.9)"
+                stroke="rgba(34, 211, 238, 0.55)"
+                strokeWidth="0.7"
+              />
+              <text
+                x={PAD_L + 7}
+                y={priceToY(takeProfit1Level) - 4.5}
+                fill="#67E8F9"
+                fontSize="9.5"
+                fontWeight="700"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                TP1 {formatPrice(takeProfit1Level)}
               </text>
             </g>
           )}
@@ -849,11 +1021,28 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 x2={W - PAD_R}
                 y2={priceToY(takeProfitLevel)}
                 stroke="#10B981"
-                strokeWidth="1.2"
+                strokeWidth="1.4"
                 strokeDasharray="4 4"
               />
-              <text x={PAD_L + 4} y={priceToY(takeProfitLevel) - 4} fill="#10B981" fontSize="10" fontFamily="JetBrains Mono">
-                TP {formatPrice(takeProfitLevel)}
+              <rect
+                x={PAD_L + 3}
+                y={priceToY(takeProfitLevel) - 14}
+                width={104}
+                height={13}
+                rx="3"
+                fill="rgba(11, 15, 23, 0.9)"
+                stroke="rgba(16, 185, 129, 0.55)"
+                strokeWidth="0.7"
+              />
+              <text
+                x={PAD_L + 7}
+                y={priceToY(takeProfitLevel) - 4.5}
+                fill="#34D399"
+                fontSize="9.5"
+                fontWeight="700"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                {takeProfit1Level ? 'TP2' : 'TP'} {formatPrice(takeProfitLevel)}
               </text>
             </g>
           )}
@@ -912,6 +1101,214 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
               <polyline fill="none" stroke="#38BDF8" strokeWidth="1.4" strokeDasharray="3 2" points={buildPolyline((c) => c.ema50)} />
             </>
           )}
+
+          {/* Active Signal Visual Point Markers (Entry / Take-Profit / Stop-Loss) */}
+          {entryLevel && entryLevel >= metrics.minPrice && entryLevel <= metrics.maxPrice && (() => {
+            const anchorX = PAD_L + activeAnchorIdx * stepX + stepX / 2;
+            const entryY = priceToY(entryLevel);
+            const hasSl = Boolean(stopLossLevel && stopLossLevel >= metrics.minPrice && stopLossLevel <= metrics.maxPrice);
+            const hasTp1 = Boolean(takeProfit1Level && takeProfit1Level >= metrics.minPrice && takeProfit1Level <= metrics.maxPrice);
+            const hasTp = Boolean(takeProfitLevel && takeProfitLevel >= metrics.minPrice && takeProfitLevel <= metrics.maxPrice);
+            const slY = hasSl && stopLossLevel ? priceToY(stopLossLevel) : entryY;
+            const tpY = hasTp && takeProfitLevel ? priceToY(takeProfitLevel) : entryY;
+            const tp1Y = hasTp1 && takeProfit1Level ? priceToY(takeProfit1Level) : entryY;
+            const isShort = signalDirection === 'SHORT';
+            const markerRightX = Math.min(W - PAD_R - 18, Math.max(anchorX + 26, W - PAD_R - 36));
+            return (
+              <g className="pointer-events-none">
+                {/* Вертикальная направляющая от Stop-Loss к Take-Profit в точке входа */}
+                {(hasSl || hasTp) && (
+                  <line
+                    x1={anchorX}
+                    y1={Math.min(slY, tpY, entryY)}
+                    x2={anchorX}
+                    y2={Math.max(slY, tpY, entryY)}
+                    stroke="rgba(248, 250, 252, 0.28)"
+                    strokeWidth="1.2"
+                    strokeDasharray="2 3"
+                  />
+                )}
+
+                {/* Точка ENTRY (Вход) */}
+                <circle cx={anchorX} cy={entryY} r="8" fill="rgba(245, 158, 11, 0.22)" />
+                <circle
+                  cx={anchorX}
+                  cy={entryY}
+                  r="4.2"
+                  fill="#F59E0B"
+                  stroke="#0B0F17"
+                  strokeWidth="1.5"
+                />
+                <polygon
+                  points={
+                    isShort
+                      ? `${anchorX},${entryY + 13} ${anchorX - 5},${entryY + 6} ${anchorX + 5},${entryY + 6}`
+                      : `${anchorX},${entryY - 13} ${anchorX - 5},${entryY - 6} ${anchorX + 5},${entryY - 6}`
+                  }
+                  fill={isShort ? '#FB7185' : '#34D399'}
+                />
+                <rect
+                  x={Math.min(W - PAD_R - 62, Math.max(PAD_L + 4, anchorX - 28))}
+                  y={isShort ? entryY + 15 : Math.max(4, entryY - 26)}
+                  width={56}
+                  height={12}
+                  rx="3"
+                  fill="rgba(11, 15, 23, 0.94)"
+                  stroke="#F59E0B"
+                  strokeWidth="0.8"
+                />
+                <text
+                  x={Math.min(W - PAD_R - 34, Math.max(PAD_L + 32, anchorX))}
+                  y={isShort ? entryY + 23.5 : Math.max(12.5, entryY - 17.5)}
+                  textAnchor="middle"
+                  fill="#FDE68A"
+                  fontSize="8"
+                  fontWeight="700"
+                  fontFamily="JetBrains Mono, monospace"
+                >
+                  ENTRY
+                </text>
+
+                {/* Точка Take-Profit 1 (TP1) */}
+                {hasTp1 && (
+                  <g>
+                    <circle cx={markerRightX - 28} cy={tp1Y} r="3.6" fill="#22D3EE" stroke="#0B0F17" strokeWidth="1.2" />
+                    <text
+                      x={markerRightX - 21}
+                      y={tp1Y + 3}
+                      fill="#67E8F9"
+                      fontSize="8"
+                      fontWeight="700"
+                      fontFamily="JetBrains Mono, monospace"
+                    >
+                      TP1
+                    </text>
+                  </g>
+                )}
+
+                {/* Точка Take-Profit (TP / TP2) */}
+                {hasTp && (
+                  <g>
+                    <circle cx={markerRightX} cy={tpY} r="7.5" fill="rgba(16, 185, 129, 0.22)" />
+                    <circle cx={markerRightX} cy={tpY} r="4.2" fill="#10B981" stroke="#0B0F17" strokeWidth="1.4" />
+                    <rect
+                      x={markerRightX - 18}
+                      y={Math.max(4, tpY - 18)}
+                      width={36}
+                      height={12}
+                      rx="3"
+                      fill="rgba(6, 78, 59, 0.92)"
+                      stroke="#34D399"
+                      strokeWidth="0.8"
+                    />
+                    <text
+                      x={markerRightX}
+                      y={Math.max(12.5, tpY - 9.5)}
+                      textAnchor="middle"
+                      fill="#A7F3D0"
+                      fontSize="8"
+                      fontWeight="700"
+                      fontFamily="JetBrains Mono, monospace"
+                    >
+                      {hasTp1 ? 'TP2' : 'TP'}
+                    </text>
+                  </g>
+                )}
+
+                {/* Точка Stop-Loss (SL) */}
+                {hasSl && (
+                  <g>
+                    <circle cx={markerRightX} cy={slY} r="7.5" fill="rgba(239, 68, 68, 0.22)" />
+                    <circle cx={markerRightX} cy={slY} r="4.2" fill="#EF4444" stroke="#0B0F17" strokeWidth="1.4" />
+                    <rect
+                      x={markerRightX - 16}
+                      y={Math.min(H_MAIN - 14, slY + 6)}
+                      width={32}
+                      height={12}
+                      rx="3"
+                      fill="rgba(127, 29, 29, 0.92)"
+                      stroke="#F87171"
+                      strokeWidth="0.8"
+                    />
+                    <text
+                      x={markerRightX}
+                      y={Math.min(H_MAIN - 5.5, slY + 14.5)}
+                      textAnchor="middle"
+                      fill="#FECACA"
+                      fontSize="8"
+                      fontWeight="700"
+                      fontFamily="JetBrains Mono, monospace"
+                    >
+                      SL
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          })()}
+
+          {/* Historical & Incoming Strategy Signal Markers on Candles */}
+          {plottedSignalMarkers.map(({ marker, candleIdx, stackOffset }) => {
+            const c = visibleCandles[candleIdx];
+            if (!c) return null;
+            const cx = PAD_L + candleIdx * stepX + stepX / 2;
+            const isLong = marker.direction === 'LONG';
+            const isSelected = selectedSignalId === marker.id || marker.source === 'active';
+            const isIncoming = marker.source === 'incoming' || marker.source === 'active';
+            const baseY = isLong
+              ? Math.min(H_MAIN - 12, priceToY(c.low) + 12 + stackOffset * 13)
+              : Math.max(14, priceToY(c.high) - 12 - stackOffset * 13);
+            const fill = isLong ? '#10B981' : '#F43F5E';
+            const stroke = isSelected ? '#FBBF24' : isIncoming ? '#FFFFFF' : 'rgba(255,255,255,0.45)';
+            const markerEntryY =
+              marker.entryPrice >= metrics.minPrice && marker.entryPrice <= metrics.maxPrice
+                ? priceToY(marker.entryPrice)
+                : null;
+
+            return (
+              <g
+                key={`sig-marker-${marker.id}`}
+                className={onSelectSignalMarker ? 'cursor-pointer' : undefined}
+                onClick={(e) => {
+                  if (!onSelectSignalMarker) return;
+                  e.stopPropagation();
+                  onSelectSignalMarker(marker);
+                }}
+              >
+                <title>
+                  {`${marker.source === 'historical' ? 'История' : 'Входящий'} ${marker.direction} · ${marker.strategyName} · Entry ${formatPrice(marker.entryPrice)} · SL ${formatPrice(marker.stopLossPrice)} · TP ${formatPrice(marker.takeProfitPrice)}`}
+                </title>
+                {markerEntryY !== null && !isSelected && (
+                  <circle
+                    cx={cx}
+                    cy={markerEntryY}
+                    r="2.8"
+                    fill={fill}
+                    fillOpacity="0.8"
+                    stroke="#0B0F17"
+                    strokeWidth="0.9"
+                  />
+                )}
+                {isIncoming && (
+                  <circle cx={cx} cy={baseY} r="9" fill={fill} fillOpacity="0.2" />
+                )}
+                <polygon
+                  points={
+                    isLong
+                      ? `${cx},${baseY - 6} ${cx - 5.5},${baseY + 4} ${cx + 5.5},${baseY + 4}`
+                      : `${cx},${baseY + 6} ${cx - 5.5},${baseY - 4} ${cx + 5.5},${baseY - 4}`
+                  }
+                  fill={fill}
+                  fillOpacity={marker.source === 'historical' && !isSelected ? 0.72 : 1}
+                  stroke={stroke}
+                  strokeWidth={isSelected ? '1.3' : '0.8'}
+                />
+                {marker.isLiveOrder && (
+                  <circle cx={cx + 5} cy={baseY - 5} r="2.3" fill="#22D3EE" stroke="#0B0F17" strokeWidth="0.7" />
+                )}
+              </g>
+            );
+          })}
 
           {/* Active Push Price Alert Overlays */}
           {priceAlerts

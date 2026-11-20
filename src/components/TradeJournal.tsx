@@ -1034,7 +1034,7 @@ export const TradeJournal: React.FC<TradeJournalProps> = ({
             const isClosed = t.status === 'CLOSED';
             const isWin = (t.pnlUsdt ?? 0) >= 0;
             return (
-              <div key={t.id} className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+              <div key={t.id} className="cv-list-item py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
                 <div className="min-w-0 space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-mono font-bold text-white">{t.symbol}</span>

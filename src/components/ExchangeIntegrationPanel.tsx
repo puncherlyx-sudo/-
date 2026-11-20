@@ -2,7 +2,9 @@ import React, { useState } from 'react';
 import {
   AlertTriangle,
   ArrowRightLeft,
+  BookOpen,
   CheckCircle2,
+  ClipboardPaste,
   Eye,
   EyeOff,
   KeyRound,
@@ -19,6 +21,9 @@ import {
 } from 'lucide-react';
 import { TRADING_PAIRS } from '../data/strategies';
 import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
+import { triggerHaptic } from '../lib/securityDlp';
+import { ApiFieldTooltip } from './ApiFieldTooltip';
+import { ExchangeApiGuide } from './ExchangeApiGuide';
 import { NonCustodialRiskNotice } from './TradeRiskConfirmModal';
 import type {
   ExchangeAssetBalance,
@@ -112,6 +117,7 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
   onPlaceOrder,
 }) => {
   const [showAddForm, setShowAddForm] = useState(exchangeKeys.length === 0);
+  const [showApiGuide, setShowApiGuide] = useState(exchangeKeys.length === 0);
   const [exchange, setExchange] = useState<ExchangeId>('binance');
   const [label, setLabel] = useState('Binance Основной');
   const [permissions, setPermissions] = useState<ExchangeKeyPermissions>('read_only');
@@ -121,6 +127,7 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
   const [passphrase, setPassphrase] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [acceptedApiResponsibility, setAcceptedApiResponsibility] = useState(false);
+  const [pasteNotice, setPasteNotice] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -146,6 +153,37 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
     setLabel(EXCHANGE_META[nextEx].placeholderLabel);
     setFormError(null);
   };
+
+  const handlePasteField = async (target: 'apiKey' | 'apiSecret' | 'passphrase') => {
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) {
+      setPasteNotice('Буфер обмена недоступен в этом браузере — вставьте ключ вручную.');
+      return;
+    }
+    try {
+      const raw = await navigator.clipboard.readText();
+      const cleaned = target === 'passphrase' ? raw.trim() : raw.replace(/\s+/g, '');
+      if (!cleaned) {
+        setPasteNotice('Буфер обмена пуст.');
+        return;
+      }
+      triggerHaptic(8);
+      if (target === 'apiKey') setApiKey(cleaned);
+      if (target === 'apiSecret') setApiSecret(cleaned);
+      if (target === 'passphrase') setPassphrase(cleaned);
+      const hadWhitespace = cleaned.length !== raw.length;
+      setPasteNotice(
+        hadWhitespace
+          ? 'Вставлено из буфера (лишние пробелы и переносы строк удалены автоматически).'
+          : 'Значение вставлено из буфера обмена.'
+      );
+      window.setTimeout(() => setPasteNotice(null), 3200);
+    } catch {
+      setPasteNotice('Разрешите доступ к буферу обмена или вставьте ключ долгим нажатием.');
+    }
+  };
+
+  const duplicateKeySecretWarning =
+    apiKey.trim().length > 6 && apiSecret.trim().length > 6 && apiKey.trim() === apiSecret.trim();
 
   const handleConnectSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -264,17 +302,36 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={() => {
-              setShowAddForm((v) => !v);
-              setFormError(null);
-            }}
-            className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            <span>{showAddForm ? 'Скрыть форму' : 'Добавить API-ключ'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setShowApiGuide((v) => !v);
+              }}
+              className={`min-h-[40px] px-3.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+                showApiGuide
+                  ? 'border-cyan-400/50 bg-cyan-500/20 text-cyan-100'
+                  : 'border-cyan-500/35 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200'
+              }`}
+            >
+              <BookOpen className="w-4 h-4 shrink-0" />
+              <span>{showApiGuide ? 'Скрыть гайд' : 'Гайд по API'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(8);
+                setShowAddForm((v) => !v);
+                setFormError(null);
+              }}
+              className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              <Plus className="w-4 h-4 shrink-0" />
+              <span>{showAddForm ? 'Скрыть форму' : 'Добавить API-ключ'}</span>
+            </button>
+          </div>
         </div>
 
         <div className="rounded-xl border border-amber-500/25 bg-amber-500/8 p-3.5 flex items-start gap-3">
@@ -346,7 +403,13 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
               </label>
 
               <div className="space-y-1.5">
-                <span className="text-xs font-medium text-slate-300 block">Права ключа</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-slate-300">Права ключа</span>
+                  <ApiFieldTooltip
+                    title="Почему нужен режим Read-Only?"
+                    body="Для синхронизации реального баланса и портфеля достаточно прав «Только чтение» (Read-Only). VERNIER никогда не запрашивает права «Withdraw» (вывод средств) — деньги всегда остаются на вашем аккаунте биржи."
+                  />
+                </div>
                 <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-[#111827] border border-white/10">
                   <button
                     type="button"
@@ -375,26 +438,64 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-slate-300">API Key</span>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="inline-flex items-center gap-1.5">
+                    <label htmlFor="ex-api-key-input" className="text-xs font-medium text-slate-300">
+                      API Key
+                    </label>
+                    <ApiFieldTooltip
+                      title="Публичный API Key"
+                      body="Идентификатор подключения вашего аккаунта биржи. Сам по себе API Key не позволяет выводить средства или управлять деньгами; используйте ключ с отключённым правом Withdraw."
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handlePasteField('apiKey')}
+                    className="text-[11px] font-medium text-cyan-300 hover:text-cyan-200 inline-flex items-center gap-1 transition-colors"
+                  >
+                    <ClipboardPaste className="w-3 h-3 shrink-0" />
+                    <span>Вставить</span>
+                  </button>
+                </div>
                 <input
+                  id="ex-api-key-input"
                   type="text"
                   value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
+                  onChange={(e) => setApiKey(e.target.value.replace(/\s+/g, ''))}
                   autoComplete="off"
                   spellCheck={false}
                   placeholder="Вставьте публичный API Key"
                   className="w-full min-h-[42px] rounded-xl border border-white/10 bg-[#111827] px-3.5 font-mono text-xs text-white focus:border-emerald-500 focus:outline-none"
                 />
-              </label>
+              </div>
 
-              <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-slate-300">API Secret</span>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="inline-flex items-center gap-1.5">
+                    <label htmlFor="ex-api-secret-input" className="text-xs font-medium text-slate-300">
+                      API Secret
+                    </label>
+                    <ApiFieldTooltip
+                      title="Секретный ключ подписи (HMAC)"
+                      body="Нужен бирже для криптографической подписи запроса баланса. В VERNIER шифруется по AES-256-GCM и никогда не имеет прав на вывод средств, если на бирже выключен пункт «Withdrawals»."
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handlePasteField('apiSecret')}
+                    className="text-[11px] font-medium text-cyan-300 hover:text-cyan-200 inline-flex items-center gap-1 transition-colors"
+                  >
+                    <ClipboardPaste className="w-3 h-3 shrink-0" />
+                    <span>Вставить</span>
+                  </button>
+                </div>
                 <div className="relative">
                   <input
+                    id="ex-api-secret-input"
                     type={showSecret ? 'text' : 'password'}
                     value={apiSecret}
-                    onChange={(e) => setApiSecret(e.target.value)}
+                    onChange={(e) => setApiSecret(e.target.value.replace(/\s+/g, ''))}
                     autoComplete="new-password"
                     spellCheck={false}
                     placeholder="Вставьте Secret Key"
@@ -409,13 +510,32 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
                     {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
-              </label>
+              </div>
             </div>
 
             {exchange === 'okx' && (
-              <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-slate-300">Passphrase (обязательно для OKX)</span>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="inline-flex items-center gap-1.5">
+                    <label htmlFor="ex-passphrase-input" className="text-xs font-medium text-slate-300">
+                      Passphrase (обязательно для OKX)
+                    </label>
+                    <ApiFieldTooltip
+                      title="Кодовая фраза OKX API V5"
+                      body="Уникальная фраза, которую вы придумываете при создании API-ключа на OKX (не пароль от аккаунта). Нужна для проверки Read-Only подписи; вывод средств остаётся отключённым."
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handlePasteField('passphrase')}
+                    className="text-[11px] font-medium text-cyan-300 hover:text-cyan-200 inline-flex items-center gap-1 transition-colors"
+                  >
+                    <ClipboardPaste className="w-3 h-3 shrink-0" />
+                    <span>Вставить</span>
+                  </button>
+                </div>
                 <input
+                  id="ex-passphrase-input"
                   type={showSecret ? 'text' : 'password'}
                   value={passphrase}
                   onChange={(e) => setPassphrase(e.target.value)}
@@ -423,7 +543,20 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
                   placeholder="Кодовая фраза API OKX"
                   className="w-full min-h-[42px] rounded-xl border border-white/10 bg-[#111827] px-3.5 font-mono text-xs text-white focus:border-emerald-500 focus:outline-none"
                 />
-              </label>
+              </div>
+            )}
+
+            {pasteNotice && (
+              <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-[11px] text-cyan-200">
+                {pasteNotice}
+              </div>
+            )}
+
+            {duplicateKeySecretWarning && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span>API Key и API Secret совпадают — проверьте, что вы вставили два разных значения с биржи.</span>
+              </div>
             )}
 
             <label className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 cursor-pointer text-xs text-slate-200 leading-relaxed">
@@ -467,6 +600,19 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
               </button>
             </div>
           </form>
+        )}
+
+        {/* Detailed Step-by-Step Exchange API Connection Guide */}
+        {showApiGuide && (
+          <ExchangeApiGuide
+            initialExchange={exchange}
+            onSelectExchange={(nextEx) => {
+              if (showAddForm) {
+                handleExchangePick(nextEx);
+              }
+            }}
+            onClose={() => setShowApiGuide(false)}
+          />
         )}
       </div>
 

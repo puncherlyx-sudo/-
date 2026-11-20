@@ -1,18 +1,19 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
-import helmet from 'helmet';
 import http from 'http';
 import path from 'path';
 import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
+import { serverLogger } from './server/logger.ts';
+import { applySecurityHeaders } from './server/middleware/securityHeaders.ts';
 import { isAllowedPushEndpoint, requireAuth, verifyFirebaseIdToken } from './server/auth.ts';
 import {
   createCheckout,
   getMaxMultiplierPlans,
   getPlanPrices,
   getTieredPlanPrices,
-  getUserPlanTier,
   isBillingConfigured,
   processIpn,
   startProExpiryMonitor,
@@ -21,6 +22,15 @@ import {
   type MaxMultiplier,
   type SubscriptionTier,
 } from './server/billing.ts';
+import {
+  consumeUserCredits,
+  EntitlementError,
+  getUserEntitlements,
+  IMMUTABLE_CREDIT_COSTS,
+  IMMUTABLE_MAX_LEVERAGE,
+  isValidBillableAction,
+  resolveAuthoritativePlan,
+} from './server/entitlements.ts';
 import { CREDIT_COSTS, FREE_MAX_LEVERAGE, STRATEGY_CATALOG, isProOnlyStrategy } from './src/data/strategies.ts';
 import {
   AiServiceError,
@@ -39,7 +49,7 @@ import {
   SUPPORTED_SYMBOLS,
 } from './server/market.ts';
 import {
-  runLiveStrategyScanner,
+  runLiveStrategyScannerWithTelemetry,
   runStrategyPortfolioBacktest,
   type StrategySimulationInput,
 } from './server/strategyBacktest.ts';
@@ -57,6 +67,7 @@ import {
   unregisterPushSubscription,
 } from './server/push.ts';
 import {
+  assertSecurityEnvConfigured,
   buildOtpAuthUri,
   decryptSecret,
   encryptSecret,
@@ -71,73 +82,222 @@ import {
   executeEncryptedExchangeOrder,
   isValidExchangeId,
   isValidPermissions,
+  MAX_TESTNET_ORDER_USDT,
   syncEncryptedExchangeBalances,
 } from './server/exchanges.ts';
 
 async function startServer() {
+  // Проверка криптографического мастер-ключа (fail-fast в production)
+  assertSecurityEnvConfigured();
+
   const app = express();
   const PORT = 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
   app.set('trust proxy', 1);
 
-  // Security headers hardened against XSS, MIME sniffing, and clickjacking
-  app.use(
-    helmet({
-      // CSP в разработке отключён (Vite HMR требует inline-скриптов), в продакшене включён.
-      contentSecurityPolicy: isProd
-        ? {
-            useDefaults: false,
-            directives: {
-              'default-src': ["'self'"],
-              'script-src': ["'self'", 'https://apis.google.com'],
-              'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-              'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
-              'img-src': ["'self'", 'data:', 'blob:', 'https:'],
-              'connect-src': [
-                "'self'",
-                'https://*.googleapis.com',
-                'https://*.firebaseio.com',
-                'https://*.firebaseapp.com',
-                'wss://*.firebaseio.com',
-              ],
-              'frame-src': [
-                "'self'",
-                'https://*.firebaseapp.com',
-                'https://accounts.google.com',
-                'https://apis.google.com',
-                'https://www.tradingview-widget.com',
-                'https://s.tradingview.com',
-                'https://*.tradingview.com',
-              ],
-              'worker-src': ["'self'", 'blob:'],
-              'manifest-src': ["'self'"],
-              'object-src': ["'none'"],
-              'base-uri': ["'self'"],
-              'form-action': ["'self'"],
-              // Запрет встраивания в чужие страницы (защита от clickjacking).
-              // Разрешён предпросмотр внутри Google AI Studio.
-              'frame-ancestors': ["'self'", 'https://aistudio.google.com', 'https://*.google.com'],
-              'upgrade-insecure-requests': [],
-            },
-          }
-        : false,
-      crossOriginEmbedderPolicy: false,
-      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' }, // нужно для входа Google через popup
-      frameguard: false, // замена: frame-ancestors в CSP
-      hsts: { maxAge: 31536000, includeSubDomains: true },
-      referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
-    })
-  );
-  app.disable('x-powered-by');
+  // Централизованные строгие HTTP-заголовки безопасности (CSP без unsafe-eval, HSTS, nosniff, DENY, Permissions-Policy)
+  applySecurityHeaders(app, { isProd });
 
   app.use(express.json({ limit: '256kb' }));
+
+  // ---------- CSRF Protection (Double Submit Cookie + строгая проверка Origin/Referer) ----------
+  const CSRF_COOKIE_NAME = 'vernier_csrf';
+  const configuredAllowedOrigins = new Set(
+    (process.env.ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((v) => v.trim().replace(/\/+$/, ''))
+      .filter(Boolean)
+  );
+  if (process.env.APP_URL) {
+    configuredAllowedOrigins.add(process.env.APP_URL.trim().replace(/\/+$/, ''));
+  }
+
+  function parseCookieMap(cookieHeader: string | undefined): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!cookieHeader) return out;
+    for (const part of cookieHeader.split(';')) {
+      const idx = part.indexOf('=');
+      if (idx === -1) continue;
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      if (k) out[k] = decodeURIComponent(v);
+    }
+    return out;
+  }
+
+  function issueCsrfCookie(res: express.Response, existingToken?: string): string {
+    const token =
+      existingToken && /^[0-9a-f]{64}$/.test(existingToken)
+        ? existingToken
+        : crypto.randomBytes(32).toString('hex');
+    const cookieParts = [
+      `${CSRF_COOKIE_NAME}=${token}`,
+      'Path=/',
+      'SameSite=Strict',
+      'Max-Age=43200',
+    ];
+    if (isProd) {
+      cookieParts.push('Secure');
+    }
+    res.setHeader('Set-Cookie', cookieParts.join('; '));
+    return token;
+  }
+
+  function isTrustedOrigin(req: express.Request): boolean {
+    const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    const refererHeader = typeof req.headers.referer === 'string' ? req.headers.referer.trim() : '';
+    const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim() : '';
+
+    const candidateUrl = originHeader || refererHeader;
+    if (!candidateUrl) {
+      // В non-browser или same-origin запросах без Origin допускаем, если присутствует валидный Double Submit CSRF token
+      return true;
+    }
+
+    try {
+      const parsed = new URL(candidateUrl);
+      const normalizedOrigin = parsed.origin;
+      if (configuredAllowedOrigins.has(normalizedOrigin)) return true;
+      if (hostHeader && parsed.host === hostHeader) return true;
+      if (!isProd && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')) {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  // Запрет передачи auth-токенов в URL query parameters
+  app.use('/api', (req, res, next) => {
+    const forbiddenQueryKeys = ['token', 'idToken', 'id_token', 'access_token', 'authToken', 'authorization'];
+    for (const key of forbiddenQueryKeys) {
+      if (req.query[key] !== undefined) {
+        res.status(400).json({
+          error: 'Передача токенов авторизации в URL запрещена. Используйте заголовок Authorization.',
+        });
+        return;
+      }
+    }
+    next();
+  });
+
+  // Выдача / обновление CSRF-токена (Double Submit Cookie)
+  app.get('/api/security/csrf-token', (req, res) => {
+    const cookies = parseCookieMap(req.headers.cookie);
+    const csrfToken = issueCsrfCookie(res, cookies[CSRF_COOKIE_NAME]);
+    res.set('Cache-Control', 'no-store');
+    res.json({ csrfToken });
+  });
+
+  // Проверка CSRF на всех мутирующих /api/* маршрутах (кроме подписанного HMAC-SHA512 IPN webhook)
+  app.use('/api', (req, res, next) => {
+    const method = req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+      next();
+      return;
+    }
+    if (req.path === '/billing/ipn') {
+      // Внешний webhook NOWPayments защищён криптографической подписью HMAC-SHA512 (x-nowpayments-sig)
+      next();
+      return;
+    }
+
+    if (!isTrustedOrigin(req)) {
+      res.status(403).json({ error: 'Запрос отклонён политикой безопасности Origin/CSRF.' });
+      return;
+    }
+
+    const cookies = parseCookieMap(req.headers.cookie);
+    const cookieToken = cookies[CSRF_COOKIE_NAME] || '';
+    const headerToken = typeof req.headers['x-csrf-token'] === 'string' ? req.headers['x-csrf-token'].trim() : '';
+
+    if (
+      !cookieToken ||
+      !headerToken ||
+      cookieToken.length !== 64 ||
+      headerToken.length !== 64 ||
+      !crypto.timingSafeEqual(Buffer.from(cookieToken), Buffer.from(headerToken))
+    ) {
+      res.status(403).json({
+        error: 'Недействительный или отсутствующий CSRF-токен. Обновите страницу и повторите запрос.',
+        code: 'CSRF_INVALID',
+      });
+      return;
+    }
+
+    next();
+  });
+
+  // ---------- Устойчивый Rate-Limiting (IP из trust proxy=1 + UID / session fingerprint) ----------
+  function getCompositeRateLimitKey(req: express.Request): string {
+    const trustedIp = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+    const uid = req.user?.uid ? `uid:${req.user.uid}` : '';
+    const clientFp =
+      typeof req.headers['x-vernier-client-fp'] === 'string'
+        ? req.headers['x-vernier-client-fp'].replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
+        : '';
+    const csrfPrefix = parseCookieMap(req.headers.cookie)[CSRF_COOKIE_NAME]?.slice(0, 16) || '';
+    const actor = uid || (clientFp ? `fp:${clientFp}` : csrfPrefix ? `csrf:${csrfPrefix}` : 'anon');
+    return `${trustedIp}|${actor}`;
+  }
+
+  // Экспоненциальный backoff и временная блокировка после 5 неудачных попыток (2FA / биржевые операции)
+  const authFailureTracker = new Map<string, { failures: number; lockedUntil: number; updatedAt: number }>();
+
+  function getAuthFailureKey(req: express.Request, scope: string): string {
+    const trustedIp = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+    const uid = req.user?.uid || 'anon';
+    return `${scope}:${uid}:${trustedIp}`;
+  }
+
+  function checkAuthBackoffLock(req: express.Request, res: express.Response, scope: string): boolean {
+    const key = getAuthFailureKey(req, scope);
+    const state = authFailureTracker.get(key);
+    if (!state) return false;
+    const now = Date.now();
+    if (state.lockedUntil > now) {
+      const waitSec = Math.ceil((state.lockedUntil - now) / 1000);
+      res.setHeader('Retry-After', String(waitSec));
+      res.status(429).json({
+        error: `Слишком много неудачных попыток. Временная блокировка ещё на ${waitSec} сек.`,
+        retryAfterSeconds: waitSec,
+        code: 'AUTH_LOCKED',
+      });
+      return true;
+    }
+    return false;
+  }
+
+  function recordAuthFailure(req: express.Request, scope: string): { failures: number; lockSeconds: number } {
+    const key = getAuthFailureKey(req, scope);
+    const now = Date.now();
+    const prev = authFailureTracker.get(key);
+    const failures = prev && now - prev.updatedAt < 30 * 60_000 ? prev.failures + 1 : 1;
+    let lockMs = 0;
+    if (failures >= 5) {
+      // Экспоненциальный backoff: 30с, 60с, 120с, 240с ... макс 15 мин
+      lockMs = Math.min(15 * 60_000, 30_000 * 2 ** (failures - 5));
+    }
+    authFailureTracker.set(key, {
+      failures,
+      lockedUntil: lockMs > 0 ? now + lockMs : 0,
+      updatedAt: now,
+    });
+    return { failures, lockSeconds: Math.ceil(lockMs / 1000) };
+  }
+
+  function clearAuthFailure(req: express.Request, scope: string): void {
+    authFailureTracker.delete(getAuthFailureKey(req, scope));
+  }
 
   const generalApiLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: (req) => getCompositeRateLimitKey(req),
     message: { error: 'Превышен лимит запросов. Повторите через минуту.' },
   });
 
@@ -146,7 +306,8 @@ async function startServer() {
     max: 15,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: 'Слишком много попыток 2FA. Подождите 5 минут для защиты аккаунта.' },
+    keyGenerator: (req) => getCompositeRateLimitKey(req),
+    message: { error: 'Слишком много попыток проверки безопасности. Подождите 5 минут.' },
   });
 
   const expensiveLimiter = rateLimit({
@@ -154,6 +315,7 @@ async function startServer() {
     max: 12,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: (req) => getCompositeRateLimitKey(req),
     message: { error: 'Слишком много тяжёлых запросов. Повторите через минуту.' },
   });
 
@@ -161,6 +323,44 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, timestamp: new Date().toISOString() });
+  });
+
+  // Авторитетные серверные эндпоинты учёта тарифов и квот (клиент больше не может изменять creditsRemaining в Firestore)
+  app.get('/api/entitlements/me', requireAuth, async (req, res) => {
+    try {
+      res.set('Cache-Control', 'no-store');
+      const snapshot = await getUserEntitlements(req.user!.uid);
+      res.json({
+        ok: true,
+        entitlements: snapshot,
+        creditCosts: IMMUTABLE_CREDIT_COSTS,
+      });
+    } catch (err) {
+      if (err instanceof EntitlementError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
+      res.status(500).json({ error: 'Ошибка чтения квот аккаунта.' });
+    }
+  });
+
+  app.post('/api/entitlements/consume', requireAuth, expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as { action?: unknown };
+      const action = isValidBillableAction(body?.action) ? body.action : 'ai_analysis';
+      const { snapshot, deducted } = await consumeUserCredits(req.user!.uid, action);
+      res.json({
+        ok: true,
+        deducted,
+        entitlements: snapshot,
+      });
+    } catch (err) {
+      if (err instanceof EntitlementError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
+      res.status(500).json({ error: 'Ошибка серверного списания кредитов.' });
+    }
   });
 
   // Market tickers (Spot / Futures)
@@ -458,7 +658,8 @@ async function startServer() {
       const strategyRules = String(body.strategyRules || '').replace(/\r/g, '').slice(0, 1500);
       const depositUsdt = Math.min(10_000_000, Math.max(10, Number(body.depositUsdt || 1000)));
       const riskPerTradePct = Math.min(10, Math.max(0.25, Number(body.riskPerTradePct || 1.5)));
-      const dbPlan = await getUserPlanTier(req.user!.uid);
+      const entitlements = await getUserEntitlements(req.user!.uid);
+      const dbPlan = entitlements.plan;
       const isPro = dbPlan === 'pro' || dbPlan === 'max';
 
       if (isProOnlyStrategy(strategyKey) && !isPro) {
@@ -469,8 +670,11 @@ async function startServer() {
         return;
       }
 
-      const maxAllowedLeverage = isPro ? 20 : FREE_MAX_LEVERAGE;
+      const maxAllowedLeverage = IMMUTABLE_MAX_LEVERAGE[dbPlan] ?? FREE_MAX_LEVERAGE;
       const leverage = Math.min(maxAllowedLeverage, Math.max(1, Number(body.leverage || 1)));
+
+      // Серверная проверка и атомарное списание 1 AI-кредита перед вызовом Gemini
+      const { snapshot: postCreditSnapshot } = await consumeUserCredits(req.user!.uid, 'ai_analysis');
 
       const marketData = await getMarketCandles(symbol, timeframe, marketType);
       const analysis = await runStrategyAnalysis({
@@ -487,15 +691,20 @@ async function startServer() {
         riskPerTradePct,
         leverage,
         isPro,
-        planTier: dbPlan || 'free',
+        planTier: dbPlan,
       });
 
       res.json({
         analysis,
         indicators: marketData.indicators,
         source: marketData.source,
+        entitlements: postCreditSnapshot,
       });
     } catch (err) {
+      if (err instanceof EntitlementError) {
+        res.status(err.statusCode).json({ error: err.message, code: err.code });
+        return;
+      }
       if (err instanceof AiServiceError) {
         res.status(err.statusCode).json({ error: err.message, code: err.code });
         return;
@@ -504,18 +713,29 @@ async function startServer() {
     }
   });
 
-  // Helper to optionally resolve verified plan tier from Authorization header
-  const resolveOptionalUserTier = async (req: express.Request): Promise<'free' | 'pro' | 'max'> => {
+  // Helper to optionally resolve verified UID & plan tier from Authorization header
+  const resolveOptionalUid = async (req: express.Request): Promise<string | undefined> => {
     const header = req.headers.authorization;
     const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
-    if (!match) return 'free';
+    if (!match) return undefined;
     try {
       const verified = await verifyFirebaseIdToken(match[1]);
-      return (await getUserPlanTier(verified.uid)) || 'free';
+      return verified.uid;
     } catch {
-      return 'free';
+      return undefined;
     }
   };
+
+  const resolveOptionalUserTier = async (
+    req: express.Request,
+    demoTier?: unknown
+  ): Promise<'free' | 'pro' | 'max'> => {
+    const uid = await resolveOptionalUid(req);
+    return resolveAuthoritativePlan(uid, demoTier);
+  };
+
+  // Серверный кэш результатов бэктеста PnL (TTL 45 сек) для предотвращения повторных нагрузок и таймаутов
+  const pnlBacktestCache = new Map<string, { report: unknown; expiresAt: number }>();
 
   // Quantitative Strategy PnL Portfolio Backtest (based on live/cached exchange candles)
   app.post('/api/strategies/pnl', expensiveLimiter, async (req, res) => {
@@ -525,6 +745,7 @@ async function startServer() {
         interval?: string;
         depositUsdt?: number;
         scope?: string;
+        demoTier?: string;
       };
       if (!Array.isArray(body.strategies) || body.strategies.length === 0) {
         res.status(400).json({ error: 'Передайте хотя бы одну стратегию для расчета PnL.' });
@@ -533,19 +754,53 @@ async function startServer() {
       let requestedInterval: '1h' | '4h' | '1d' =
         body.interval === '1d' ? '1d' : body.interval === '4h' ? '4h' : '1h';
       if (requestedInterval === '1d') {
-        const tier = await resolveOptionalUserTier(req);
+        const tier = await resolveOptionalUserTier(req, body.demoTier);
         if (tier !== 'max') {
           requestedInterval = '4h';
         }
       }
+      const strategiesSlice = body.strategies.slice(0, 40);
+      const depositUsdt = Number(body.depositUsdt || 2500);
+      const scope = body.scope === 'all' ? 'all' : 'active';
+      const cacheKey = crypto
+        .createHash('sha1')
+        .update(
+          JSON.stringify({
+            interval: requestedInterval,
+            depositUsdt,
+            scope,
+            s: strategiesSlice.map((st) => [
+              st.strategyKey,
+              st.enabled ? 1 : 0,
+              st.riskPerTradePct,
+              st.leverage,
+              Array.isArray(st.pairs) ? st.pairs.slice(0, 6).join(',') : '',
+            ]),
+          })
+        )
+        .digest('hex');
+
+      const cached = pnlBacktestCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        res.json(cached.report);
+        return;
+      }
+
       const report = await runStrategyPortfolioBacktest({
-        strategies: body.strategies.slice(0, 40),
+        strategies: strategiesSlice,
         interval: requestedInterval,
-        depositUsdt: Number(body.depositUsdt || 2500),
-        scope: body.scope === 'all' ? 'all' : 'active',
+        depositUsdt,
+        scope,
       });
+
+      if (pnlBacktestCache.size >= 40) {
+        const firstKey = pnlBacktestCache.keys().next().value;
+        if (firstKey) pnlBacktestCache.delete(firstKey);
+      }
+      pnlBacktestCache.set(cacheKey, { report, expiresAt: Date.now() + 45_000 });
       res.json(report);
     } catch (err) {
+      serverLogger.error('strategies:pnl', err);
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка расчета доходности стратегий' });
     }
   });
@@ -553,33 +808,74 @@ async function startServer() {
   // Live Multi-Pair Quantitative Strategy Scanner (PRO: top-16 pairs, MAX: all 44 pairs + 4H)
   app.post('/api/strategies/scanner', expensiveLimiter, async (req, res) => {
     try {
-      const tier = await resolveOptionalUserTier(req);
       const body = req.body as {
         timeframe?: string;
         minConfidence?: number;
         marketFilter?: 'all' | 'spot' | 'futures';
+        demoTier?: string;
+        activeStrategyConfigs?: Array<{
+          strategyKey?: string;
+          minConfidence?: number;
+          pairs?: string[];
+        }>;
       };
+      const tier = await resolveOptionalUserTier(req, body.demoTier);
 
       const maxPairs = tier === 'max' ? SUPPORTED_SYMBOLS.length : tier === 'pro' ? 16 : 3;
       const timeframe: '1h' | '4h' = tier === 'max' && body.timeframe === '4h' ? '4h' : '1h';
       const minConfidence = Math.min(95, Math.max(55, Number(body.minConfidence || 70)));
       const marketFilter = body.marketFilter === 'spot' || body.marketFilter === 'futures' ? body.marketFilter : 'all';
 
+      const customCfgMap = new Map<string, { minConfidence?: number; pairs?: string[] }>();
+      const hasExplicitActiveFilter =
+        Array.isArray(body.activeStrategyConfigs) && body.activeStrategyConfigs.length > 0;
+      if (hasExplicitActiveFilter && body.activeStrategyConfigs) {
+        for (const item of body.activeStrategyConfigs.slice(0, 32)) {
+          if (typeof item?.strategyKey === 'string' && item.strategyKey.length > 0) {
+            const validPairs = Array.isArray(item.pairs)
+              ? item.pairs
+                  .filter((p): p is string => typeof p === 'string' && (SUPPORTED_SYMBOLS as readonly string[]).includes(p))
+                  .slice(0, 8)
+              : undefined;
+            customCfgMap.set(item.strategyKey, {
+              minConfidence:
+                typeof item.minConfidence === 'number' && Number.isFinite(item.minConfidence)
+                  ? Math.min(95, Math.max(50, item.minConfidence))
+                  : undefined,
+              pairs: validPairs && validPairs.length > 0 ? validPairs : undefined,
+            });
+          }
+        }
+      }
+
       const allowedStrategies = STRATEGY_CATALOG.filter((tpl) => {
         if (marketFilter !== 'all' && tpl.marketType !== marketFilter) return false;
-        if (tier === 'free') return tpl.tier === 'free';
-        if (tier === 'pro') return tpl.tier !== 'max';
+        if (tier === 'free' && tpl.tier !== 'free') return false;
+        if (tier === 'pro' && tpl.tier === 'max') return false;
+        if (hasExplicitActiveFilter && !customCfgMap.has(tpl.key)) return false;
         return true;
-      }).map((tpl) => ({
-        strategyKey: tpl.key,
-        name: tpl.name,
-        marketType: tpl.marketType,
-        tier: tpl.tier,
-      }));
+      }).map((tpl) => {
+        const customCfg = customCfgMap.get(tpl.key);
+        return {
+          strategyKey: tpl.key,
+          name: tpl.name,
+          marketType: tpl.marketType,
+          tier: tpl.tier,
+          minConfidence: customCfg?.minConfidence,
+          pairs: customCfg?.pairs,
+        };
+      });
 
-      const scanSymbols = SUPPORTED_SYMBOLS.slice(0, maxPairs);
-      const opportunities = await runLiveStrategyScanner({
-        symbols: scanSymbols,
+      const scanSymbols = hasExplicitActiveFilter
+        ? Array.from(
+            new Set(
+              allowedStrategies.flatMap((s) => (s.pairs && s.pairs.length > 0 ? s.pairs : SUPPORTED_SYMBOLS.slice(0, 6)))
+            )
+          ).slice(0, maxPairs)
+        : SUPPORTED_SYMBOLS.slice(0, maxPairs);
+
+      const { opportunities, strategyTelemetry } = await runLiveStrategyScannerWithTelemetry({
+        symbols: scanSymbols.length > 0 ? scanSymbols : SUPPORTED_SYMBOLS.slice(0, Math.min(3, maxPairs)),
         strategies: allowedStrategies,
         timeframe,
         minConfidence,
@@ -591,9 +887,11 @@ async function startServer() {
         totalPairsAvailable: SUPPORTED_SYMBOLS.length,
         timeframe,
         opportunities,
+        strategyTelemetry,
         updatedAt: new Date().toISOString(),
       });
     } catch (err) {
+      serverLogger.error('strategies:scanner', err);
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка сканера торговых сетапов' });
     }
   });
@@ -601,18 +899,10 @@ async function startServer() {
   // Exclusive PRO/MAX Advanced Market Sentiment forecast + real Free-vs-Sentiment backtest comparison
   app.post('/api/strategies/sentiment', expensiveLimiter, async (req, res) => {
     try {
-      const dbTier = await resolveOptionalUserTier(req);
+      const uid = await resolveOptionalUid(req);
       const body = req.body as { asset?: string; interval?: string; demoTier?: string };
-      const requestedDemoTier: 'pro' | 'max' | null =
-        body.demoTier === 'max' ? 'max' : body.demoTier === 'pro' ? 'pro' : null;
-      const tier =
-        dbTier === 'max'
-          ? 'max'
-          : dbTier === 'pro'
-            ? requestedDemoTier === 'max'
-              ? 'max'
-              : 'pro'
-            : requestedDemoTier ?? 'free';
+      // В production demoTier строго игнорируется на сервере; в dev допускается для тестирования
+      const tier = await resolveAuthoritativePlan(uid, body.demoTier);
       const rawAsset = String(body.asset || 'ALL').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'ALL';
       const allowedAssets = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
       const asset = allowedAssets.has(rawAsset) ? rawAsset : 'ALL';
@@ -905,6 +1195,7 @@ async function startServer() {
 
   // 2FA Step 2: Verify initial 6-digit TOTP code and issue 8 SHA-256 hashed backup codes
   app.post('/api/security/totp/confirm', requireAuth, strictAuthLimiter, (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
       const uid = req.user!.uid;
       const { encryptedPendingSecret, code } = req.body as {
@@ -917,9 +1208,16 @@ async function startServer() {
       }
       const plainSecret = decryptSecret(encryptedPendingSecret, uid);
       if (!verifyTotpCode(plainSecret, code, 1)) {
-        res.status(401).json({ error: 'Неверный 6-значный код из приложения-аутентификатора.' });
+        const penalty = recordAuthFailure(req, 'totp');
+        res.status(401).json({
+          error:
+            penalty.lockSeconds > 0
+              ? `Неверный 6-значный код 2FA. Доступ заблокирован на ${penalty.lockSeconds} сек.`
+              : 'Неверный 6-значный код из приложения-аутентификатора.',
+        });
         return;
       }
+      clearAuthFailure(req, 'totp');
       const { plaintext, hashes } = generateBackupCodes(8);
       res.json({
         verified: true,
@@ -928,12 +1226,14 @@ async function startServer() {
         backupCodeHashes: hashes,
       });
     } catch {
+      recordAuthFailure(req, 'totp');
       res.status(400).json({ error: 'Не удалось расшифровать или проверить 2FA секрет.' });
     }
   });
 
   // 2FA Step-Up & Lock Screen Verification (supports TOTP OR single-use backup code)
   app.post('/api/security/totp/verify', requireAuth, strictAuthLimiter, (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
       const uid = req.user!.uid;
       const { encryptedSecret, code, backupCodeHashes } = req.body as {
@@ -948,12 +1248,14 @@ async function startServer() {
       const cleanCode = code.trim();
       const plainSecret = decryptSecret(encryptedSecret, uid);
       if (verifyTotpCode(plainSecret, cleanCode, 1)) {
+        clearAuthFailure(req, 'totp');
         res.json({ verified: true, method: 'totp', consumedBackupHash: null });
         return;
       }
 
       const candidateHash = hashBackupCode(cleanCode);
       if (Array.isArray(backupCodeHashes) && backupCodeHashes.includes(candidateHash)) {
+        clearAuthFailure(req, 'totp');
         res.json({
           verified: true,
           method: 'backup_code',
@@ -962,8 +1264,15 @@ async function startServer() {
         return;
       }
 
-      res.status(401).json({ error: 'Неверный код 2FA или резервный код.' });
+      const penalty = recordAuthFailure(req, 'totp');
+      res.status(401).json({
+        error:
+          penalty.lockSeconds > 0
+            ? `Неверный код 2FA. Временная блокировка на ${penalty.lockSeconds} сек.`
+            : 'Неверный код 2FA или резервный код.',
+      });
     } catch {
+      recordAuthFailure(req, 'totp');
       res.status(400).json({ error: 'Ошибка проверки 2FA.' });
     }
   });
@@ -985,13 +1294,8 @@ async function startServer() {
   >();
 
   app.get('/api/security/session-geo', async (req, res) => {
-    const rawForwarded = req.headers['x-forwarded-for'];
-    const forwardedIp = Array.isArray(rawForwarded)
-      ? rawForwarded[0]
-      : typeof rawForwarded === 'string'
-        ? rawForwarded.split(',')[0]
-        : '';
-    const candidateRaw = (forwardedIp || req.ip || req.socket.remoteAddress || '').trim();
+    // Используем только req.ip (с доверенным trust proxy=1), игнорируя поддельные X-Forwarded-For от клиента
+    const candidateRaw = (req.ip || req.socket.remoteAddress || '').trim();
     const cleanedIp = candidateRaw.replace(/^::ffff:/, '').slice(0, 64);
 
     const isPrivateIp =
@@ -1143,7 +1447,7 @@ async function startServer() {
       await processIpn(req.body as Record<string, unknown>);
       res.json({ ok: true });
     } catch (err) {
-      console.error('[billing] Ошибка обработки IPN:', err instanceof Error ? err.message : err);
+      serverLogger.error('billing', 'Ошибка обработки IPN:', err instanceof Error ? err.message : err);
       res.status(500).json({ error: 'IPN processing failed' }); // NOWPayments повторит доставку
     }
   });
@@ -1240,7 +1544,7 @@ async function startServer() {
       const result = await dispatchPushToUser(uid, {
         title: 'Vernier · Тест фоновых уведомлений',
         body: 'Push-канал активен. Вы будете получать сигналы стратегий и рыночные импульсы даже при закрытом приложении.',
-        tag: 'aegisquant-test',
+        tag: 'vernier-test',
         url: '/?tab=security',
         impact: 'HIGH',
         category: 'test',
@@ -1490,6 +1794,7 @@ async function startServer() {
 
   // Exchange Integration: Verify API credentials against exchange, fetch initial balances, encrypt secrets
   app.post('/api/exchanges/connect', requireAuth, strictAuthLimiter, async (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'exchange_connect')) return;
     try {
       const uid = req.user!.uid;
       const body = req.body as Record<string, unknown>;
@@ -1525,8 +1830,10 @@ async function startServer() {
         testnet,
       });
 
-      res.json({ ok: true, ...result });
+      clearAuthFailure(req, 'exchange_connect');
+      res.json({ ok: true, ...result, maxTestnetOrderUsdt: MAX_TESTNET_ORDER_USDT });
     } catch (err) {
+      recordAuthFailure(req, 'exchange_connect');
       if (err instanceof ExchangeApiError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
@@ -1570,17 +1877,19 @@ async function startServer() {
     }
   });
 
-  // Exchange Integration: Execute Spot or Futures order on connected exchange
+  // Exchange Integration: Execute Testnet Spot/Futures order (Live Trade заблокирован на сервере; клиентские permissions игнорируются)
   app.post('/api/exchanges/order', requireAuth, strictAuthLimiter, async (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'exchange_order')) return;
     try {
       const uid = req.user!.uid;
       const body = req.body as Record<string, unknown>;
       const exchange = body.exchange;
-      const permissions = body.permissions;
       const encryptedApiKey = typeof body.encryptedApiKey === 'string' ? body.encryptedApiKey : '';
       const encryptedApiSecret = typeof body.encryptedApiSecret === 'string' ? body.encryptedApiSecret : '';
       const encryptedPassphrase = typeof body.encryptedPassphrase === 'string' ? body.encryptedPassphrase : '';
       const testnet = Boolean(body.testnet);
+      const confirmResponsibility = body.confirmResponsibility === true;
+      const confirmStatement = typeof body.confirmStatement === 'string' ? body.confirmStatement.trim() : '';
       const symbol = typeof body.symbol === 'string' ? body.symbol : '';
       const marketType = body.marketType === 'futures' ? 'futures' : 'spot';
       const side = body.side === 'SELL' ? 'SELL' : body.side === 'BUY' ? 'BUY' : null;
@@ -1590,7 +1899,7 @@ async function startServer() {
       const stopLoss = body.stopLoss !== undefined ? Number(body.stopLoss) : undefined;
       const takeProfit = body.takeProfit !== undefined ? Number(body.takeProfit) : undefined;
 
-      if (!isValidExchangeId(exchange) || !isValidPermissions(permissions) || !side) {
+      if (!isValidExchangeId(exchange) || !side) {
         res.status(400).json({ error: 'Некорректные параметры торгового ордера.' });
         return;
       }
@@ -1605,8 +1914,9 @@ async function startServer() {
         encryptedApiKey,
         encryptedApiSecret,
         encryptedPassphrase,
-        permissions,
         testnet,
+        confirmResponsibility,
+        confirmStatement,
         symbol,
         marketType,
         side,
@@ -1617,6 +1927,7 @@ async function startServer() {
         takeProfit,
       });
 
+      clearAuthFailure(req, 'exchange_order');
       res.json({ ok: true, order });
     } catch (err) {
       if (err instanceof ExchangeApiError) {
@@ -1825,7 +2136,7 @@ async function startServer() {
   startProExpiryMonitor();
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Vernier server listening on http://0.0.0.0:${PORT}`);
+    serverLogger.info('server', `Vernier server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

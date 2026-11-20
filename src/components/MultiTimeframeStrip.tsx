@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import type { IndicatorSnapshot, MarketType, Timeframe } from '../types/domain';
+import { CACHE_TTL, fetchWithSWR, isPageVisible, subscribePageVisibility } from '../utils/cache';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 
 const FRAMES: Array<{ tf: Timeframe; label: string }> = [
   { tf: '15m', label: '15м' },
@@ -46,35 +48,66 @@ export const MultiTimeframeStrip: React.FC<MultiTimeframeStripProps> = ({
   const [frames, setFrames] = useState<Partial<Record<Timeframe, FrameState>>>({});
 
   useEffect(() => {
-    let cancelled = false;
+    let activeController: AbortController | null = null;
     setFrames({});
+
     const load = async () => {
-      if (typeof document !== 'undefined' && document.hidden) return;
+      if (!isPageVisible()) return;
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+
       const results = await Promise.all(
         FRAMES.map(async ({ tf }) => {
           try {
-            const res = await fetch(`/api/market/candles?symbol=${symbol}&interval=${tf}&marketType=${marketType}`);
-            if (!res.ok) return null;
-            const data = (await res.json()) as { indicators?: IndicatorSnapshot; source?: 'live' | 'cached' };
+            const data = await fetchWithSWR<{ indicators?: IndicatorSnapshot; source?: 'live' | 'cached' }>(
+              `mtf:${symbol}:${marketType}:${tf}`,
+              async (signal) => {
+                const res = await fetch(
+                  `/api/market/candles?symbol=${symbol}&interval=${tf}&marketType=${marketType}`,
+                  { signal }
+                );
+                const parsed = await parseJsonResponse<{
+                  indicators?: IndicatorSnapshot;
+                  source?: 'live' | 'cached';
+                }>(res);
+                if (!parsed.ok || !parsed.data) {
+                  throw new Error(parsed.errorMessage || 'Candle fetch failed');
+                }
+                return parsed.data;
+              },
+              {
+                ttlMs: CACHE_TTL.MULTI_TF_MS,
+                signal: controller.signal,
+              }
+            );
             if (!data.indicators) return null;
-            return [tf, { bias: data.indicators.trendBias, rsi: data.indicators.rsi14, live: data.source === 'live' }] as const;
+            return [
+              tf,
+              { bias: data.indicators.trendBias, rsi: data.indicators.rsi14, live: data.source === 'live' },
+            ] as const;
           } catch {
             return null;
           }
         })
       );
-      if (cancelled) return;
+      if (controller.signal.aborted) return;
       setFrames((prev) => {
         const next = { ...prev };
         for (const item of results) if (item) next[item[0]] = item[1];
         return next;
       });
     };
+
     void load();
     const timer = window.setInterval(() => void load(), REFRESH_MS);
+    const unsubVis = subscribePageVisibility((visible) => {
+      if (visible) void load();
+    });
     return () => {
-      cancelled = true;
+      activeController?.abort();
       window.clearInterval(timer);
+      unsubVis();
     };
   }, [symbol, marketType]);
 
@@ -125,8 +158,11 @@ export const MultiTimeframeStrip: React.FC<MultiTimeframeStripProps> = ({
               <div className="text-[10px] font-semibold text-slate-400">{label}</div>
               {ui && f ? (
                 <>
-                  <div className={`mt-0.5 text-sm font-bold ${ui.cls}`}>
-                    {ui.arrow} <span className="text-[11px] font-semibold">{ui.label}</span>
+                  <div
+                    className={`mt-0.5 text-xs font-bold inline-flex items-center justify-center gap-1 whitespace-nowrap ${ui.cls}`}
+                  >
+                    <span className="leading-none">{ui.arrow}</span>
+                    <span className="text-[11px] font-semibold leading-none">{ui.label}</span>
                   </div>
                   <div className="text-[10px] font-mono tabular-nums text-slate-500">RSI {Math.round(f.rsi)}</div>
                 </>

@@ -277,10 +277,48 @@ export function sanitizePlainText(value: string, maxLen = 400): string {
     .slice(0, maxLen);
 }
 
+export const PBKDF2_ITERATIONS = 310_000;
+const PIN_LOCKOUT_STORAGE_KEY = 'vernier_pin_lockout_v1';
+
+// Очистка старого небезопасного ключа устройства из localStorage, если он оставался от прежней версии
+if (typeof window !== 'undefined') {
+  try {
+    window.localStorage.removeItem('vernier_device_aes_salt_v1');
+  } catch {
+    // ignore
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 /**
- * Хэширование 4-значного PIN-кода через Web Crypto SHA-256 с солью приложения.
+ * Устаревший SHA-256 хэш — используется только для прозрачной миграции существующих PIN-кодов на PBKDF2.
  */
-export async function hashPinSha256(pin: string): Promise<string> {
+export async function hashPinLegacySha256(pin: string): Promise<string> {
   const normalized = `vernier-pin-v1::${pin.trim()}`;
   const data = new TextEncoder().encode(normalized);
   if (typeof window !== 'undefined' && window.crypto?.subtle) {
@@ -289,7 +327,6 @@ export async function hashPinSha256(pin: string): Promise<string> {
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
   }
-  // Фолбэк для сред без subtle (например, небезопасный http)
   let h = 2166136261;
   for (let i = 0; i < normalized.length; i += 1) {
     h ^= normalized.charCodeAt(i);
@@ -298,51 +335,261 @@ export async function hashPinSha256(pin: string): Promise<string> {
   return `fnv1a_${(h >>> 0).toString(16)}`;
 }
 
-const LOCAL_CRYPTO_SEED_KEY = 'vernier_device_aes_salt_v1';
+/**
+ * Криптографическое хэширование PIN-кода через Web Crypto PBKDF2 (SHA-256, 310 000 итераций)
+ * со случайной 16-байтной солью, хранимой отдельно от хэша.
+ */
+export async function derivePinPbkdf2(
+  pin: string,
+  saltBase64?: string
+): Promise<{ hash: string; salt: string }> {
+  const saltBytes = saltBase64
+    ? base64ToBytes(saltBase64)
+    : (() => {
+        const buf = new Uint8Array(16);
+        window.crypto.getRandomValues(buf);
+        return buf;
+      })();
+  const salt = saltBase64 || bytesToBase64(saltBytes);
 
-async function getDeviceAesKey(): Promise<CryptoKey | null> {
-  if (typeof window === 'undefined' || !window.crypto?.subtle) return null;
-  let saltB64 = window.localStorage.getItem(LOCAL_CRYPTO_SEED_KEY);
-  if (!saltB64) {
-    const random = new Uint8Array(32);
-    window.crypto.getRandomValues(random);
-    saltB64 = btoa(String.fromCharCode(...random));
-    window.localStorage.setItem(LOCAL_CRYPTO_SEED_KEY, saltB64);
+  if (typeof window !== 'undefined' && window.crypto?.subtle) {
+    const keyMaterial = await window.crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(pin.trim()),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveBits']
+    );
+    const derivedBits = await window.crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt: saltBytes as BufferSource,
+        iterations: PBKDF2_ITERATIONS,
+        hash: 'SHA-256',
+      },
+      keyMaterial,
+      256
+    );
+    const hash = `pbkdf2_v2:${bytesToBase64(new Uint8Array(derivedBits))}`;
+    return { hash, salt };
   }
-  const rawBytes = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
-  return window.crypto.subtle.importKey('raw', rawBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+
+  // Fallback только если SubtleCrypto недоступен в небезопасном контексте
+  const legacy = await hashPinLegacySha256(`${salt}:${pin}`);
+  return { hash: `legacy_fallback:${legacy}`, salt };
 }
 
 /**
- * Шифрование локального секрета (например, Read-Only API ключа в локальном режиме) через Web Crypto AES-GCM.
+ * Проверка PIN-кода: поддерживает новый PBKDF2 (310 000 итераций + соль) и миграцию со старого SHA-256.
  */
-export async function encryptLocalSecret(plainText: string): Promise<string> {
-  const key = await getDeviceAesKey();
-  if (!key) {
-    return `b64:${btoa(unescape(encodeURIComponent(plainText)))}`;
+export async function verifyPinWithMigration(
+  candidatePin: string,
+  storedHash: string,
+  storedSalt: string | null
+): Promise<{ valid: boolean; migrated?: { hash: string; salt: string } }> {
+  if (!storedHash) return { valid: false };
+
+  if (storedHash.startsWith('pbkdf2_v2:') && storedSalt) {
+    const { hash } = await derivePinPbkdf2(candidatePin, storedSalt);
+    return { valid: constantTimeStringEqual(hash, storedHash) };
   }
-  const iv = new Uint8Array(12);
-  window.crypto.getRandomValues(iv);
-  const encoded = new TextEncoder().encode(plainText);
-  const cipherBuf = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
-  const combined = new Uint8Array(iv.length + cipherBuf.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(cipherBuf), iv.length);
-  return `aesgcm:${btoa(String.fromCharCode(...combined))}`;
+
+  // Обратная совместимость со старым SHA-256 + автоматическая миграция на PBKDF2
+  const legacyCandidate = await hashPinLegacySha256(candidatePin);
+  if (constantTimeStringEqual(legacyCandidate, storedHash)) {
+    const upgraded = await derivePinPbkdf2(candidatePin);
+    return { valid: true, migrated: upgraded };
+  }
+  return { valid: false };
 }
 
-export async function decryptLocalSecret(payload: string): Promise<string | null> {
+/** @deprecated Используйте derivePinPbkdf2 */
+export async function hashPinSha256(pin: string): Promise<string> {
+  const { hash } = await derivePinPbkdf2(pin);
+  return hash;
+}
+
+// ---------- Защита от перебора PIN-кода (Brute-Force Lockout) ----------
+
+export interface PinLockoutState {
+  failedAttempts: number;
+  lockedUntilMs: number;
+  remainingSeconds: number;
+  canWipeVault: boolean;
+}
+
+function readRawPinLockout(): { failedAttempts: number; lockedUntilMs: number } {
+  if (typeof window === 'undefined') return { failedAttempts: 0, lockedUntilMs: 0 };
   try {
-    if (payload.startsWith('b64:')) {
-      return decodeURIComponent(escape(atob(payload.slice(4))));
+    const raw = window.localStorage.getItem(PIN_LOCKOUT_STORAGE_KEY);
+    if (!raw) return { failedAttempts: 0, lockedUntilMs: 0 };
+    const parsed = JSON.parse(raw) as { failedAttempts?: unknown; lockedUntilMs?: unknown };
+    return {
+      failedAttempts: Math.max(0, Number(parsed.failedAttempts) || 0),
+      lockedUntilMs: Math.max(0, Number(parsed.lockedUntilMs) || 0),
+    };
+  } catch {
+    return { failedAttempts: 0, lockedUntilMs: 0 };
+  }
+}
+
+export function getPinLockoutState(): PinLockoutState {
+  const raw = readRawPinLockout();
+  const remainingMs = Math.max(0, raw.lockedUntilMs - Date.now());
+  return {
+    failedAttempts: raw.failedAttempts,
+    lockedUntilMs: raw.lockedUntilMs,
+    remainingSeconds: Math.ceil(remainingMs / 1000),
+    canWipeVault: raw.failedAttempts >= 10,
+  };
+}
+
+export function recordPinFailure(): PinLockoutState {
+  const prev = readRawPinLockout();
+  const nextAttempts = prev.failedAttempts + 1;
+  let lockDurationMs = 0;
+  if (nextAttempts >= 8) {
+    lockDurationMs = 5 * 60 * 1000; // 5 минут после 8 неудач
+  } else if (nextAttempts >= 5) {
+    lockDurationMs = 30 * 1000; // 30 секунд после 5 неудач
+  }
+  const lockedUntilMs = lockDurationMs > 0 ? Date.now() + lockDurationMs : 0;
+  try {
+    window.localStorage.setItem(
+      PIN_LOCKOUT_STORAGE_KEY,
+      JSON.stringify({ failedAttempts: nextAttempts, lockedUntilMs })
+    );
+  } catch {
+    // ignore
+  }
+  return getPinLockoutState();
+}
+
+export function resetPinFailures(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(PIN_LOCKOUT_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// ---------- Локальный AES-GCM сейф на базе PBKDF2 (НИКОГДА не хранит сырой ключ в localStorage) ----------
+
+// Расшифрованные секреты и производная мастер-фраза живут ТОЛЬКО в оперативной памяти текущей сессии
+let sessionVaultPassphrase: string | null = null;
+const decryptedSecretsMemoryCache = new Map<string, string>();
+
+export function setSessionVaultPassphrase(passphrase: string | null): void {
+  sessionVaultPassphrase = passphrase ? passphrase.trim() : null;
+}
+
+export function hasSessionVaultPassphrase(): boolean {
+  return Boolean(sessionVaultPassphrase && sessionVaultPassphrase.length >= 4);
+}
+
+/**
+ * Очищает расшифрованные секреты и сессионную ключевую фразу из оперативной памяти.
+ * Обязательно вызывается при блокировке PIN/2FA, автоблокировке и выходе из аккаунта.
+ */
+export function clearDecryptedSecretsFromMemory(): void {
+  sessionVaultPassphrase = null;
+  decryptedSecretsMemoryCache.clear();
+}
+
+export function cacheDecryptedSecretInMemory(id: string, value: string): void {
+  decryptedSecretsMemoryCache.set(id, value);
+}
+
+export function getDecryptedSecretFromMemory(id: string): string | null {
+  return decryptedSecretsMemoryCache.get(id) ?? null;
+}
+
+async function deriveVaultAesKeyFromPassphrase(
+  passphrase: string,
+  saltBytes: Uint8Array
+): Promise<CryptoKey> {
+  if (typeof window === 'undefined' || !window.crypto?.subtle) {
+    throw new Error('Web Crypto SubtleCrypto недоступен в текущей среде.');
+  }
+  const baseKey = await window.crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveKey']
+  );
+  return window.crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes as BufferSource,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/**
+ * Шифрование локального секрета (Read-Only API-ключ) через Web Crypto AES-256-GCM
+ * с производным ключом PBKDF2 (310 000 итераций), случайной 16-байтной солью и свежим 12-байтным IV.
+ * Сырой ключ шифрования НИКОГДА не сохраняется в localStorage.
+ */
+export async function encryptLocalSecret(
+  plainText: string,
+  explicitPassphrase?: string
+): Promise<string> {
+  const secretPassphrase = (explicitPassphrase || sessionVaultPassphrase || '').trim();
+  if (secretPassphrase.length < 4) {
+    throw new Error(
+      'Для шифрования локального API-ключа укажите мастер-пароль сейфа или 4-значный PIN-код (минимум 4 символа).'
+    );
+  }
+  if (typeof window === 'undefined' || !window.crypto?.subtle) {
+    throw new Error('Web Crypto API (HTTPS) обязателен для безопасного шифрования ключей.');
+  }
+
+  const salt = new Uint8Array(16);
+  const iv = new Uint8Array(12);
+  window.crypto.getRandomValues(salt);
+  window.crypto.getRandomValues(iv);
+
+  const key = await deriveVaultAesKeyFromPassphrase(secretPassphrase, salt);
+  const encoded = new TextEncoder().encode(plainText);
+  const cipherBuf = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+
+  return `pbkdf2-aesgcm:v2:${bytesToBase64(salt)}:${bytesToBase64(iv)}:${bytesToBase64(new Uint8Array(cipherBuf))}`;
+}
+
+/**
+ * Расшифровка локального секрета AES-256-GCM с использованием PIN/мастер-фразы.
+ */
+export async function decryptLocalSecret(
+  payload: string,
+  explicitPassphrase?: string
+): Promise<string | null> {
+  try {
+    if (!payload.startsWith('pbkdf2-aesgcm:v2:')) {
+      return null;
     }
-    if (!payload.startsWith('aesgcm:')) return null;
-    const key = await getDeviceAesKey();
-    if (!key) return null;
-    const combined = Uint8Array.from(atob(payload.slice(7)), (c) => c.charCodeAt(0));
-    const iv = combined.slice(0, 12);
-    const data = combined.slice(12);
-    const plainBuf = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    const secretPassphrase = (explicitPassphrase || sessionVaultPassphrase || '').trim();
+    if (secretPassphrase.length < 4) return null;
+
+    const parts = payload.split(':');
+    if (parts.length !== 5) return null;
+    const salt = base64ToBytes(parts[2]);
+    const iv = base64ToBytes(parts[3]);
+    const data = base64ToBytes(parts[4]);
+
+    const key = await deriveVaultAesKeyFromPassphrase(secretPassphrase, salt);
+    const plainBuf = await window.crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource },
+      key,
+      data as BufferSource
+    );
     return new TextDecoder().decode(plainBuf);
   } catch {
     return null;

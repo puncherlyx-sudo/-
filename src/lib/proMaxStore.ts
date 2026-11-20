@@ -335,11 +335,13 @@ export function evaluateTiltGuardAfterLoss(lossUsdt: number, baseEquity = 10_000
   return next;
 }
 
-export function triggerManualCooldown(): TiltGuardConfig {
+export function triggerManualCooldown(minutesOverride?: 15 | 30 | 60): TiltGuardConfig {
   const cfg = readTiltGuardConfig();
+  const mins = minutesOverride ?? cfg.cooldownMinutes;
   const next: TiltGuardConfig = {
     ...cfg,
-    cooldownUntilMs: Date.now() + cfg.cooldownMinutes * 60_000,
+    cooldownMinutes: mins,
+    cooldownUntilMs: Date.now() + mins * 60_000,
     totalTriggers: cfg.totalTriggers + 1,
   };
   writeTiltGuardConfig(next);

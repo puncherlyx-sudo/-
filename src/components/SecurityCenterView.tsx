@@ -6,6 +6,7 @@ import {
   Bell,
   BellOff,
   BellRing,
+  BookOpen,
   CheckCircle2,
   ChevronRight,
   Clock,
@@ -38,6 +39,7 @@ import {
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import type { PortfolioSourceMeta } from '../hooks/usePaperPortfolio';
+import { ApiFieldTooltip } from './ApiFieldTooltip';
 import type { PushPreferences } from '../hooks/usePushNotifications';
 import type {
   ExchangeId,
@@ -55,13 +57,17 @@ import type {
 } from '../types/domain';
 import { ActiveSessionsPanel } from './ActiveSessionsPanel';
 import { EditExchangeKeyModal } from './EditExchangeKeyModal';
+import { ExchangeApiGuide } from './ExchangeApiGuide';
 import { ExchangeIntegrationPanel } from './ExchangeIntegrationPanel';
 import { FeatureGuide } from './FeatureGuide';
 import { StaggerDeck } from './MotionPrimitives';
 import { PriceAlertsPanel } from './PriceAlertsPanel';
 import { SecurityAuditActivityChart } from './SecurityAuditActivityChart';
-import { SecurityFaqSection } from './SecurityFaqSection';
 import { SecurityStrengthIndicator } from './SecurityStrengthIndicator';
+
+const LazySecurityFaqSection = React.lazy(() =>
+  import('./SecurityFaqSection').then((m) => ({ default: m.SecurityFaqSection }))
+);
 import { SessionGeoMapPanel } from './SessionGeoMapPanel';
 import { TiltGuardPanel } from './TiltGuardPanel';
 import { WebhookBuilderModal } from './WebhookBuilderModal';
@@ -98,6 +104,7 @@ export type SecuritySection =
   | 'settings'
   | '2fa'
   | 'exchanges'
+  | 'api-guide'
   | 'push'
   | 'alerts'
   | 'sessions'
@@ -290,6 +297,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const [localKeyLabel, setLocalKeyLabel] = useState('');
   const [localApiKey, setLocalApiKey] = useState('');
   const [localApiSecret, setLocalApiSecret] = useState('');
+  const [localVaultPassphrase, setLocalVaultPassphrase] = useState('');
   const [localKeyDlpError, setLocalKeyDlpError] = useState<string | null>(null);
   const [localKeySavedNotice, setLocalKeySavedNotice] = useState<string | null>(null);
   const [deleteStepOpen, setDeleteStepOpen] = useState(false);
@@ -556,10 +564,14 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const sectionMetaMap: Record<SecuritySection, { title: string; subtitle: string }> = {
     meter: { title: 'Индекс защиты', subtitle: 'Детальный чек-лист безопасности профиля' },
     exchanges: { title: 'Интеграция бирж', subtitle: 'Read-Only API · Шифрование AES-GCM' },
+    'api-guide': {
+      title: 'Руководство по подключению API',
+      subtitle: 'Binance, Bybit, OKX · Права Read-Only без вывода',
+    },
     alerts: { title: 'Ценовые алерты и Webhook', subtitle: 'Триггеры цены, индикаторов и Telegram' },
     tilt: { title: 'Анти-FOMO / Tilt-Guard', subtitle: 'Контроль лимитов потерь и дисциплины (MAX)' },
     '2fa': { title: '2FA и резервные коды', subtitle: 'TOTP Google Authenticator и автоблокировка' },
-    settings: { title: 'PIN-код и антифишинг', subtitle: 'Локальный PIN SHA-256 и защита от фишинга' },
+    settings: { title: 'PIN-код и антифишинг', subtitle: 'PIN-код (PBKDF2), таймер и антифишинг' },
     sessions: { title: 'Сессии и карта входов', subtitle: 'Активные устройства и геолокация' },
     push: { title: 'Push-уведомления PWA', subtitle: 'Критические оповещения в реальном времени' },
     legal: { title: 'Данные и Закон', subtitle: 'GDPR · Google Play · Закон Украины № 2297-VI' },
@@ -613,6 +625,8 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                 <img
                   src="/src/assets/images/terminal_icon_vault_1794855844198.jpg"
                   alt="Центр защиты VERNIER"
+                  width={44}
+                  height={44}
                   referrerPolicy="no-referrer"
                   className="w-11 h-11 rounded-xl object-cover border border-emerald-500/30 shrink-0"
                 />
@@ -631,10 +645,15 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                         isSignedIn ? 'bg-emerald-400' : 'bg-amber-400'
                       }`}
                     />
-                    <span>
-                      {isSignedIn
-                        ? 'Google OAuth подключён · Non-Custodial'
-                        : 'Гостевой режим · Войдите через Google OAuth'}
+                    <span className="leading-snug">
+                      {isSignedIn ? (
+                        <>
+                          Google OAuth подключён ·{' '}
+                          <span className="whitespace-nowrap">Non-Custodial</span>
+                        </>
+                      ) : (
+                        'Гостевой режим · Войдите через Google OAuth'
+                      )}
                     </span>
                   </div>
                 </div>
@@ -724,6 +743,33 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                     }`}
                   >
                     {connectedExchangeMeta.label}
+                  </span>
+                  <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
+                </div>
+              </button>
+
+              {/* 1b. Руководство по подключению API (Binance, Bybit, OKX + Безопасность) */}
+              <button
+                type="button"
+                onClick={() => openInnerSection('api-guide')}
+                className="w-full min-h-[58px] px-4 py-3 text-left flex items-center justify-between gap-3 hover:bg-white/[0.03] transition-colors"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="w-9 h-9 rounded-xl border border-cyan-500/25 bg-cyan-500/10 text-cyan-300 flex items-center justify-center shrink-0">
+                    <BookOpen className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white leading-snug">
+                      Руководство по подключению API
+                    </div>
+                    <div className="text-xs text-slate-400 truncate">
+                      Пошагово для Binance, Bybit, OKX · Безопасность Read-Only
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="px-2 py-0.5 rounded-lg text-[10px] font-mono font-semibold border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 whitespace-nowrap">
+                    Гайд
                   </span>
                   <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
                 </div>
@@ -839,7 +885,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       PIN-код, автоблокировка и антифишинг
                     </div>
                     <div className="text-xs text-slate-400 truncate">
-                      {antiPhishingCode ? `Код: ${antiPhishingCode}` : '4-значный PIN SHA-256 и секретный код'}
+                      {antiPhishingCode ? `Код: ${antiPhishingCode}` : 'PIN-код (PBKDF2), таймер и антифишинг'}
                     </div>
                   </div>
                 </div>
@@ -1116,7 +1162,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
       ) : (
         <div className="max-w-4xl mx-auto space-y-4">
           {/* Sticky Inner Sub-Screen Header */}
-          <div className="sticky top-[56px] z-20 -mx-1 px-3 py-2.5 rounded-2xl border border-emerald-500/20 bg-[var(--surface-1)]/95 backdrop-blur-md flex items-center justify-between gap-3 shadow-lg shadow-black/30">
+          <div className="sticky top-[56px] z-20 -mx-1 px-3 py-2.5 rounded-2xl border border-emerald-500/20 bg-[var(--surface-1)] flex items-center justify-between gap-3 shadow-lg shadow-black/30">
             <button
               type="button"
               onClick={() => {
@@ -1326,7 +1372,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                 </div>
 
                 <p className="text-xs text-slate-400">
-                  Локальный 4-значный PIN-код (SHA-256) защищает доступ к терминалу при сворачивании или простое.
+                  Локальный 4-значный PIN-код (PBKDF2) защищает доступ к терминалу при сворачивании или простое.
                 </p>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -1370,7 +1416,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       await onSavePin?.(newPinInput);
                       setNewPinInput('');
                       setPinConfirmInput('');
-                      setPinStatusMsg('PIN-код успешно сохранён (SHA-256).');
+                      setPinStatusMsg('PIN-код успешно сохранён (PBKDF2).');
                     }}
                     className="min-h-[36px] px-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
                   >
@@ -1550,6 +1596,8 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                         <img
                           src={setupQr}
                           alt="QR-код для Google Authenticator"
+                          width={144}
+                          height={144}
                           className="w-36 h-36 rounded-lg bg-white p-1.5 shrink-0"
                         />
                         <div className="space-y-2 text-xs text-slate-300">
@@ -1680,66 +1728,132 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       setLocalKeyDlpError('Заполните API Key и API Secret (только Read-Only).');
                       return;
                     }
-                    const encryptedPayload = await encryptLocalSecret(
-                      JSON.stringify({ apiKey: localApiKey.trim(), apiSecret: localApiSecret.trim() })
-                    );
-                    const nextItem: LocalReadOnlyExchangeKey = {
-                      id: `lkey_${Date.now()}`,
-                      exchange: localExch,
-                      label: sanitizePlainText(localKeyLabel || `${localExch.toUpperCase()} Read-Only`, 40),
-                      maskedKey: `${localApiKey.trim().slice(0, 4)}••••${localApiKey.trim().slice(-4)}`,
-                      encryptedPayload,
-                      readOnlyVerified: true,
-                      createdAt: new Date().toISOString(),
-                    };
-                    const nextList = [nextItem, ...localKeys];
-                    setLocalKeys(nextList);
-                    writeLocalReadOnlyKeys(nextList);
-                    setLocalKeyLabel('');
-                    setLocalApiKey('');
-                    setLocalApiSecret('');
-                    setLocalKeySavedNotice('Ключ зашифрован AES-256-GCM и сохранён локально с меткой Read-Only.');
-                    triggerHaptic(12);
+                    try {
+                      const encryptedPayload = await encryptLocalSecret(
+                        JSON.stringify({ apiKey: localApiKey.trim(), apiSecret: localApiSecret.trim() }),
+                        localVaultPassphrase.trim() || undefined
+                      );
+                      const nextItem: LocalReadOnlyExchangeKey = {
+                        id: `lkey_${Date.now()}`,
+                        exchange: localExch,
+                        label: sanitizePlainText(localKeyLabel || `${localExch.toUpperCase()} Read-Only`, 40),
+                        maskedKey: `${localApiKey.trim().slice(0, 4)}••••${localApiKey.trim().slice(-4)}`,
+                        encryptedPayload,
+                        readOnlyVerified: true,
+                        createdAt: new Date().toISOString(),
+                      };
+                      const nextList = [nextItem, ...localKeys];
+                      setLocalKeys(nextList);
+                      writeLocalReadOnlyKeys(nextList);
+                      setLocalKeyLabel('');
+                      setLocalApiKey('');
+                      setLocalApiSecret('');
+                      setLocalVaultPassphrase('');
+                      setLocalKeySavedNotice(
+                        'Ключ зашифрован PBKDF2 + AES-256-GCM и сохранён локально с меткой Read-Only.'
+                      );
+                      triggerHaptic(12);
+                    } catch (err) {
+                      setLocalKeyDlpError(
+                        err instanceof Error
+                          ? err.message
+                          : 'Укажите мастер-фразу сейфа (от 4 символов) или активируйте PIN-код выше.'
+                      );
+                    }
                   }}
                   className="grid grid-cols-1 sm:grid-cols-2 gap-2.5"
                 >
-                  <select
-                    value={localExch}
-                    onChange={(e) => setLocalExch(e.target.value as 'binance' | 'bybit' | 'okx')}
-                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
-                  >
-                    <option value="binance">Binance (Read-Only)</option>
-                    <option value="bybit">Bybit (Read-Only)</option>
-                    <option value="okx">OKX (Read-Only)</option>
-                  </select>
-                  <input
-                    type="text"
-                    value={localKeyLabel}
-                    onChange={(e) => setLocalKeyLabel(e.target.value)}
-                    placeholder="Название ключа (напр. Спот-аналитика)"
-                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
-                  />
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={localApiKey}
-                    onChange={(e) => setLocalApiKey(e.target.value)}
-                    placeholder="API Key (маскируется ••••)"
-                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
-                  />
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={localApiSecret}
-                    onChange={(e) => setLocalApiSecret(e.target.value)}
-                    placeholder="API Secret (маскируется ••••)"
-                    className="min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
-                  />
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                      <span>Биржа (только Read-Only)</span>
+                      <ApiFieldTooltip
+                        title="Почему только Read-Only?"
+                        body="Локальный сейф предназначен для безопасного хранения ключей чтения. VERNIER никогда не требует права «Withdraw» (вывод средств)."
+                      />
+                    </div>
+                    <div className="grid grid-cols-3 gap-1 p-1 rounded-xl border border-white/10 bg-[#0B0F17]">
+                      {(['binance', 'bybit', 'okx'] as const).map((ex) => (
+                        <button
+                          key={ex}
+                          type="button"
+                          onClick={() => setLocalExch(ex)}
+                          className={`min-h-[30px] rounded-lg text-[11px] font-semibold uppercase transition-colors ${
+                            localExch === ex
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {ex}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-[11px] text-slate-300 block">Название ключа</span>
+                    <input
+                      type="text"
+                      value={localKeyLabel}
+                      onChange={(e) => setLocalKeyLabel(e.target.value)}
+                      placeholder="Напр. Спот-аналитика"
+                      className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                      <span>API Key (Read-Only)</span>
+                      <ApiFieldTooltip
+                        title="Публичный API Key"
+                        body="Используется только для чтения баланса. Убедитесь, что в кабинете биржи отключён вывод средств (Withdrawals)."
+                      />
+                    </div>
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      value={localApiKey}
+                      onChange={(e) => setLocalApiKey(e.target.value)}
+                      placeholder="API Key (маскируется ••••)"
+                      className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                      <span>API Secret</span>
+                      <ApiFieldTooltip
+                        title="API Secret (AES-256-GCM)"
+                        body="Шифруется локально алгоритмом PBKDF2 + AES-256-GCM. Без включённого флага Withdraw на бирже ключ физически не может вывести средства."
+                      />
+                    </div>
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      value={localApiSecret}
+                      onChange={(e) => setLocalApiSecret(e.target.value)}
+                      placeholder="API Secret (маскируется ••••)"
+                      className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs font-mono text-white"
+                    />
+                  </div>
+                  <div className="sm:col-span-2 space-y-1">
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                      <span>Мастер-фраза локального сейфа</span>
+                      <ApiFieldTooltip
+                        title="Только Read-Only · Без вывода средств"
+                        body="Мы запрашиваем только права «Read-Only» и никогда не требуем доступ к выводу средств (Withdrawals). Мастер-фраза шифрует ключи локально в вашем браузере (PBKDF2 + AES-256-GCM)."
+                      />
+                    </div>
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={localVaultPassphrase}
+                      onChange={(e) => setLocalVaultPassphrase(e.target.value)}
+                      placeholder="Мастер-фраза сейфа (от 4 симв. или ваш PIN-код)"
+                      className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
+                    />
+                  </div>
                   <button
                     type="submit"
                     className="sm:col-span-2 min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
                   >
-                    Зашифровать и сохранить локально (AES-GCM Read-Only)
+                    Зашифровать и сохранить локально (PBKDF2 + AES-GCM Read-Only)
                   </button>
                 </form>
 
@@ -1792,6 +1906,57 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
               onPlaceOrder={onPlaceExchangeOrder}
             />
           )
+        )}
+
+        {section === 'api-guide' && (
+          <div className="space-y-4">
+            {/* Блок «Безопасность» — почему нужны только права Read-Only */}
+            <section className="rounded-2xl border border-emerald-500/30 bg-emerald-500/[0.06] p-4 sm:p-5 space-y-3">
+              <div className="flex items-center gap-2.5">
+                <span className="w-9 h-9 rounded-xl border border-emerald-500/35 bg-emerald-500/15 text-emerald-300 flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-5 h-5" />
+                </span>
+                <div>
+                  <h2 className="text-sm sm:text-base font-bold text-white">
+                    Безопасность: только права Read-Only
+                  </h2>
+                  <p className="text-[11px] text-emerald-200/80">
+                    Архитектура <span className="whitespace-nowrap">Non-Custodial</span> · Без доступа к выводу средств
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                <div className="rounded-xl border border-emerald-500/25 bg-[#0B0F17] p-3 space-y-1">
+                  <div className="font-semibold text-emerald-300">✓ Что разрешаем: Read-Only</div>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Права «Чтение» (Enable Reading / Read-Only) позволяют безопасно синхронизировать балансы, открытые позиции и историю PnL с биржи в аналитику VERNIER.
+                  </p>
+                </div>
+                <div className="rounded-xl border border-rose-500/25 bg-[#0B0F17] p-3 space-y-1">
+                  <div className="font-semibold text-rose-300">✕ Что запрещаем: Вывод средств</div>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Мы никогда не требуем права на вывод средств (Enable Withdrawals / Internal Transfer). Даже при компрометации устройства ваши активы физически не могут покинуть биржу.
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            {/* Пошаговые инструкции с визуальными схемами для Binance, Bybit и OKX */}
+            <ExchangeApiGuide initialExchange="binance" />
+
+            {/* Переход к подключению API-ключа */}
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => openInnerSection('exchanges')}
+                className="w-full sm:w-auto min-h-[44px] px-5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs sm:text-sm font-semibold text-white inline-flex items-center justify-center gap-2 transition-colors"
+              >
+                <KeyRound className="w-4 h-4 shrink-0" />
+                <span>Перейти к подключению API-ключа</span>
+              </button>
+            </div>
+          </div>
         )}
 
         {section === 'push' && (
@@ -2400,7 +2565,18 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             </div>
 
             {auditSub === 'faq' ? (
-              <SecurityFaqSection onStartTour={onStartTour} />
+              <React.Suspense
+                fallback={
+                  <div className="rounded-2xl border border-white/8 bg-[#111827] p-5 space-y-3 min-h-[320px]">
+                    <div className="h-5 w-48 rounded-lg bg-white/8 shimmer-skeleton" />
+                    <div className="h-14 w-full rounded-xl bg-white/6 shimmer-skeleton" />
+                    <div className="h-14 w-full rounded-xl bg-white/6 shimmer-skeleton" />
+                    <div className="h-14 w-full rounded-xl bg-white/6 shimmer-skeleton" />
+                  </div>
+                }
+              >
+                <LazySecurityFaqSection onStartTour={onStartTour} />
+              </React.Suspense>
             ) : !isSignedIn || !profile ? (
               requireLoginCard(
                 'Авторизуйтесь для доступа к логам и журналу аудита',

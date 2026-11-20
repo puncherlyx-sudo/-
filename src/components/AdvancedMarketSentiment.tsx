@@ -15,7 +15,10 @@ import { CREDIT_COSTS, MAX_X10_MONTHLY_QUOTA, MAX_X20_MONTHLY_QUOTA } from '../d
 import { useFearGreed } from '../contexts/FearGreedContext';
 import { usePlan } from '../contexts/PlanContext';
 import { authFetch } from '../lib/authFetch';
+import { buildLocalSentimentReport } from '../lib/localAnalyticsEngine';
+import { useLiveMarketSnapshot } from '../stores/liveMarketStore';
 import { decodeHtmlEntities } from '../utils/htmlEntities';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 import { FeatureGuide } from './FeatureGuide';
 import type { AdvancedSentimentReport, MarketType, SentimentComparisonRow } from '../types/domain';
 
@@ -77,13 +80,16 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
   onOpenPairOnMarket,
 }) => {
   const planCtx = usePlan();
-  const { syncFromExternal } = useFearGreed();
-  const isMax = isMaxProp || planCtx.isMax;
-  const isPro = isProProp || planCtx.isPro || isMax;
+  const { data: fearGreedData, syncFromExternal } = useFearGreed();
+  const spotSnapshot = useLiveMarketSnapshot('spot');
+  const futuresSnapshot = useLiveMarketSnapshot('futures');
+  const isMax = Boolean(isMaxProp) || planCtx.isMax || planCtx.plan === 'MAX';
+  const isPro = Boolean(isProProp) || planCtx.isPro || planCtx.plan === 'PRO' || isMax;
 
   const [asset, setAsset] = useState<(typeof ASSET_OPTIONS)[number]>('ALL');
   const [interval, setInterval] = useState<'1h' | '4h' | '1d'>('4h');
   const [report, setReport] = useState<AdvancedSentimentReport | null>(null);
+  const [isLocalFallback, setIsLocalFallback] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -105,36 +111,79 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
 
   const effectiveTierForApi: 'free' | 'pro' | 'max' = isMax ? 'max' : isPro ? 'pro' : 'free';
 
-  const fetchSentiment = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await authFetch('/api/strategies/sentiment', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+  const fetchSentiment = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await authFetch('/api/strategies/sentiment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            asset,
+            interval: effectiveInterval,
+            ...(effectiveTierForApi !== 'free' ? { demoTier: effectiveTierForApi } : {}),
+          }),
+          signal,
+        });
+        const parsed = await parseJsonResponse<AdvancedSentimentReport & { error?: string }>(res);
+        if (signal?.aborted) return;
+        if (!parsed.ok || !parsed.data || typeof parsed.data.compositeScore !== 'number') {
+          throw new Error(parsed.errorMessage || 'Локальный режим расчёта');
+        }
+        setReport(parsed.data);
+        setIsLocalFallback(false);
+        if (parsed.data.fearGreed && typeof parsed.data.fearGreed.value === 'number') {
+          syncFromExternal(parsed.data.fearGreed);
+        }
+      } catch (err) {
+        if (signal?.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+        const fgVal = fearGreedData?.value ?? 52;
+        const fgWeek = fearGreedData?.weekAgoValue ?? 48;
+        const local = buildLocalSentimentReport({
           asset,
           interval: effectiveInterval,
-          ...(effectiveTierForApi !== 'free' ? { demoTier: effectiveTierForApi } : {}),
-        }),
-      });
-      const json = (await res.json()) as AdvancedSentimentReport & { error?: string };
-      if (!res.ok) {
-        throw new Error(json.error || 'Не удалось загрузить данные сентимента.');
+          fearGreed: {
+            value: fgVal,
+            classificationRu: fearGreedData?.classificationRu ?? 'Нейтрально',
+            yesterdayValue: fearGreedData?.yesterdayValue ?? 50,
+            weekAgoValue: fgWeek,
+            monthAgoValue: fearGreedData?.monthAgoValue ?? 46,
+            delta7d: fgVal - fgWeek,
+          },
+          spotTickers: spotSnapshot.tickers,
+          futuresTickers: futuresSnapshot.tickers,
+          isPro,
+          isMax,
+        });
+        setReport(local);
+        setIsLocalFallback(true);
+        setError(null);
+      } finally {
+        if (!signal?.aborted) {
+          setLoading(false);
+        }
       }
-      setReport(json);
-      if (json.fearGreed && typeof json.fearGreed.value === 'number') {
-        syncFromExternal(json.fearGreed);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка загрузки модуля Advanced Market Sentiment.');
-    } finally {
-      setLoading(false);
-    }
-  }, [asset, effectiveInterval, effectiveTierForApi, syncFromExternal]);
+    },
+    [
+      asset,
+      effectiveInterval,
+      effectiveTierForApi,
+      syncFromExternal,
+      fearGreedData,
+      spotSnapshot.tickers,
+      futuresSnapshot.tickers,
+      isPro,
+      isMax,
+    ]
+  );
 
   useEffect(() => {
-    void fetchSentiment();
+    const controller = new AbortController();
+    void fetchSentiment(controller.signal);
+    return () => {
+      controller.abort();
+    };
   }, [fetchSentiment]);
 
   const needsProCredit = Boolean(isPro && !isMax && isSignedIn && !planCtx.isDemoOverride);
@@ -193,6 +242,12 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
               <span className="font-mono text-slate-300">
                 {isMax ? '0 кр. · безлимит в MAX' : `${CREDIT_COSTS.sentimentForecast} кр. за ручное обновление`}
               </span>
+              {isLocalFallback && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-300 font-medium">Локальный расчёт в реальном времени</span>
+                </>
+              )}
             </div>
             <h2 className="mt-1.5 text-lg sm:text-xl font-bold text-white flex items-center gap-2">
               <Gauge className="w-5 h-5 text-cyan-400 shrink-0" />
@@ -401,7 +456,7 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
         </section>
       )}
 
-      {/* Full PRO / MAX Dashboard */}
+      {/* Full PRO / MAX Dashboard (никогда не показывает paywall-замок при активном PRO / MAX или Demo MAX) */}
       {report && isPro && (
         <>
           {/* 1. Integrated Sentiment Forecast */}
@@ -416,8 +471,17 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
                   </span>
                   <span className="text-slate-500" aria-hidden="true">·</span>
                   <span className="font-mono text-slate-400">ТФ {report.interval.toUpperCase()}</span>
+                  {planCtx.isDemoOverride && (
+                    <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-400/35 text-cyan-200 font-mono text-[10px] font-semibold">
+                      Demo {planCtx.plan}
+                    </span>
+                  )}
                 </div>
-                <h3 className="text-base sm:text-lg font-bold text-white">{report.forecastHeadline}</h3>
+                <h3 className="text-base sm:text-lg font-bold text-white">
+                  {report.locked
+                    ? `Сводный индекс настроений: ${report.compositeScore}/100 (${biasMeta.label})`
+                    : report.forecastHeadline}
+                </h3>
                 <p className="text-xs sm:text-sm text-slate-300 leading-relaxed max-w-3xl">
                   {report.forecastSummary}
                 </p>
@@ -510,6 +574,76 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
                 </div>
               </div>
             </div>
+
+            {/* 4-Factor Visual Breakdown Chart (Разблокированный график вкладов факторов PRO / MAX) */}
+            {(() => {
+              const totalNews =
+                report.newsBreakdown.bullishCount +
+                report.newsBreakdown.neutralCount +
+                report.newsBreakdown.bearishCount;
+              const newsScore =
+                totalNews > 0
+                  ? Math.round(
+                      ((report.newsBreakdown.bullishCount + report.newsBreakdown.neutralCount * 0.5) / totalNews) * 100
+                    )
+                  : 50;
+              const fundingScore = Math.max(
+                5,
+                Math.min(95, Math.round(50 + report.marketBreadth.avgFundingRatePct * 900))
+              );
+              const factors = [
+                {
+                  label: 'Fear & Greed',
+                  score: Math.max(0, Math.min(100, report.fearGreed.value)),
+                  valueText: `${report.fearGreed.value}/100`,
+                  barClass: 'from-amber-400 to-emerald-400',
+                },
+                {
+                  label: 'Ширина спота (44 пары)',
+                  score: Math.max(0, Math.min(100, Math.round(report.marketBreadth.advancingPct))),
+                  valueText: `${report.marketBreadth.advancingPct}%`,
+                  barClass: 'from-emerald-500 to-teal-300',
+                },
+                {
+                  label: 'Баланс Funding Futures',
+                  score: fundingScore,
+                  valueText: formatSigned(report.marketBreadth.avgFundingRatePct, '%'),
+                  barClass: 'from-cyan-400 to-sky-300',
+                },
+                {
+                  label: 'Новостной импульс',
+                  score: newsScore,
+                  valueText: `${newsScore}%`,
+                  barClass: 'from-emerald-400 to-cyan-400',
+                },
+              ];
+              return (
+                <div className="rounded-xl border border-white/8 bg-[#0B0F17] p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-semibold text-slate-200">
+                      Декомпозиция композитного индекса ({report.compositeScore}/100)
+                    </span>
+                    <span className="font-mono text-slate-400">4 фактора · live</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {factors.map((f) => (
+                      <div key={f.label} className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">{f.label}</span>
+                          <span className="font-mono tabular-nums font-semibold text-white">{f.valueText}</span>
+                        </div>
+                        <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full bg-gradient-to-r ${f.barClass} transition-[width] duration-500`}
+                            style={{ width: `${Math.max(4, f.score)}%` }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </section>
 
           {/* 2. Real Historical Win Rate Comparison vs Free Strategies */}
@@ -552,79 +686,145 @@ export const AdvancedMarketSentiment: React.FC<AdvancedMarketSentimentProps> = (
                 Недостаточно завершённых сделок на выбранном интервале для сравнения Win Rate.
               </div>
             ) : (
-              <div className="overflow-x-auto border-t border-white/8 pt-2">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="border-b border-white/8 text-slate-400">
-                      <th className="py-2.5 pr-4 font-medium">Стратегия</th>
-                      <th className="py-2.5 px-3 font-medium">Тариф</th>
-                      <th className="py-2.5 px-3 font-medium">Винрейт (Win Rate)</th>
-                      <th className="py-2.5 px-3 font-medium text-right">Profit Factor</th>
-                      <th className="py-2.5 px-3 font-medium text-right">Сделки</th>
-                      <th className="py-2.5 pl-3 font-medium text-right">PnL (%)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/6 font-mono tabular-nums">
+              <>
+                {/* Mobile Compact Row-Cards (390px — all metrics visible on one screen) */}
+                <div className="md:hidden border-t border-white/8 pt-2.5 space-y-2">
+                  <div className="flex items-center justify-between px-1 text-[11px] text-slate-400">
+                    <span>Стратегия</span>
+                    <span className="font-mono">WR % · Сд. · PnL %</span>
+                  </div>
+                  <div className="divide-y divide-white/8 rounded-xl border border-white/8 bg-[#0B0F17] overflow-hidden">
                     {comparisonRows.map((row) => {
                       const isSentiment = row.strategyKey === 'spot_advanced_market_sentiment';
                       const barWidth = Math.min(100, Math.max(4, row.winRatePct));
+                      const isPos = row.totalPnlPct >= 0;
                       return (
-                        <tr
+                        <div
                           key={row.strategyKey}
-                          className={
-                            isSentiment
-                              ? 'bg-cyan-500/[0.06]'
-                              : 'hover:bg-white/[0.02] transition-colors'
-                          }
+                          className={`px-3 py-2.5 space-y-1.5 ${
+                            isSentiment ? 'bg-cyan-500/[0.08]' : ''
+                          }`}
                         >
-                          <td className="py-3 pr-4 font-sans font-medium text-white whitespace-nowrap">
-                            {row.name}
-                          </td>
-                          <td className="py-3 px-3 whitespace-nowrap">
-                            <span
-                              className={`font-mono text-[11px] font-semibold ${
-                                isSentiment ? 'text-cyan-300' : 'text-slate-400'
-                              }`}
-                            >
-                              {isSentiment ? 'PRO / MAX' : 'Free'}
-                            </span>
-                          </td>
-                          <td className="py-3 px-3 min-w-[180px]">
-                            <div className="flex items-center gap-2.5">
-                              <span
-                                className={`w-12 font-semibold ${
-                                  isSentiment ? 'text-emerald-300' : 'text-slate-200'
-                                }`}
-                              >
-                                {row.winRatePct}%
-                              </span>
-                              <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
-                                <div
-                                  className={`h-full rounded-full ${
-                                    isSentiment ? 'bg-cyan-400' : 'bg-slate-400'
-                                  }`}
-                                  style={{ width: `${barWidth}%` }}
-                                />
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-medium text-white leading-tight line-clamp-2">
+                                {row.name}
+                              </div>
+                              <div className="mt-0.5 flex items-center gap-1.5 text-[10px] font-mono">
+                                <span className={isSentiment ? 'text-cyan-300 font-semibold' : 'text-slate-400'}>
+                                  {isSentiment ? 'PRO / MAX' : 'Free'}
+                                </span>
+                                <span className="text-slate-600" aria-hidden="true">·</span>
+                                <span className="text-slate-400">PF {row.profitFactor.toFixed(2)}</span>
                               </div>
                             </div>
-                          </td>
-                          <td className="py-3 px-3 text-right text-slate-200">
-                            {row.profitFactor.toFixed(2)}
-                          </td>
-                          <td className="py-3 px-3 text-right text-slate-300">{row.tradesCount}</td>
-                          <td
-                            className={`py-3 pl-3 text-right font-semibold whitespace-nowrap ${
-                              row.totalPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                            }`}
-                          >
-                            {formatSigned(row.totalPnlPct, '%')}
-                          </td>
-                        </tr>
+
+                            <div className="flex items-center gap-1.5 shrink-0 font-mono tabular-nums text-[11px]">
+                              <div className="text-right">
+                                <div className={isSentiment ? 'text-emerald-300 font-semibold' : 'text-slate-200 font-semibold'}>
+                                  {row.winRatePct}%
+                                </div>
+                                <div className="text-[10px] text-slate-500">{row.tradesCount} сд.</div>
+                              </div>
+                              <span
+                                className={`min-w-[58px] text-right px-2 py-1 rounded-lg border font-semibold ${
+                                  isPos
+                                    ? 'border-emerald-500/30 bg-emerald-500/12 text-emerald-300'
+                                    : 'border-rose-500/30 bg-rose-500/12 text-rose-300'
+                                }`}
+                              >
+                                {formatSigned(row.totalPnlPct, '%')}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="h-1 w-full rounded-full bg-white/10 overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${isSentiment ? 'bg-cyan-400' : 'bg-slate-400'}`}
+                              style={{ width: `${barWidth}%` }}
+                            />
+                          </div>
+                        </div>
                       );
                     })}
-                  </tbody>
-                </table>
-              </div>
+                  </div>
+                </div>
+
+                {/* Desktop Table */}
+                <div className="hidden md:block overflow-x-auto border-t border-white/8 pt-2">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-white/8 text-slate-400">
+                        <th className="py-2.5 pr-4 font-medium">Стратегия</th>
+                        <th className="py-2.5 px-3 font-medium">Тариф</th>
+                        <th className="py-2.5 px-3 font-medium">Винрейт (Win Rate)</th>
+                        <th className="py-2.5 px-3 font-medium text-right">Profit Factor</th>
+                        <th className="py-2.5 px-3 font-medium text-right">Сделки</th>
+                        <th className="py-2.5 pl-3 font-medium text-right">PnL (%)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/6 font-mono tabular-nums">
+                      {comparisonRows.map((row) => {
+                        const isSentiment = row.strategyKey === 'spot_advanced_market_sentiment';
+                        const barWidth = Math.min(100, Math.max(4, row.winRatePct));
+                        return (
+                          <tr
+                            key={row.strategyKey}
+                            className={
+                              isSentiment
+                                ? 'bg-cyan-500/[0.06]'
+                                : 'hover:bg-white/[0.02] transition-colors'
+                            }
+                          >
+                            <td className="py-3 pr-4 font-sans font-medium text-white whitespace-nowrap">
+                              {row.name}
+                            </td>
+                            <td className="py-3 px-3 whitespace-nowrap">
+                              <span
+                                className={`font-mono text-[11px] font-semibold ${
+                                  isSentiment ? 'text-cyan-300' : 'text-slate-400'
+                                }`}
+                              >
+                                {isSentiment ? 'PRO / MAX' : 'Free'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-3 min-w-[180px]">
+                              <div className="flex items-center gap-2.5">
+                                <span
+                                  className={`w-12 font-semibold ${
+                                    isSentiment ? 'text-emerald-300' : 'text-slate-200'
+                                  }`}
+                                >
+                                  {row.winRatePct}%
+                                </span>
+                                <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden">
+                                  <div
+                                    className={`h-full rounded-full ${
+                                      isSentiment ? 'bg-cyan-400' : 'bg-slate-400'
+                                    }`}
+                                    style={{ width: `${barWidth}%` }}
+                                  />
+                                </div>
+                              </div>
+                            </td>
+                            <td className="py-3 px-3 text-right text-slate-200">
+                              {row.profitFactor.toFixed(2)}
+                            </td>
+                            <td className="py-3 px-3 text-right text-slate-300">{row.tradesCount}</td>
+                            <td
+                              className={`py-3 pl-3 text-right font-semibold whitespace-nowrap ${
+                                row.totalPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                              }`}
+                            >
+                              {formatSigned(row.totalPnlPct, '%')}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
             )}
 
             <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/8 text-xs text-slate-400">

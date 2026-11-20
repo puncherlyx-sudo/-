@@ -31,7 +31,7 @@ import {
   isProOnlyStrategy,
   isProSubscriptionActive,
 } from '../data/strategies';
-import { auth, db, googleProvider, handleFirestoreError } from '../lib/firebase';
+import { auth, db, googleProvider, handleFirestoreError, isFirestoreOfflineError } from '../lib/firebase';
 import {
   OperationType,
   type AnalysisRecord,
@@ -224,6 +224,11 @@ export function useAuthAndVault() {
       try {
         snap = await getDoc(userRef);
       } catch (err) {
+        if (isFirestoreOfflineError(err)) {
+          // Временная потеря связи с Firestore: не показываем фатальный баннер,
+          // живые onSnapshot-слушатели автоматически подтянут профиль после восстановления сети.
+          return;
+        }
         handleFirestoreError(err, OperationType.GET, userPath);
       }
 
@@ -243,6 +248,7 @@ export function useAuthAndVault() {
             updatedAt: serverTimestamp(),
           });
         } catch (err) {
+          if (isFirestoreOfflineError(err)) return;
           handleFirestoreError(err, OperationType.CREATE, userPath);
         }
 
@@ -250,7 +256,7 @@ export function useAuthAndVault() {
         try {
           await setDoc(doc(db, 'users', uid, 'private', 'security'), {
             uid,
-            email: (user.email || 'user@aegisquant.app').slice(0, 200),
+            email: (user.email || 'user@vernier-terminal.app').slice(0, 200),
             totpEncryptedSecret: '',
             totpPendingSecret: '',
             backupCodeHashes: [],
@@ -258,7 +264,9 @@ export function useAuthAndVault() {
             updatedAt: serverTimestamp(),
           });
         } catch (err) {
-          handleFirestoreError(err, OperationType.CREATE, privPath);
+          if (!isFirestoreOfflineError(err)) {
+            handleFirestoreError(err, OperationType.CREATE, privPath);
+          }
         }
 
         // Seed default Spot & Futures strategies (Free plan starts with leverage capped at FREE_MAX_LEVERAGE)
@@ -284,7 +292,9 @@ export function useAuthAndVault() {
               updatedAt: serverTimestamp(),
             });
           } catch (err) {
-            handleFirestoreError(err, OperationType.CREATE, stratPath);
+            if (!isFirestoreOfflineError(err)) {
+              handleFirestoreError(err, OperationType.CREATE, stratPath);
+            }
           }
         }
 
@@ -298,48 +308,38 @@ export function useAuthAndVault() {
         const data = snap.data() as UserProfile;
         const isExistingPro = isProSubscriptionActive(data);
 
-        if (data.plan === 'free') {
-          if (data.nextResetAt && Date.now() >= new Date(data.nextResetAt).getTime()) {
-            try {
-              await updateDoc(userRef, {
-                creditsRemaining: FREE_WEEKLY_QUOTA,
-                weeklyQuota: FREE_WEEKLY_QUOTA,
-                nextResetAt: nextWeekIso(),
-                updatedAt: serverTimestamp(),
-              });
-              await writeAuditLog(
-                uid,
-                'WEEKLY_CREDIT_RESET',
-                `Еженедельное пополнение квоты: ${FREE_WEEKLY_QUOTA} кредитов.`,
-                'SUCCESS'
+        // Обновление квот, еженедельный сброс и проверка подписки выполняются строго на сервере (/api/entitlements/me)
+        try {
+          const entRes = await authFetch('/api/entitlements/me');
+          if (entRes.ok) {
+            const entData = (await entRes.json()) as {
+              entitlements?: {
+                creditsRemaining?: number;
+                weeklyQuota?: number;
+                nextResetAt?: number;
+                plan?: 'free' | 'pro' | 'max';
+              };
+            };
+            if (entData.entitlements) {
+              setProfile((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      creditsRemaining:
+                        typeof entData.entitlements?.creditsRemaining === 'number'
+                          ? entData.entitlements.creditsRemaining
+                          : prev.creditsRemaining,
+                      weeklyQuota:
+                        typeof entData.entitlements?.weeklyQuota === 'number'
+                          ? entData.entitlements.weeklyQuota
+                          : prev.weeklyQuota,
+                    }
+                  : prev
               );
-            } catch (err) {
-              handleFirestoreError(err, OperationType.UPDATE, userPath);
-            }
-          } else if (data.weeklyQuota !== FREE_WEEKLY_QUOTA) {
-            const oldQuota = Number(data.weeklyQuota) || 10;
-            const bonus = Math.max(0, FREE_WEEKLY_QUOTA - oldQuota);
-            const upgradedCredits = Math.min(
-              FREE_WEEKLY_QUOTA,
-              Math.max(0, Number(data.creditsRemaining) || 0) + bonus
-            );
-            try {
-              await updateDoc(userRef, {
-                creditsRemaining: upgradedCredits,
-                weeklyQuota: FREE_WEEKLY_QUOTA,
-                nextResetAt: data.nextResetAt || nextWeekIso(),
-                updatedAt: serverTimestamp(),
-              });
-              await writeAuditLog(
-                uid,
-                'QUOTA_UPGRADED',
-                `Недельная квота Free обновлена до ${FREE_WEEKLY_QUOTA} кредитов (+${bonus}).`,
-                'SUCCESS'
-              );
-            } catch (err) {
-              handleFirestoreError(err, OperationType.UPDATE, userPath);
             }
           }
+        } catch {
+          // Неблокирующая синхронизация квот
         }
 
         // Backfill newly added catalog strategies for existing accounts (per-item resilient)
@@ -513,9 +513,15 @@ export function useAuthAndVault() {
     const unsubProfile = onSnapshot(
       doc(db, 'users', uid),
       (snap) => {
-        if (snap.exists()) setProfile(snap.data() as UserProfile);
+        if (snap.exists()) {
+          setProfile(snap.data() as UserProfile);
+          setAuthError(null);
+        }
       },
-      (err) => handleFirestoreError(err, OperationType.GET, `users/${uid}`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.GET, `users/${uid}`);
+      }
     );
 
     const unsubPrivate = onSnapshot(
@@ -523,7 +529,10 @@ export function useAuthAndVault() {
       (snap) => {
         if (snap.exists()) setPrivateSecurity(snap.data() as UserPrivateSecurity);
       },
-      (err) => handleFirestoreError(err, OperationType.GET, `users/${uid}/private/security`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.GET, `users/${uid}/private/security`);
+      }
     );
 
     const stratQuery = query(collection(db, 'users', uid, 'strategies'), where('userId', '==', uid));
@@ -532,7 +541,10 @@ export function useAuthAndVault() {
       (snap) => {
         setStrategies(snap.docs.map((d) => d.data() as StrategyConfig));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/strategies`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/strategies`);
+      }
     );
 
     const analysisQuery = query(
@@ -551,7 +563,10 @@ export function useAuthAndVault() {
         });
         setAnalyses(docs.slice(0, 15));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/analyses`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/analyses`);
+      }
     );
 
     const logQuery = query(
@@ -570,7 +585,10 @@ export function useAuthAndVault() {
         });
         setAuditLogs(docs.slice(0, 100));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/auditLogs`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/auditLogs`);
+      }
     );
 
     const pushQuery = query(
@@ -583,7 +601,10 @@ export function useAuthAndVault() {
       (snap) => {
         setPushSubscriptions(snap.docs.map((d) => d.data() as PushSubscriptionRecord));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/pushSubscriptions`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/pushSubscriptions`);
+      }
     );
 
     const sessionQuery = query(
@@ -616,7 +637,10 @@ export function useAuthAndVault() {
         });
         setSessions(docs);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/sessions`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/sessions`);
+      }
     );
 
     const priceAlertsQuery = query(
@@ -636,7 +660,10 @@ export function useAuthAndVault() {
         });
         setPriceAlerts(docs);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/priceAlerts`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/priceAlerts`);
+      }
     );
 
     const supportQuery = query(
@@ -655,7 +682,10 @@ export function useAuthAndVault() {
         });
         setSupportTickets(docs);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/supportTickets`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/supportTickets`);
+      }
     );
 
     const exchangeKeysQuery = query(
@@ -675,7 +705,10 @@ export function useAuthAndVault() {
         setExchangeKeys(docs);
         setExchangeSyncCache(pruneExchangeSyncCache(uid, docs.map((d) => d.id)));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/exchangeKeys`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/exchangeKeys`);
+      }
     );
 
     const portfolioTargetsQuery = query(
@@ -695,7 +728,10 @@ export function useAuthAndVault() {
         });
         setPortfolioTargets(docs);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, `users/${uid}/portfolioTargets`)
+      (err) => {
+        if (isFirestoreOfflineError(err)) return;
+        handleFirestoreError(err, OperationType.LIST, `users/${uid}/portfolioTargets`);
+      }
     );
 
     return () => {
@@ -797,20 +833,28 @@ export function useAuthAndVault() {
       }
 
       const uid = firebaseUser.uid;
-      try {
-        await updateDoc(doc(db, 'users', uid), {
-          creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
-          nextResetAt: profile.nextResetAt,
-          updatedAt: serverTimestamp(),
-        });
-        if (auditReason) {
-          await writeAuditLog(uid, 'CREDITS_SPENT', `${auditReason} (−${cost} кр.)`, 'SUCCESS');
-        }
-        return true;
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
-        return false;
+      // Атомарное списание выполняется строго на сервере (server/entitlements.ts)
+      const res = await authFetch('/api/entitlements/consume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'strategy_scan' }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        entitlements?: { creditsRemaining?: number; weeklyQuota?: number };
+      };
+      if (!res.ok) {
+        throw new Error(payload.error || 'Не удалось списать кредиты на сервере.');
       }
+      if (typeof payload.entitlements?.creditsRemaining === 'number') {
+        const nextCredits = payload.entitlements.creditsRemaining;
+        setProfile((prev) => (prev ? { ...prev, creditsRemaining: nextCredits } : prev));
+      }
+      if (auditReason) {
+        await writeAuditLog(uid, 'CREDITS_SPENT', `${auditReason} (−${cost} кр.)`, 'SUCCESS');
+      }
+      return true;
     },
     [firebaseUser, profile, writeAuditLog]
   );
@@ -855,14 +899,21 @@ export function useAuthAndVault() {
       );
     }
 
+    // Списание кредитов уже выполнено атомарно на сервере при вызове /api/analyze;
+    // синхронизируем актуальный баланс из /api/entitlements/me (без запрещённого updateDoc из клиента).
     try {
-      await updateDoc(doc(db, 'users', uid), {
-        creditsRemaining: Math.max(0, profile.creditsRemaining - cost),
-        nextResetAt: profile.nextResetAt,
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+      const entRes = await authFetch('/api/entitlements/me');
+      if (entRes.ok) {
+        const entData = (await entRes.json()) as {
+          entitlements?: { creditsRemaining?: number };
+        };
+        if (typeof entData.entitlements?.creditsRemaining === 'number') {
+          const nextCredits = entData.entitlements.creditsRemaining;
+          setProfile((prev) => (prev ? { ...prev, creditsRemaining: nextCredits } : prev));
+        }
+      }
+    } catch {
+      // Non-blocking UI credit refresh
     }
 
     const analysisId = sanitizeId(`an_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
@@ -1902,11 +1953,12 @@ export function useAuthAndVault() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           exchange: keyRecord.exchange,
-          permissions: keyRecord.permissions,
           encryptedApiKey: keyRecord.encryptedApiKey,
           encryptedApiSecret: keyRecord.encryptedApiSecret,
           encryptedPassphrase: keyRecord.encryptedPassphrase,
           testnet: keyRecord.testnet,
+          confirmResponsibility: true,
+          confirmStatement: 'VERNIER_API_ORDER_CONFIRMED',
           ...orderParams,
         }),
       });
