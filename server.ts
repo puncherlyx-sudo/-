@@ -25,10 +25,12 @@ import {
 import {
   consumeUserCredits,
   EntitlementError,
+  getAdminDb,
   getUserEntitlements,
   IMMUTABLE_CREDIT_COSTS,
   IMMUTABLE_MAX_LEVERAGE,
   isValidBillableAction,
+  refundUserCredits,
   resolveAuthoritativePlan,
 } from './server/entitlements.ts';
 import { CREDIT_COSTS, FREE_MAX_LEVERAGE, STRATEGY_CATALOG, isProOnlyStrategy } from './src/data/strategies.ts';
@@ -57,6 +59,7 @@ import {
   checkPriceAlertsForUser,
   dispatchPushToUser,
   getVapidPublicKey,
+  notifyCriticalExchangeSyncError,
   notifyHighImpactNews,
   notifyPortfolioDailyPnl,
   notifyPortfolioTargetReached,
@@ -73,8 +76,8 @@ import {
   encryptSecret,
   generateBackupCodes,
   generateBase32Secret,
-  hashBackupCode,
-  verifyTotpCode,
+  matchBackupCodeHash,
+  verifyTotpCodeWithStep,
 } from './server/security.ts';
 import {
   connectAndEncryptExchange,
@@ -121,23 +124,33 @@ async function startServer() {
       if (idx === -1) continue;
       const k = part.slice(0, idx).trim();
       const v = part.slice(idx + 1).trim();
-      if (k) out[k] = decodeURIComponent(v);
+      if (k) {
+        try {
+          out[k] = decodeURIComponent(v);
+        } catch {
+          out[k] = v;
+        }
+      }
     }
     return out;
   }
 
-  function issueCsrfCookie(res: express.Response, existingToken?: string): string {
+  function issueCsrfCookie(req: express.Request, res: express.Response, existingToken?: string): string {
     const token =
       existingToken && /^[0-9a-f]{64}$/.test(existingToken)
         ? existingToken
         : crypto.randomBytes(32).toString('hex');
+    const isHttps =
+      isProd ||
+      req.secure ||
+      String(req.headers['x-forwarded-proto'] || '').toLowerCase().includes('https');
     const cookieParts = [
       `${CSRF_COOKIE_NAME}=${token}`,
       'Path=/',
-      'SameSite=Strict',
+      isHttps ? 'SameSite=None' : 'SameSite=Lax',
       'Max-Age=43200',
     ];
-    if (isProd) {
+    if (isHttps) {
       cookieParts.push('Secure');
     }
     res.setHeader('Set-Cookie', cookieParts.join('; '));
@@ -169,8 +182,9 @@ async function startServer() {
     }
   }
 
-  // Запрет передачи auth-токенов в URL query parameters
+  // Запрет передачи auth-токенов в URL query parameters и единый Cache-Control: no-store для всех /api/*
   app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
     const forbiddenQueryKeys = ['token', 'idToken', 'id_token', 'access_token', 'authToken', 'authorization'];
     for (const key of forbiddenQueryKeys) {
       if (req.query[key] !== undefined) {
@@ -186,12 +200,26 @@ async function startServer() {
   // Выдача / обновление CSRF-токена (Double Submit Cookie)
   app.get('/api/security/csrf-token', (req, res) => {
     const cookies = parseCookieMap(req.headers.cookie);
-    const csrfToken = issueCsrfCookie(res, cookies[CSRF_COOKIE_NAME]);
+    const csrfToken = issueCsrfCookie(req, res, cookies[CSRF_COOKIE_NAME]);
     res.set('Cache-Control', 'no-store');
     res.json({ csrfToken });
   });
 
-  // Проверка CSRF на всех мутирующих /api/* маршрутах (кроме подписанного HMAC-SHA512 IPN webhook)
+  // Извлекаем верифицированного пользователя (если передан Bearer-токен) ДО лимитера и CSRF-проверки
+  app.use('/api', async (req, _res, next) => {
+    const header = req.headers.authorization;
+    const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
+    if (match) {
+      try {
+        req.user = await verifyFirebaseIdToken(match[1]);
+      } catch {
+        // Невалидный токен будет отклонён в requireAuth на защищённых маршрутах
+      }
+    }
+    next();
+  });
+
+  // Проверка Origin / CSRF на всех мутирующих /api/* маршрутах (кроме подписанного HMAC-SHA512 IPN webhook)
   app.use('/api', (req, res, next) => {
     const method = req.method.toUpperCase();
     if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
@@ -206,6 +234,14 @@ async function startServer() {
 
     if (!isTrustedOrigin(req)) {
       res.status(403).json({ error: 'Запрос отклонён политикой безопасности Origin/CSRF.' });
+      return;
+    }
+
+    // Если запрос аутентифицирован верифицированным заголовком Authorization: Bearer,
+    // двойная cookie не требуется (браузер не прикрепляет Authorization автоматически при CSRF) —
+    // строгая проверка Origin выше уже защищает маршрут и исключает сбои в iframe.
+    if (req.user?.uid) {
+      next();
       return;
     }
 
@@ -230,21 +266,32 @@ async function startServer() {
     next();
   });
 
-  // ---------- Устойчивый Rate-Limiting (IP из trust proxy=1 + UID / session fingerprint) ----------
+  // ---------- Устойчивый Rate-Limiting (ТОЛЬКО верифицированный UID или доверенный req.ip; клиентские заголовки исключены) ----------
   function getCompositeRateLimitKey(req: express.Request): string {
+    if (req.user?.uid) {
+      return `uid:${req.user.uid}`;
+    }
     const trustedIp = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
-    const uid = req.user?.uid ? `uid:${req.user.uid}` : '';
-    const clientFp =
-      typeof req.headers['x-vernier-client-fp'] === 'string'
-        ? req.headers['x-vernier-client-fp'].replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32)
-        : '';
-    const csrfPrefix = parseCookieMap(req.headers.cookie)[CSRF_COOKIE_NAME]?.slice(0, 16) || '';
-    const actor = uid || (clientFp ? `fp:${clientFp}` : csrfPrefix ? `csrf:${csrfPrefix}` : 'anon');
-    return `${trustedIp}|${actor}`;
+    return `ip:${trustedIp}`;
   }
 
   // Экспоненциальный backoff и временная блокировка после 5 неудачных попыток (2FA / биржевые операции)
+  const MAX_AUTH_FAILURE_ENTRIES = 5_000;
   const authFailureTracker = new Map<string, { failures: number; lockedUntil: number; updatedAt: number }>();
+
+  function pruneAuthFailureTracker(now: number): void {
+    if (authFailureTracker.size < MAX_AUTH_FAILURE_ENTRIES) return;
+    for (const [k, v] of authFailureTracker.entries()) {
+      if (now - v.updatedAt > 30 * 60_000 && v.lockedUntil <= now) {
+        authFailureTracker.delete(k);
+      }
+    }
+    while (authFailureTracker.size >= MAX_AUTH_FAILURE_ENTRIES) {
+      const oldest = authFailureTracker.keys().next().value;
+      if (!oldest) break;
+      authFailureTracker.delete(oldest);
+    }
+  }
 
   function getAuthFailureKey(req: express.Request, scope: string): string {
     const trustedIp = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
@@ -273,6 +320,7 @@ async function startServer() {
   function recordAuthFailure(req: express.Request, scope: string): { failures: number; lockSeconds: number } {
     const key = getAuthFailureKey(req, scope);
     const now = Date.now();
+    pruneAuthFailureTracker(now);
     const prev = authFailureTracker.get(key);
     const failures = prev && now - prev.updatedAt < 30 * 60_000 ? prev.failures + 1 : 1;
     let lockMs = 0;
@@ -589,6 +637,19 @@ async function startServer() {
     });
   });
 
+  // Серверный лимит принудительного обновления (?refresh=1): не чаще 1 раза в 60 сек на весь сервер
+  const REFRESH_COOLDOWN_MS = 60_000;
+  const lastForcedRefreshAt = new Map<string, number>();
+  function allowForcedRefresh(feedKey: string): boolean {
+    const now = Date.now();
+    const prev = lastForcedRefreshAt.get(feedKey) ?? 0;
+    if (now - prev < REFRESH_COOLDOWN_MS) {
+      return false;
+    }
+    lastForcedRefreshAt.set(feedKey, now);
+    return true;
+  }
+
   // Grounded crypto news feed (with live RSS fallback + explicit notice on quota limits)
   app.get('/api/news', async (req, res) => {
     try {
@@ -597,7 +658,7 @@ async function startServer() {
       const requested = String(req.query.symbol || 'ALL').toUpperCase().slice(0, 12);
       const allowedNews = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
       const symbol = allowedNews.has(requested) ? requested : 'ALL';
-      const forceRefresh = req.query.refresh === '1';
+      const forceRefresh = req.query.refresh === '1' && allowForcedRefresh(`news:${symbol}`);
       const news = await fetchGroundedCryptoNews(symbol, forceRefresh);
       const topHigh = news.items.find((n) => n.impact === 'HIGH');
       if (topHigh) {
@@ -613,11 +674,20 @@ async function startServer() {
     }
   });
 
-  // Batch full-sentence Russian translation for English RSS/news headlines
-  app.post('/api/news/translate', async (req, res) => {
+  // Batch full-sentence Russian translation for English RSS/news headlines (requires sign-in to protect Gemini quota)
+  app.post('/api/news/translate', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as { items?: Array<{ id: string; title: string; summary: string }> };
-      const list = Array.isArray(body?.items) ? body.items.slice(0, 24) : [];
+      const list = Array.isArray(body?.items)
+        ? body.items
+            .slice(0, 12)
+            .filter((item) => item && typeof item.id === 'string' && typeof item.title === 'string')
+            .map((item) => ({
+              id: item.id.slice(0, 80),
+              title: item.title.slice(0, 280),
+              summary: typeof item.summary === 'string' ? item.summary.slice(0, 480) : '',
+            }))
+        : [];
       if (list.length === 0) {
         res.json({ translations: {} });
         return;
@@ -633,7 +703,7 @@ async function startServer() {
   app.get('/api/economic-calendar', async (req, res) => {
     try {
       res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-      const forceRefresh = req.query.refresh === '1';
+      const forceRefresh = req.query.refresh === '1' && allowForcedRefresh('economic-calendar');
       const calendar = await fetchEconomicCalendar(forceRefresh);
       res.json(calendar);
     } catch (err) {
@@ -673,33 +743,44 @@ async function startServer() {
       const maxAllowedLeverage = IMMUTABLE_MAX_LEVERAGE[dbPlan] ?? FREE_MAX_LEVERAGE;
       const leverage = Math.min(maxAllowedLeverage, Math.max(1, Number(body.leverage || 1)));
 
-      // Серверная проверка и атомарное списание 1 AI-кредита перед вызовом Gemini
+      // Серверная проверка и атомарное списание 1 AI-кредита перед вызовом Gemini (с автовозвратом при сбое)
+      let creditDeducted = false;
       const { snapshot: postCreditSnapshot } = await consumeUserCredits(req.user!.uid, 'ai_analysis');
+      creditDeducted = true;
 
-      const marketData = await getMarketCandles(symbol, timeframe, marketType);
-      const analysis = await runStrategyAnalysis({
-        symbol: marketData.symbol,
-        marketType,
-        timeframe: marketData.interval,
-        strategyKey,
-        strategyName,
-        strategyRules,
-        indicators: marketData.indicators,
-        fundingRatePct: marketData.fundingRatePct,
-        openInterestUsdt: marketData.openInterestUsdt,
-        depositUsdt,
-        riskPerTradePct,
-        leverage,
-        isPro,
-        planTier: dbPlan,
-      });
+      try {
+        const marketData = await getMarketCandles(symbol, timeframe, marketType);
+        const analysis = await runStrategyAnalysis({
+          symbol: marketData.symbol,
+          marketType,
+          timeframe: marketData.interval,
+          strategyKey,
+          strategyName,
+          strategyRules,
+          indicators: marketData.indicators,
+          fundingRatePct: marketData.fundingRatePct,
+          openInterestUsdt: marketData.openInterestUsdt,
+          depositUsdt,
+          riskPerTradePct,
+          leverage,
+          isPro,
+          planTier: dbPlan,
+        });
 
-      res.json({
-        analysis,
-        indicators: marketData.indicators,
-        source: marketData.source,
-        entitlements: postCreditSnapshot,
-      });
+        res.json({
+          analysis,
+          indicators: marketData.indicators,
+          source: marketData.source,
+          entitlements: postCreditSnapshot,
+        });
+      } catch (innerErr) {
+        if (creditDeducted) {
+          await refundUserCredits(req.user!.uid, 'ai_analysis').catch((refundErr) => {
+            serverLogger.warn('entitlements', 'Не удалось вернуть кредит после сбоя анализа:', refundErr);
+          });
+        }
+        throw innerErr;
+      }
     } catch (err) {
       if (err instanceof EntitlementError) {
         res.status(err.statusCode).json({ error: err.message, code: err.code });
@@ -713,8 +794,9 @@ async function startServer() {
     }
   });
 
-  // Helper to optionally resolve verified UID & plan tier from Authorization header
+  // Helper to optionally resolve verified UID & authoritative plan tier (demoTier полностью исключён на сервере)
   const resolveOptionalUid = async (req: express.Request): Promise<string | undefined> => {
+    if (req.user?.uid) return req.user.uid;
     const header = req.headers.authorization;
     const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
     if (!match) return undefined;
@@ -726,12 +808,9 @@ async function startServer() {
     }
   };
 
-  const resolveOptionalUserTier = async (
-    req: express.Request,
-    demoTier?: unknown
-  ): Promise<'free' | 'pro' | 'max'> => {
+  const resolveOptionalUserTier = async (req: express.Request): Promise<'free' | 'pro' | 'max'> => {
     const uid = await resolveOptionalUid(req);
-    return resolveAuthoritativePlan(uid, demoTier);
+    return resolveAuthoritativePlan(uid);
   };
 
   // Серверный кэш результатов бэктеста PnL (TTL 45 сек) для предотвращения повторных нагрузок и таймаутов
@@ -745,7 +824,6 @@ async function startServer() {
         interval?: string;
         depositUsdt?: number;
         scope?: string;
-        demoTier?: string;
       };
       if (!Array.isArray(body.strategies) || body.strategies.length === 0) {
         res.status(400).json({ error: 'Передайте хотя бы одну стратегию для расчета PnL.' });
@@ -754,7 +832,7 @@ async function startServer() {
       let requestedInterval: '1h' | '4h' | '1d' =
         body.interval === '1d' ? '1d' : body.interval === '4h' ? '4h' : '1h';
       if (requestedInterval === '1d') {
-        const tier = await resolveOptionalUserTier(req, body.demoTier);
+        const tier = await resolveOptionalUserTier(req);
         if (tier !== 'max') {
           requestedInterval = '4h';
         }
@@ -812,14 +890,13 @@ async function startServer() {
         timeframe?: string;
         minConfidence?: number;
         marketFilter?: 'all' | 'spot' | 'futures';
-        demoTier?: string;
         activeStrategyConfigs?: Array<{
           strategyKey?: string;
           minConfidence?: number;
           pairs?: string[];
         }>;
       };
-      const tier = await resolveOptionalUserTier(req, body.demoTier);
+      const tier = await resolveOptionalUserTier(req);
 
       const maxPairs = tier === 'max' ? SUPPORTED_SYMBOLS.length : tier === 'pro' ? 16 : 3;
       const timeframe: '1h' | '4h' = tier === 'max' && body.timeframe === '4h' ? '4h' : '1h';
@@ -900,9 +977,9 @@ async function startServer() {
   app.post('/api/strategies/sentiment', expensiveLimiter, async (req, res) => {
     try {
       const uid = await resolveOptionalUid(req);
-      const body = req.body as { asset?: string; interval?: string; demoTier?: string };
-      // В production demoTier строго игнорируется на сервере; в dev допускается для тестирования
-      const tier = await resolveAuthoritativePlan(uid, body.demoTier);
+      const body = req.body as { asset?: string; interval?: string };
+      // Авторитетный тариф определяется исключительно по токену и базе данных (demoTier запрещён на сервере)
+      const tier = await resolveAuthoritativePlan(uid);
       const rawAsset = String(body.asset || 'ALL').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'ALL';
       const allowedAssets = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
       const asset = allowedAssets.has(rawAsset) ? rawAsset : 'ALL';
@@ -1163,7 +1240,22 @@ async function startServer() {
     }
   });
 
-  // 2FA Step 1: Generate TOTP secret + QR code + encrypted pending secret
+  // Защита от повторного использования (replay) одного TOTP-кода + серверный step-up (+10 мин)
+  const MAX_SECURITY_CACHE_SIZE = 5_000;
+  const lastTotpStepByUid = new Map<string, number>();
+  const stepUpUntilByUid = new Map<string, number>();
+  const serverBackupHashesByUid = new Map<string, Set<string>>();
+  const STEP_UP_TTL_MS = 10 * 60_000;
+
+  function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V): void {
+    if (!map.has(key) && map.size >= MAX_SECURITY_CACHE_SIZE) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+    map.set(key, value);
+  }
+
+  // 2FA Step 1: Generate TOTP secret + QR code + encrypted pending secret (purpose: 'totp')
   app.post('/api/security/totp/setup', requireAuth, strictAuthLimiter, async (req, res) => {
     try {
       const uid = req.user!.uid;
@@ -1181,7 +1273,7 @@ async function startServer() {
         width: 220,
         color: { dark: '#0B0F17', light: '#FFFFFF' },
       });
-      const encryptedPendingSecret = encryptSecret(plainSecret, uid);
+      const encryptedPendingSecret = encryptSecret(plainSecret, uid, 'totp');
 
       res.json({
         qrDataUrl,
@@ -1193,8 +1285,8 @@ async function startServer() {
     }
   });
 
-  // 2FA Step 2: Verify initial 6-digit TOTP code and issue 8 SHA-256 hashed backup codes
-  app.post('/api/security/totp/confirm', requireAuth, strictAuthLimiter, (req, res) => {
+  // 2FA Step 2: Verify initial 6-digit TOTP code and issue 8 HMAC-SHA256 10-char backup codes
+  app.post('/api/security/totp/confirm', requireAuth, strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
       const uid = req.user!.uid;
@@ -1206,8 +1298,9 @@ async function startServer() {
         res.status(400).json({ error: 'Укажите код подтверждения 2FA.' });
         return;
       }
-      const plainSecret = decryptSecret(encryptedPendingSecret, uid);
-      if (!verifyTotpCode(plainSecret, code, 1)) {
+      const plainSecret = decryptSecret(encryptedPendingSecret, uid, 'totp');
+      const check = verifyTotpCodeWithStep(plainSecret, code, 1);
+      if (!check.valid || check.matchedStep === null) {
         const penalty = recordAuthFailure(req, 'totp');
         res.status(401).json({
           error:
@@ -1218,12 +1311,40 @@ async function startServer() {
         return;
       }
       clearAuthFailure(req, 'totp');
+      setBoundedMap(lastTotpStepByUid, uid, check.matchedStep);
+      const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
+      setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+
       const { plaintext, hashes } = generateBackupCodes(8);
+      const encryptedSecret = encryptSecret(plainSecret, uid, 'totp');
+      setBoundedMap(serverBackupHashesByUid, uid, new Set(hashes));
+
+      // Если доступен Admin SDK — фиксируем серверную запись безопасности для защиты от клиентских подмен
+      const adminDb = getAdminDb();
+      if (adminDb) {
+        await adminDb
+          .collection('users')
+          .doc(uid)
+          .collection('serverSecurity')
+          .doc('totp')
+          .set(
+            {
+              totpEncryptedSecret: encryptedSecret,
+              backupCodeHashes: hashes,
+              lastTotpStep: check.matchedStep,
+              stepUpUntil,
+              updatedAtMs: Date.now(),
+            },
+            { merge: true }
+          );
+      }
+
       res.json({
         verified: true,
-        encryptedSecret: encryptSecret(plainSecret, uid),
+        encryptedSecret,
         backupCodes: plaintext,
         backupCodeHashes: hashes,
+        stepUpUntil,
       });
     } catch {
       recordAuthFailure(req, 'totp');
@@ -1231,35 +1352,131 @@ async function startServer() {
     }
   });
 
-  // 2FA Step-Up & Lock Screen Verification (supports TOTP OR single-use backup code)
-  app.post('/api/security/totp/verify', requireAuth, strictAuthLimiter, (req, res) => {
+  // 2FA Step-Up & Lock Screen Verification (anti-replay + authoritative backup codes + server stepUpUntil)
+  app.post('/api/security/totp/verify', requireAuth, strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
       const uid = req.user!.uid;
-      const { encryptedSecret, code, backupCodeHashes } = req.body as {
+      const { encryptedSecret: clientEncryptedSecret, code, backupCodeHashes: clientBackupHashes } = req.body as {
         encryptedSecret?: string;
         code?: string;
         backupCodeHashes?: string[];
       };
-      if (typeof code !== 'string' || typeof encryptedSecret !== 'string' || !code || !encryptedSecret) {
+      if (typeof code !== 'string' || !code.trim()) {
         res.status(400).json({ error: 'Недостаточно данных для проверки 2FA.' });
         return;
       }
       const cleanCode = code.trim();
-      const plainSecret = decryptSecret(encryptedSecret, uid);
-      if (verifyTotpCode(plainSecret, cleanCode, 1)) {
-        clearAuthFailure(req, 'totp');
-        res.json({ verified: true, method: 'totp', consumedBackupHash: null });
+      const adminDb = getAdminDb();
+
+      let authoritativeEncryptedSecret = typeof clientEncryptedSecret === 'string' ? clientEncryptedSecret : '';
+      let authoritativeBackupHashes: string[] = [];
+      let lastAcceptedStep = lastTotpStepByUid.get(uid) ?? -1;
+
+      if (adminDb) {
+        const secDocRef = adminDb.collection('users').doc(uid).collection('serverSecurity').doc('totp');
+        const secSnap = await secDocRef.get();
+        if (secSnap.exists) {
+          const d = secSnap.data() as {
+            totpEncryptedSecret?: string;
+            backupCodeHashes?: string[];
+            lastTotpStep?: number;
+          };
+          if (typeof d.totpEncryptedSecret === 'string' && d.totpEncryptedSecret) {
+            authoritativeEncryptedSecret = d.totpEncryptedSecret;
+          }
+          if (Array.isArray(d.backupCodeHashes)) {
+            authoritativeBackupHashes = d.backupCodeHashes;
+          }
+          if (typeof d.lastTotpStep === 'number' && d.lastTotpStep > lastAcceptedStep) {
+            lastAcceptedStep = d.lastTotpStep;
+          }
+        } else {
+          // Fallback к private/security в Firestore (не доверяем телу запроса)
+          const privSnap = await adminDb.collection('users').doc(uid).collection('private').doc('security').get();
+          if (privSnap.exists) {
+            const p = privSnap.data() as { totpEncryptedSecret?: string; backupCodeHashes?: string[] };
+            if (typeof p.totpEncryptedSecret === 'string' && p.totpEncryptedSecret) {
+              authoritativeEncryptedSecret = p.totpEncryptedSecret;
+            }
+            if (Array.isArray(p.backupCodeHashes)) {
+              authoritativeBackupHashes = p.backupCodeHashes;
+            }
+          }
+        }
+      } else {
+        // Dev/preview режим без Admin SDK: используем серверно-выданные хеши, если они были зарегистрированы в сессии;
+        // клиентский массив принимается только в non-production, если сервер ещё не хранил хеши
+        const knownServerHashes = serverBackupHashesByUid.get(uid);
+        if (knownServerHashes) {
+          authoritativeBackupHashes = Array.from(knownServerHashes);
+        } else if (!isProd && Array.isArray(clientBackupHashes)) {
+          authoritativeBackupHashes = clientBackupHashes.filter((h): h is string => typeof h === 'string').slice(0, 8);
+        }
+      }
+
+      if (!authoritativeEncryptedSecret) {
+        res.status(400).json({ error: 'Секрет 2FA не найден. Повторите настройку 2FA.' });
         return;
       }
 
-      const candidateHash = hashBackupCode(cleanCode);
-      if (Array.isArray(backupCodeHashes) && backupCodeHashes.includes(candidateHash)) {
+      const plainSecret = decryptSecret(authoritativeEncryptedSecret, uid, 'totp');
+      const check = verifyTotpCodeWithStep(plainSecret, cleanCode, 1);
+      if (check.valid && check.matchedStep !== null) {
+        if (check.matchedStep <= lastAcceptedStep) {
+          const penalty = recordAuthFailure(req, 'totp');
+          res.status(401).json({
+            error:
+              penalty.lockSeconds > 0
+                ? `Этот 6-значный код уже использовался. Доступ заблокирован на ${penalty.lockSeconds} сек.`
+                : 'Этот 6-значный код уже использовался. Дождитесь следующего кода (30 сек).',
+          });
+          return;
+        }
         clearAuthFailure(req, 'totp');
+        setBoundedMap(lastTotpStepByUid, uid, check.matchedStep);
+        const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
+        setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+        if (adminDb) {
+          await adminDb
+            .collection('users')
+            .doc(uid)
+            .collection('serverSecurity')
+            .doc('totp')
+            .set({ lastTotpStep: check.matchedStep, stepUpUntil, updatedAtMs: Date.now() }, { merge: true });
+        }
+        res.json({ verified: true, method: 'totp', consumedBackupHash: null, stepUpUntil });
+        return;
+      }
+
+      const matchedHash = matchBackupCodeHash(cleanCode, authoritativeBackupHashes);
+      if (matchedHash) {
+        clearAuthFailure(req, 'totp');
+        const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
+        setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+
+        const knownSet = serverBackupHashesByUid.get(uid);
+        if (knownSet) {
+          knownSet.delete(matchedHash);
+        }
+
+        if (adminDb) {
+          const secDocRef = adminDb.collection('users').doc(uid).collection('serverSecurity').doc('totp');
+          await adminDb.runTransaction(async (tx) => {
+            const snap = await tx.get(secDocRef);
+            const currentHashes = Array.isArray(snap.data()?.backupCodeHashes)
+              ? (snap.data()!.backupCodeHashes as string[])
+              : authoritativeBackupHashes;
+            const remaining = currentHashes.filter((h) => h !== matchedHash);
+            tx.set(secDocRef, { backupCodeHashes: remaining, stepUpUntil, updatedAtMs: Date.now() }, { merge: true });
+          });
+        }
+
         res.json({
           verified: true,
           method: 'backup_code',
-          consumedBackupHash: candidateHash,
+          consumedBackupHash: matchedHash,
+          stepUpUntil,
         });
         return;
       }
@@ -1278,6 +1495,7 @@ async function startServer() {
   });
 
   // Security: Resolve current request IP & geographic coordinates for session map
+  const MAX_GEO_CACHE_ENTRIES = 1_000;
   const geoCache = new Map<
     string,
     {
@@ -1293,7 +1511,32 @@ async function startServer() {
     }
   >();
 
-  app.get('/api/security/session-geo', async (req, res) => {
+  function setGeoCacheEntry(
+    key: string,
+    data: {
+      ipAddress: string;
+      city: string;
+      country: string;
+      countryCode: string;
+      latitude: number;
+      longitude: number;
+    },
+  ): void {
+    const now = Date.now();
+    if (geoCache.size >= MAX_GEO_CACHE_ENTRIES) {
+      for (const [k, v] of geoCache.entries()) {
+        if (v.expiresAt <= now) geoCache.delete(k);
+      }
+      while (geoCache.size >= MAX_GEO_CACHE_ENTRIES) {
+        const oldest = geoCache.keys().next().value;
+        if (!oldest) break;
+        geoCache.delete(oldest);
+      }
+    }
+    geoCache.set(key, { data, expiresAt: now + 10 * 60_000 });
+  }
+
+  app.get('/api/security/session-geo', requireAuth, expensiveLimiter, async (req, res) => {
     // Используем только req.ip (с доверенным trust proxy=1), игнорируя поддельные X-Forwarded-For от клиента
     const candidateRaw = (req.ip || req.socket.remoteAddress || '').trim();
     const cleanedIp = candidateRaw.replace(/^::ffff:/, '').slice(0, 64);
@@ -1349,7 +1592,7 @@ async function startServer() {
             latitude: Math.max(-90, Math.min(90, Number(json.latitude))),
             longitude: Math.max(-180, Math.min(180, Number(json.longitude))),
           };
-          geoCache.set(cacheKey, { data: resolved, expiresAt: Date.now() + 10 * 60_000 });
+          setGeoCacheEntry(cacheKey, resolved);
           res.json(resolved);
           return;
         }
@@ -1382,7 +1625,7 @@ async function startServer() {
             latitude: Math.max(-90, Math.min(90, Number(json2.latitude))),
             longitude: Math.max(-180, Math.min(180, Number(json2.longitude))),
           };
-          geoCache.set(cacheKey, { data: resolved, expiresAt: Date.now() + 10 * 60_000 });
+          setGeoCacheEntry(cacheKey, resolved);
           res.json(resolved);
           return;
         }
@@ -1432,7 +1675,15 @@ async function startServer() {
       const { invoiceUrl } = await createCheckout(req.user!.uid, period as BillingPeriod, tier, maxMultiplier);
       res.json({ invoiceUrl });
     } catch (err) {
-      res.status(503).json({ error: err instanceof Error ? err.message : 'Не удалось создать счёт на оплату.' });
+      serverLogger.error('billing:checkout', err instanceof Error ? err.message : err);
+      const safeMsg =
+        err instanceof Error &&
+        (err.message.includes('не настроена') ||
+          err.message.includes('Превышен лимит') ||
+          err.message.includes('Платёжный сервис'))
+          ? err.message
+          : 'Не удалось создать счёт на оплату. Попробуйте позже.';
+      res.status(503).json({ error: safeMsg });
     }
   });
 
@@ -1629,6 +1880,51 @@ async function startServer() {
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отправки критического Push' });
+    }
+  });
+
+  // Web Push: Critical exchange sync error (expired/revoked API key or critical exchange failure)
+  app.post('/api/push/exchange-sync-error', requireAuth, expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as {
+        keyId?: unknown;
+        exchange?: unknown;
+        label?: unknown;
+        category?: unknown;
+        errorMessage?: unknown;
+        testnet?: unknown;
+      };
+      const exchange =
+        body.exchange === 'binance' || body.exchange === 'bybit' || body.exchange === 'okx'
+          ? body.exchange
+          : null;
+      const category =
+        body.category === 'auth' || body.category === 'exchange_api' || body.category === 'unknown'
+          ? body.category
+          : 'unknown';
+      const keyId = typeof body.keyId === 'string' ? body.keyId.trim().slice(0, 64) : '';
+      const label = typeof body.label === 'string' ? body.label.trim().slice(0, 64) : '';
+      const errorMessage =
+        typeof body.errorMessage === 'string' ? body.errorMessage.trim().slice(0, 280) : '';
+
+      if (!exchange || !keyId || !errorMessage) {
+        res.status(400).json({ error: 'Некорректные параметры уведомления о сбое синхронизации.' });
+        return;
+      }
+
+      const result = await notifyCriticalExchangeSyncError(req.user!.uid, {
+        keyId,
+        exchange,
+        label: label || exchange.toUpperCase(),
+        category,
+        errorMessage,
+        testnet: Boolean(body.testnet),
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Ошибка отправки Push о критическом сбое биржи',
+      });
     }
   });
 
@@ -1835,7 +2131,14 @@ async function startServer() {
     } catch (err) {
       recordAuthFailure(req, 'exchange_connect');
       if (err instanceof ExchangeApiError) {
-        res.status(err.statusCode).json({ error: err.message });
+        res.status(err.statusCode).json({
+          error: err.message,
+          details: {
+            httpStatus: err.httpStatus ?? err.statusCode,
+            endpoint: err.endpoint,
+            rawResponse: err.rawResponse,
+          },
+        });
         return;
       }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка подключения биржи' });
@@ -1870,7 +2173,14 @@ async function startServer() {
       res.json({ ok: true, sync });
     } catch (err) {
       if (err instanceof ExchangeApiError) {
-        res.status(err.statusCode).json({ error: err.message });
+        res.status(err.statusCode).json({
+          error: err.message,
+          details: {
+            httpStatus: err.httpStatus ?? err.statusCode,
+            endpoint: err.endpoint,
+            rawResponse: err.rawResponse,
+          },
+        });
         return;
       }
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка синхронизации баланса биржи' });
@@ -1908,6 +2218,32 @@ async function startServer() {
         return;
       }
 
+      // Серверная проверка свежего 2FA step-up (10 минут) для пользователей с активной 2FA
+      const adminDb = getAdminDb();
+      if (adminDb) {
+        const totpSnap = await adminDb
+          .collection('users')
+          .doc(uid)
+          .collection('serverSecurity')
+          .doc('totp')
+          .get();
+        if (totpSnap.exists) {
+          const sec = totpSnap.data() as { totpEncryptedSecret?: string; stepUpUntil?: number };
+          const hasActive2fa = typeof sec.totpEncryptedSecret === 'string' && sec.totpEncryptedSecret.length > 0;
+          const validUntil = Math.max(
+            typeof sec.stepUpUntil === 'number' ? sec.stepUpUntil : 0,
+            stepUpUntilByUid.get(uid) ?? 0
+          );
+          if (hasActive2fa && validUntil <= Date.now()) {
+            res.status(403).json({
+              error: 'Требуется свежее подтверждение 2FA перед отправкой торгового ордера.',
+              code: 'STEP_UP_REQUIRED',
+            });
+            return;
+          }
+        }
+      }
+
       const order = await executeEncryptedExchangeOrder({
         uid,
         exchange,
@@ -1930,46 +2266,75 @@ async function startServer() {
       clearAuthFailure(req, 'exchange_order');
       res.json({ ok: true, order });
     } catch (err) {
+      recordAuthFailure(req, 'exchange_order');
       if (err instanceof ExchangeApiError) {
         res.status(err.statusCode).json({ error: err.message });
         return;
       }
-      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка исполнения ордера на бирже' });
+      res.status(500).json({ error: 'Ошибка исполнения ордера на бирже.' });
     }
   });
 
-  // Support & Feedback intake for guest or fallback submissions
-  app.post('/api/support', expensiveLimiter, (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const contactEmail = typeof body.contactEmail === 'string' ? body.contactEmail.trim() : '';
-    const category = typeof body.category === 'string' ? body.category : 'other';
-    const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
-    const message = typeof body.message === 'string' ? body.message.trim() : '';
+  // Support & Feedback intake (persists to Firestore via Admin SDK; never fakes success in production)
+  app.post('/api/support', expensiveLimiter, async (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown>;
+      const contactEmail = typeof body.contactEmail === 'string' ? body.contactEmail.trim() : '';
+      const category = typeof body.category === 'string' ? body.category : 'other';
+      const subject = typeof body.subject === 'string' ? body.subject.trim() : '';
+      const message = typeof body.message === 'string' ? body.message.trim() : '';
 
-    const allowedCategories = new Set(['alerts', 'chart', 'billing', 'security', 'other']);
-    if (!contactEmail || contactEmail.length < 3 || contactEmail.length > 200 || !contactEmail.includes('@')) {
-      res.status(400).json({ error: 'Укажите корректный email для обратной связи.' });
-      return;
-    }
-    if (!allowedCategories.has(category)) {
-      res.status(400).json({ error: 'Некорректная категория обращения.' });
-      return;
-    }
-    if (subject.length < 3 || subject.length > 140) {
-      res.status(400).json({ error: 'Тема должна содержать от 3 до 140 символов.' });
-      return;
-    }
-    if (message.length < 10 || message.length > 2000) {
-      res.status(400).json({ error: 'Сообщение должно содержать от 10 до 2000 символов.' });
-      return;
-    }
+      const allowedCategories = new Set(['alerts', 'chart', 'billing', 'security', 'other']);
+      if (!contactEmail || contactEmail.length < 3 || contactEmail.length > 200 || !contactEmail.includes('@')) {
+        res.status(400).json({ error: 'Укажите корректный email для обратной связи.' });
+        return;
+      }
+      if (!allowedCategories.has(category)) {
+        res.status(400).json({ error: 'Некорректная категория обращения.' });
+        return;
+      }
+      if (subject.length < 3 || subject.length > 140) {
+        res.status(400).json({ error: 'Тема должна содержать от 3 до 140 символов.' });
+        return;
+      }
+      if (message.length < 10 || message.length > 2000) {
+        res.status(400).json({ error: 'Сообщение должно содержать от 10 до 2000 символов.' });
+        return;
+      }
 
-    const ticketId = `sup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    res.json({ ok: true, ticketId, createdAt: new Date().toISOString() });
+      const ticketId = `sup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const createdAtIso = new Date().toISOString();
+      const adminDb = getAdminDb();
+
+      if (adminDb) {
+        await adminDb.collection('supportInbox').doc(ticketId).set({
+          id: ticketId,
+          uid: req.user?.uid ?? null,
+          contactEmail,
+          category,
+          subject,
+          message,
+          status: 'open',
+          createdAtIso,
+          createdAtMs: Date.now(),
+        });
+      } else if (isProd) {
+        serverLogger.error('support', 'Не удалось сохранить обращение: Firebase Admin SDK не настроен в production.');
+        res.status(503).json({
+          error: 'Служба приёма обращений временно недоступна. Попробуйте повторить отправку позже.',
+        });
+        return;
+      }
+
+      res.json({ ok: true, ticketId, createdAt: createdAtIso });
+    } catch (err) {
+      serverLogger.error('support', err);
+      res.status(500).json({ error: 'Не удалось сохранить обращение в поддержку.' });
+    }
   });
 
-  // Gemini-powered Terminal Help Assistant Chat
-  app.post('/api/support/chat', expensiveLimiter, async (req, res) => {
+  // Gemini-powered Terminal Help Assistant Chat (requires sign-in to protect Gemini quota)
+  app.post('/api/support/chat', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as { message?: unknown; history?: unknown };
       const message = typeof body.message === 'string' ? body.message.trim() : '';
@@ -2025,7 +2390,48 @@ async function startServer() {
         typeof err === 'object' && err !== null && 'status' in err
           ? Number((err as { status?: number }).status) || 500
           : 500;
-      const msg = err instanceof Error ? err.message : 'Внутренняя ошибка API.';
+      if (status >= 500) {
+        serverLogger.error('api:unhandled', err);
+      }
+      const msg =
+        isProd && status >= 500
+          ? 'Внутренняя ошибка API. Повторите запрос позже.'
+          : err instanceof Error
+            ? err.message
+            : 'Внутренняя ошибка API.';
+      res.status(status).json({ error: msg });
+    }
+  );
+
+  // Корневой обработчик ошибок Express (ловит ошибки express.json() 400/413 до маршрутов /api)
+  app.use(
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (!req.originalUrl.startsWith('/api')) {
+        next(err);
+        return;
+      }
+      const status =
+        typeof err === 'object' && err !== null && 'status' in err
+          ? Number((err as { status?: number }).status) || 400
+          : 500;
+      if (status >= 500) {
+        serverLogger.error('api:root-error', err);
+      }
+      const msg =
+        status === 413
+          ? 'Превышен максимальный размер запроса (256 КБ).'
+          : status === 400
+            ? 'Некорректный формат JSON в теле запроса.'
+            : isProd
+              ? 'Внутренняя ошибка API. Повторите запрос позже.'
+              : err instanceof Error
+                ? err.message
+                : 'Внутренняя ошибка API.';
       res.status(status).json({ error: msg });
     }
   );
@@ -2126,8 +2532,26 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      express.static(distDir, {
+        etag: true,
+        setHeaders(res, filePath) {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else if (
+            filePath.endsWith('index.html') ||
+            filePath.endsWith('sw.js') ||
+            filePath.endsWith('manifest.webmanifest')
+          ) {
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

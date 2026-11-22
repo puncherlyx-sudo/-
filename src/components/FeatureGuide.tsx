@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { BookOpen, ChevronDown, ChevronUp, HelpCircle } from 'lucide-react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { triggerHaptic } from '../lib/securityDlp';
 
 interface FeatureGuideProps {

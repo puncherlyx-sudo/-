@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { TERMINAL_EASE } from './MotionPrimitives';
 
 function prefersReducedMotion(): boolean {

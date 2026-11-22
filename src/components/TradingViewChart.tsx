@@ -95,7 +95,7 @@ export const TradingViewChart: React.FC<TradingViewChartProps> = ({ symbol, mark
       save_image: false,
       calendar: false,
       support_host: 'https://www.tradingview.com',
-      utm_source: typeof window !== 'undefined' ? window.location.hostname : 'aegisquant.app',
+      utm_source: typeof window !== 'undefined' ? window.location.hostname : 'vernier.app',
       utm_medium: 'widget',
       utm_campaign: 'chart',
     };

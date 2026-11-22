@@ -8,7 +8,7 @@ import {
   RefreshCw,
   Waves,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { usePlan } from '../contexts/PlanContext';
 import { triggerHaptic } from '../lib/securityDlp';
 import { isPageVisible, subscribePageVisibility } from '../utils/cache';

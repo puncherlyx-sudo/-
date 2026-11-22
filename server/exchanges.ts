@@ -8,16 +8,51 @@ import type {
   MarketType,
 } from '../src/types/domain.ts';
 import { getMarketOverview } from './market.ts';
-import { decryptSecret, encryptSecret } from './security.ts';
+import {
+  decryptSecret,
+  decryptSecretWithAad,
+  encryptSecretWithAad,
+} from './security.ts';
 
 const STABLE_COINS = new Set(['USDT', 'USDC', 'FDUSD', 'BUSD', 'DAI', 'TUSD', 'USDE']);
 
+export interface ExchangeApiErrorDetails {
+  httpStatus?: number;
+  endpoint?: string;
+  rawResponse?: string;
+}
+
+function sanitizeRawExchangeResponse(data: unknown): string | undefined {
+  if (data === null || data === undefined) return undefined;
+  let serialized = '';
+  try {
+    serialized = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  } catch {
+    serialized = String(data);
+  }
+  const trimmed = serialized.trim();
+  if (!trimmed) return undefined;
+  return trimmed
+    .replace(
+      /((?:api[_-]?key|api[_-]?secret|secret|passphrase|signature|token|authorization|x-mbx-apikey|x-bapi-api-key|ok-access-key|ok-access-passphrase|ok-access-sign)["']?\s*[:=]\s*["']?)([^"',\s}\n]+)/gi,
+      '$1[скрыто]'
+    )
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[скрыто]')
+    .slice(0, 1600);
+}
+
 export class ExchangeApiError extends Error {
   statusCode: number;
+  httpStatus?: number;
+  endpoint?: string;
+  rawResponse?: string;
 
-  constructor(message: string, statusCode = 400) {
+  constructor(message: string, statusCode = 400, details?: ExchangeApiErrorDetails) {
     super(message);
     this.statusCode = statusCode;
+    this.httpStatus = details?.httpStatus;
+    this.endpoint = details?.endpoint;
+    this.rawResponse = details?.rawResponse;
   }
 }
 
@@ -53,12 +88,32 @@ async function fetchJsonWithTimeout(
     }
     return { ok: res.ok, status: res.status, data };
   } catch (err) {
+    const safeEndpoint = (() => {
+      try {
+        const parsed = new URL(url);
+        return `${init.method || 'GET'} ${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return undefined;
+      }
+    })();
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new ExchangeApiError('Превышено время ожидания ответа от API биржи.', 504);
+      throw new ExchangeApiError('Превышено время ожидания ответа от API биржи.', 504, {
+        httpStatus: 504,
+        endpoint: safeEndpoint,
+        rawResponse: JSON.stringify({ error: 'AbortError', timeoutMs }, null, 2),
+      });
     }
     throw new ExchangeApiError(
       err instanceof Error ? `Сетевая ошибка при обращении к бирже: ${err.message}` : 'Сетевая ошибка биржи',
-      502
+      502,
+      {
+        httpStatus: 502,
+        endpoint: safeEndpoint,
+        rawResponse: sanitizeRawExchangeResponse({
+          error: err instanceof Error ? err.name : 'NetworkError',
+          message: err instanceof Error ? err.message : String(err),
+        }),
+      }
     );
   } finally {
     clearTimeout(timer);
@@ -120,11 +175,13 @@ async function fetchBinanceBalances(
   const sig = crypto.createHmac('sha256', apiSecret).update(qs).digest('hex');
 
   let lastError: string | null = null;
+  let lastErrorDetails: ExchangeApiErrorDetails | undefined;
   let accountPayload: { balances?: Array<{ asset: string; free: string; locked: string }>; accountType?: string } | null = null;
 
   for (const base of bases) {
+    const endpointLabel = `GET ${base}/api/v3/account`;
     try {
-      const { ok, data } = await fetchJsonWithTimeout(
+      const { ok, status, data } = await fetchJsonWithTimeout(
         `${base}/api/v3/account?${qs}&signature=${sig}`,
         {
           method: 'GET',
@@ -134,9 +191,14 @@ async function fetchBinanceBalances(
       const record = (data ?? {}) as Record<string, unknown>;
       if (!ok || typeof record.code === 'number') {
         lastError = translateBinanceError(record.code, record.msg);
+        lastErrorDetails = {
+          httpStatus: status,
+          endpoint: endpointLabel,
+          rawResponse: sanitizeRawExchangeResponse(record),
+        };
         // Auth/signature errors shouldn't retry other mirrors
         if (record.code === -2015 || record.code === -1022 || record.code === -2014) {
-          throw new ExchangeApiError(lastError, 400);
+          throw new ExchangeApiError(lastError, 400, lastErrorDetails);
         }
         continue;
       }
@@ -147,12 +209,26 @@ async function fetchBinanceBalances(
       break;
     } catch (err) {
       if (err instanceof ExchangeApiError && err.statusCode === 400) throw err;
-      lastError = err instanceof Error ? err.message : 'Сбой подключения к Binance';
+      if (err instanceof ExchangeApiError) {
+        lastError = err.message;
+        lastErrorDetails = {
+          httpStatus: err.httpStatus ?? err.statusCode,
+          endpoint: err.endpoint ?? endpointLabel,
+          rawResponse: err.rawResponse,
+        };
+      } else {
+        lastError = err instanceof Error ? err.message : 'Сбой подключения к Binance';
+        lastErrorDetails = {
+          httpStatus: 502,
+          endpoint: endpointLabel,
+          rawResponse: sanitizeRawExchangeResponse({ message: lastError }),
+        };
+      }
     }
   }
 
   if (!accountPayload) {
-    throw new ExchangeApiError(lastError || 'Не удалось получить баланс с Binance.', 502);
+    throw new ExchangeApiError(lastError || 'Не удалось получить баланс с Binance.', 502, lastErrorDetails);
   }
 
   const priceMap = await getSpotPriceMap();
@@ -209,7 +285,7 @@ async function fetchBybitBalances(
     const signPayload = `${ts}${apiKey}${recvWindow}${query}`;
     const sign = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('hex');
 
-    const { ok, data } = await fetchJsonWithTimeout(`${host}/v5/account/wallet-balance?${query}`, {
+    const { ok, status, data } = await fetchJsonWithTimeout(`${host}/v5/account/wallet-balance?${query}`, {
       method: 'GET',
       headers: {
         'X-BAPI-API-KEY': apiKey,
@@ -218,7 +294,12 @@ async function fetchBybitBalances(
         'X-BAPI-RECV-WINDOW': recvWindow,
       },
     });
-    return { ok, data: (data ?? {}) as Record<string, unknown> };
+    return {
+      ok,
+      status,
+      endpoint: `GET ${host}/v5/account/wallet-balance?${query}`,
+      data: (data ?? {}) as Record<string, unknown>,
+    };
   };
 
   let resp = await queryBalances('UNIFIED');
@@ -232,7 +313,15 @@ async function fetchBybitBalances(
 
   if (!resp.ok || resp.data.retCode !== 0) {
     const retMsg = typeof resp.data.retMsg === 'string' ? resp.data.retMsg : 'Неверный ключ или права Bybit API';
-    throw new ExchangeApiError(`Ошибка Bybit API (${String(resp.data.retCode ?? 'ERR')}): ${retMsg}`, 400);
+    throw new ExchangeApiError(
+      `Ошибка Bybit API (${String(resp.data.retCode ?? 'ERR')}): ${retMsg}`,
+      400,
+      {
+        httpStatus: resp.status,
+        endpoint: resp.endpoint,
+        rawResponse: sanitizeRawExchangeResponse(resp.data),
+      }
+    );
   }
 
   const priceMap = await getSpotPriceMap();
@@ -303,7 +392,7 @@ async function fetchOkxBalances(
   };
   if (testnet) headers['x-simulated-trading'] = '1';
 
-  const { ok, data } = await fetchJsonWithTimeout(`https://www.okx.com${requestPath}`, {
+  const { ok, status, data } = await fetchJsonWithTimeout(`https://www.okx.com${requestPath}`, {
     method: 'GET',
     headers,
   });
@@ -311,7 +400,11 @@ async function fetchOkxBalances(
   const payload = (data ?? {}) as Record<string, unknown>;
   if (!ok || payload.code !== '0') {
     const msg = typeof payload.msg === 'string' ? payload.msg : 'Проверьте ключи и Passphrase OKX API';
-    throw new ExchangeApiError(`Ошибка OKX API (${String(payload.code ?? 'ERR')}): ${msg}`, 400);
+    throw new ExchangeApiError(`Ошибка OKX API (${String(payload.code ?? 'ERR')}): ${msg}`, 400, {
+      httpStatus: status,
+      endpoint: `GET https://www.okx.com${requestPath}`,
+      rawResponse: sanitizeRawExchangeResponse(payload),
+    });
   }
 
   const priceMap = await getSpotPriceMap();
@@ -376,10 +469,44 @@ interface VerifiedKeyRecord {
 }
 
 // Серверный реестр прав ключей (клиентское поле permissions при исполнении ордера НЕ принимается).
+const MAX_VERIFIED_KEY_REGISTRY = 2_000;
 const serverVerifiedKeyRegistry = new Map<string, VerifiedKeyRecord>();
 
 function computeKeyRegistryId(uid: string, encryptedApiKey: string): string {
   return crypto.createHash('sha256').update(`${uid}:${encryptedApiKey}`).digest('hex');
+}
+
+function buildExchangeKeyAad(
+  uid: string,
+  exchange: ExchangeId,
+  testnet: boolean,
+  permissions: ExchangeKeyPermissions,
+): string {
+  return `vernier:exch:v3:${uid}:${exchange}:${testnet ? 'testnet' : 'mainnet'}:${permissions}`;
+}
+
+function setVerifiedKeyRecord(id: string, record: VerifiedKeyRecord): void {
+  if (serverVerifiedKeyRegistry.size >= MAX_VERIFIED_KEY_REGISTRY) {
+    const oldestKey = serverVerifiedKeyRegistry.keys().next().value;
+    if (oldestKey) serverVerifiedKeyRegistry.delete(oldestKey);
+  }
+  serverVerifiedKeyRegistry.set(id, record);
+}
+
+function decryptExchangeSecretForSync(
+  cipherText: string,
+  uid: string,
+  exchange: ExchangeId,
+  testnet: boolean,
+): string {
+  if (cipherText.startsWith('v3:')) {
+    try {
+      return decryptSecretWithAad(cipherText, uid, buildExchangeKeyAad(uid, exchange, testnet, 'read_only'));
+    } catch {
+      return decryptSecretWithAad(cipherText, uid, buildExchangeKeyAad(uid, exchange, testnet, 'trade'));
+    }
+  }
+  return decryptSecret(cipherText, uid);
 }
 
 export async function connectAndEncryptExchange(params: {
@@ -423,11 +550,12 @@ export async function connectAndEncryptExchange(params: {
     sync = await fetchOkxBalances(apiKey, apiSecret, passphrase, params.testnet);
   }
 
-  const encryptedApiKey = encryptSecret(apiKey, params.uid);
-  const encryptedApiSecret = encryptSecret(apiSecret, params.uid);
-  const encryptedPassphrase = passphrase ? encryptSecret(passphrase, params.uid) : '';
+  const aadContext = buildExchangeKeyAad(params.uid, params.exchange, params.testnet, effectivePermissions);
+  const encryptedApiKey = encryptSecretWithAad(apiKey, params.uid, aadContext);
+  const encryptedApiSecret = encryptSecretWithAad(apiSecret, params.uid, aadContext);
+  const encryptedPassphrase = passphrase ? encryptSecretWithAad(passphrase, params.uid, aadContext) : '';
 
-  serverVerifiedKeyRegistry.set(computeKeyRegistryId(params.uid, encryptedApiKey), {
+  setVerifiedKeyRecord(computeKeyRegistryId(params.uid, encryptedApiKey), {
     uid: params.uid,
     exchange: params.exchange,
     permissions: effectivePermissions,
@@ -457,10 +585,10 @@ export async function syncEncryptedExchangeBalances(params: {
   let apiSecret = '';
   let passphrase = '';
   try {
-    apiKey = decryptSecret(params.encryptedApiKey, params.uid);
-    apiSecret = decryptSecret(params.encryptedApiSecret, params.uid);
+    apiKey = decryptExchangeSecretForSync(params.encryptedApiKey, params.uid, params.exchange, params.testnet);
+    apiSecret = decryptExchangeSecretForSync(params.encryptedApiSecret, params.uid, params.exchange, params.testnet);
     passphrase = params.encryptedPassphrase
-      ? decryptSecret(params.encryptedPassphrase, params.uid)
+      ? decryptExchangeSecretForSync(params.encryptedPassphrase, params.uid, params.exchange, params.testnet)
       : '';
   } catch {
     throw new ExchangeApiError('Не удалось расшифровать API-ключи. Переподключите биржу.', 400);
@@ -512,7 +640,8 @@ export async function executeEncryptedExchangeOrder(params: {
     );
   }
 
-  // 3. Проверка прав ключа строго на стороне сервера (клиентские permissions игнорируются)
+  // 3. Криптографическая проверка прав ключа (fail-closed даже после перезапуска сервера)
+  const isV3Key = params.encryptedApiKey.startsWith('v3:') && params.encryptedApiSecret.startsWith('v3:');
   const keyRecord = serverVerifiedKeyRegistry.get(
     computeKeyRegistryId(params.uid, params.encryptedApiKey),
   );
@@ -526,6 +655,11 @@ export async function executeEncryptedExchangeOrder(params: {
         403
       );
     }
+  } else if (!isV3Key) {
+    throw new ExchangeApiError(
+      'Права этого ключа не подтверждены сервером после обновления сессии. Переподключите Testnet API-ключ.',
+      403
+    );
   }
 
   const symbol = params.symbol.toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -542,7 +676,7 @@ export async function executeEncryptedExchangeOrder(params: {
     throw new ExchangeApiError('Для лимитного ордера укажите корректную цену (> 0).', 400);
   }
 
-  // 4. Серверный лимит максимального объёма ордера и проверка непротиворечивости SL/TP
+  // 4. Серверный лимит максимального объёма ордера и проверка непротиворечивости SL/TP (строго fail-closed)
   const priceMap = await getSpotPriceMap();
   const baseAsset = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
   const referencePrice =
@@ -550,29 +684,34 @@ export async function executeEncryptedExchangeOrder(params: {
       ? params.limitPrice
       : (priceMap.get(symbol) ?? priceMap.get(baseAsset) ?? 0);
 
-  if (referencePrice > 0) {
-    const estimatedNotional = params.quantity * referencePrice;
-    if (!Number.isFinite(estimatedNotional) || estimatedNotional > MAX_TESTNET_ORDER_USDT) {
-      throw new ExchangeApiError(
-        `Превышен серверный лимит Testnet-ордера: $${estimatedNotional.toFixed(2)} > $${MAX_TESTNET_ORDER_USDT} USDT.`,
-        400
-      );
+  if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+    throw new ExchangeApiError(
+      `Не удалось получить актуальную рыночную цену для ${symbol}, чтобы проверить серверный лимит Testnet-ордера ($${MAX_TESTNET_ORDER_USDT} USDT). Повторите запрос или укажите LIMIT-цену.`,
+      503
+    );
+  }
+
+  const estimatedNotional = params.quantity * referencePrice;
+  if (!Number.isFinite(estimatedNotional) || estimatedNotional > MAX_TESTNET_ORDER_USDT) {
+    throw new ExchangeApiError(
+      `Превышен серверный лимит Testnet-ордера: $${estimatedNotional.toFixed(2)} > $${MAX_TESTNET_ORDER_USDT} USDT.`,
+      400
+    );
+  }
+  if (params.stopLoss !== undefined && params.stopLoss > 0) {
+    if (params.side === 'BUY' && params.stopLoss >= referencePrice) {
+      throw new ExchangeApiError('Для LONG/BUY ордера Stop-Loss должен быть строго ниже цены входа.', 400);
     }
-    if (params.stopLoss !== undefined && params.stopLoss > 0) {
-      if (params.side === 'BUY' && params.stopLoss >= referencePrice) {
-        throw new ExchangeApiError('Для LONG/BUY ордера Stop-Loss должен быть строго ниже цены входа.', 400);
-      }
-      if (params.side === 'SELL' && params.stopLoss <= referencePrice) {
-        throw new ExchangeApiError('Для SHORT/SELL ордера Stop-Loss должен быть строго выше цены входа.', 400);
-      }
+    if (params.side === 'SELL' && params.stopLoss <= referencePrice) {
+      throw new ExchangeApiError('Для SHORT/SELL ордера Stop-Loss должен быть строго выше цены входа.', 400);
     }
-    if (params.takeProfit !== undefined && params.takeProfit > 0) {
-      if (params.side === 'BUY' && params.takeProfit <= referencePrice) {
-        throw new ExchangeApiError('Для LONG/BUY ордера Take-Profit должен быть строго выше цены входа.', 400);
-      }
-      if (params.side === 'SELL' && params.takeProfit >= referencePrice) {
-        throw new ExchangeApiError('Для SHORT/SELL ордера Take-Profit должен быть строго ниже цены входа.', 400);
-      }
+  }
+  if (params.takeProfit !== undefined && params.takeProfit > 0) {
+    if (params.side === 'BUY' && params.takeProfit <= referencePrice) {
+      throw new ExchangeApiError('Для LONG/BUY ордера Take-Profit должен быть строго выше цены входа.', 400);
+    }
+    if (params.side === 'SELL' && params.takeProfit >= referencePrice) {
+      throw new ExchangeApiError('Для SHORT/SELL ордера Take-Profit должен быть строго ниже цены входа.', 400);
     }
   }
 
@@ -580,13 +719,25 @@ export async function executeEncryptedExchangeOrder(params: {
   let apiSecret = '';
   let passphrase = '';
   try {
-    apiKey = decryptSecret(params.encryptedApiKey, params.uid);
-    apiSecret = decryptSecret(params.encryptedApiSecret, params.uid);
-    passphrase = params.encryptedPassphrase
-      ? decryptSecret(params.encryptedPassphrase, params.uid)
-      : '';
+    if (isV3Key) {
+      const requiredTradeAad = buildExchangeKeyAad(params.uid, params.exchange, true, 'trade');
+      apiKey = decryptSecretWithAad(params.encryptedApiKey, params.uid, requiredTradeAad);
+      apiSecret = decryptSecretWithAad(params.encryptedApiSecret, params.uid, requiredTradeAad);
+      passphrase = params.encryptedPassphrase
+        ? decryptSecretWithAad(params.encryptedPassphrase, params.uid, requiredTradeAad)
+        : '';
+    } else {
+      apiKey = decryptSecret(params.encryptedApiKey, params.uid);
+      apiSecret = decryptSecret(params.encryptedApiSecret, params.uid);
+      passphrase = params.encryptedPassphrase
+        ? decryptSecret(params.encryptedPassphrase, params.uid)
+        : '';
+    }
   } catch {
-    throw new ExchangeApiError('Не удалось расшифровать торговые ключи.', 400);
+    throw new ExchangeApiError(
+      'Ключ зарегистрирован только для чтения (Read-Only) или не соответствует параметрам Testnet.',
+      403
+    );
   }
 
   const qtyStr = formatOrderQty(params.quantity);

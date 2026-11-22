@@ -6,7 +6,7 @@ import {
   Send,
   X,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import type { SupportTicketCategory, SupportTicketRecord } from '../types/domain';
 import { NATIVE_SPRING } from './MotionPrimitives';
 

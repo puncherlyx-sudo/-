@@ -49,6 +49,17 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
     setError(null);
   }, [keyRecord]);
 
+  useEffect(() => {
+    if (!keyRecord) return;
+    const onKeyDown = (evt: KeyboardEvent) => {
+      if (evt.key === 'Escape' && !submitting) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [keyRecord, submitting, onClose]);
+
   if (!keyRecord) return null;
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -91,6 +102,11 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-labelledby="edit-exchange-key-title"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !submitting) {
+          onClose();
+        }
+      }}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4"
     >
       <div className="w-full max-w-lg rounded-2xl border border-white/12 bg-[#111827] shadow-2xl overflow-hidden">

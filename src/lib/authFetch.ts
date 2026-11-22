@@ -14,7 +14,12 @@ function readCookie(name: string): string | null {
     if (idx === -1) continue;
     const k = part.slice(0, idx).trim();
     if (k === name) {
-      return decodeURIComponent(part.slice(idx + 1).trim());
+      const rawVal = part.slice(idx + 1).trim();
+      try {
+        return decodeURIComponent(rawVal);
+      } catch {
+        return rawVal;
+      }
     }
   }
   return null;

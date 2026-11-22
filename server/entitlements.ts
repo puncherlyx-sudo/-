@@ -44,6 +44,28 @@ export const IMMUTABLE_MAX_LEVERAGE: Readonly<Record<PlanTier, number>> = Object
 });
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function parseTimestampMs(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const num = Number(trimmed);
+      return Number.isFinite(num) && num > 0 ? num : null;
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  if (value && typeof value === 'object' && 'toMillis' in value && typeof (value as { toMillis?: unknown }).toMillis === 'function') {
+    const ms = (value as { toMillis: () => number }).toMillis();
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  return null;
+}
 
 export interface EntitlementSnapshot {
   uid: string;
@@ -70,7 +92,7 @@ export class EntitlementError extends Error {
 
 let cachedAdminDb: Firestore | null | undefined;
 
-function getAdminDb(): Firestore | null {
+export function getAdminDb(): Firestore | null {
   if (cachedAdminDb !== undefined) return cachedAdminDb;
   try {
     const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
@@ -104,12 +126,22 @@ function getAdminDb(): Firestore | null {
   } catch (err) {
     serverLogger.warn(
       'entitlements',
-      'Admin SDK недоступен, используется серверный ledger в памяти:',
+      'Admin SDK недоступен:',
       err instanceof Error ? err.message : 'unknown'
     );
     cachedAdminDb = null;
   }
   return cachedAdminDb;
+}
+
+function assertDevFallbackAllowed(): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new EntitlementError(
+      'Сервер учёта тарифов и квот временно недоступен (Firebase Admin SDK не сконфигурирован в production).',
+      503,
+      'ENTITLEMENTS_UNAVAILABLE',
+    );
+  }
 }
 
 // ---------- Per-UID mutex (защита от race condition / double spend) ----------
@@ -136,9 +168,18 @@ async function withUidLock<T>(uid: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// ---------- Fallback server ledger (когда Admin SDK не сконфигурирован в dev) ----------
+// ---------- Fallback server ledger (строго для dev/preview, в production блокируется 503) ----------
 
+const MAX_MEMORY_LEDGER_SIZE = 5_000;
 const memoryLedger = new Map<string, EntitlementSnapshot>();
+
+function setMemoryLedgerEntry(uid: string, snapshot: EntitlementSnapshot): void {
+  if (!memoryLedger.has(uid) && memoryLedger.size >= MAX_MEMORY_LEDGER_SIZE) {
+    const oldestUid = memoryLedger.keys().next().value;
+    if (oldestUid) memoryLedger.delete(oldestUid);
+  }
+  memoryLedger.set(uid, snapshot);
+}
 
 function getOrCreateMemoryEntry(uid: string): EntitlementSnapshot {
   const now = Date.now();
@@ -148,6 +189,16 @@ function getOrCreateMemoryEntry(uid: string): EntitlementSnapshot {
       existing.creditsRemaining = IMMUTABLE_WEEKLY_QUOTAS.free;
       existing.weeklyQuota = IMMUTABLE_WEEKLY_QUOTAS.free;
       existing.nextResetAt = now + WEEK_MS;
+    } else if ((existing.plan === 'pro' || existing.plan === 'max') && existing.proUntil > now && existing.nextResetAt <= now) {
+      const paidQuota =
+        existing.plan === 'pro'
+          ? IMMUTABLE_WEEKLY_QUOTAS.pro
+          : existing.maxMultiplier === 20
+            ? IMMUTABLE_WEEKLY_QUOTAS.max20
+            : IMMUTABLE_WEEKLY_QUOTAS.max10;
+      existing.creditsRemaining = paidQuota;
+      existing.weeklyQuota = paidQuota;
+      existing.nextResetAt = Math.min(existing.proUntil, now + MONTH_MS);
     }
     return { ...existing };
   }
@@ -161,11 +212,11 @@ function getOrCreateMemoryEntry(uid: string): EntitlementSnapshot {
     maxLeverage: IMMUTABLE_MAX_LEVERAGE.free,
     source: 'server_memory',
   };
-  memoryLedger.set(uid, fresh);
+  setMemoryLedgerEntry(uid, fresh);
   return { ...fresh };
 }
 
-function normalizeFirestoreState(
+export function normalizeFirestoreState(
   uid: string,
   data: Record<string, unknown>,
   now: number,
@@ -174,7 +225,7 @@ function normalizeFirestoreState(
   patch: Record<string, unknown> | null;
 } {
   const rawPlan = data.plan === 'pro' || data.plan === 'max' ? data.plan : 'free';
-  const proUntil = Number(data.proUntil) || 0;
+  const proUntil = parseTimestampMs(data.proUntil) ?? 0;
   const maxMultiplier: 10 | 20 = Number(data.maxMultiplier) === 20 ? 20 : 10;
   let plan: PlanTier = rawPlan;
   let creditsRemaining = Number.isFinite(Number(data.creditsRemaining))
@@ -183,7 +234,8 @@ function normalizeFirestoreState(
   let weeklyQuota = Number.isFinite(Number(data.weeklyQuota))
     ? Math.max(1, Math.floor(Number(data.weeklyQuota)))
     : IMMUTABLE_WEEKLY_QUOTAS.free;
-  let nextResetAt = Number(data.nextResetAt) || now + WEEK_MS;
+  const parsedNextReset = parseTimestampMs(data.nextResetAt);
+  let nextResetAt = parsedNextReset ?? now + (plan === 'free' ? WEEK_MS : MONTH_MS);
 
   const patch: Record<string, unknown> = {};
 
@@ -192,12 +244,14 @@ function normalizeFirestoreState(
     plan = 'free';
     weeklyQuota = IMMUTABLE_WEEKLY_QUOTAS.free;
     creditsRemaining = Math.min(IMMUTABLE_WEEKLY_QUOTAS.free, creditsRemaining);
+    nextResetAt = now + WEEK_MS;
     patch.plan = 'free';
     patch.weeklyQuota = weeklyQuota;
     patch.creditsRemaining = creditsRemaining;
+    patch.nextResetAt = new Date(nextResetAt).toISOString();
   }
 
-  // Еженедельное обновление квоты Free и миграция старых квот (10/15 -> 25)
+  // Еженедельное обновление квоты Free (7 дней) и миграция старых квот (10/15 -> 25)
   if (plan === 'free') {
     if (weeklyQuota < IMMUTABLE_WEEKLY_QUOTAS.free) {
       weeklyQuota = IMMUTABLE_WEEKLY_QUOTAS.free;
@@ -211,12 +265,33 @@ function normalizeFirestoreState(
       weeklyQuota = IMMUTABLE_WEEKLY_QUOTAS.free;
       patch.creditsRemaining = creditsRemaining;
       patch.weeklyQuota = weeklyQuota;
-      patch.nextResetAt = nextResetAt;
+      // Пишем в ISO-строке, чтобы соответствовать схеме firestore.rules (nextResetAt is string)
+      patch.nextResetAt = new Date(nextResetAt).toISOString();
+    } else if (parsedNextReset === null) {
+      patch.nextResetAt = new Date(nextResetAt).toISOString();
     }
-  } else if (plan === 'pro') {
-    weeklyQuota = IMMUTABLE_WEEKLY_QUOTAS.pro;
-  } else if (plan === 'max') {
-    weeklyQuota = maxMultiplier === 20 ? IMMUTABLE_WEEKLY_QUOTAS.max20 : IMMUTABLE_WEEKLY_QUOTAS.max10;
+  } else {
+    // Ежемесячное обновление квоты PRO / MAX (каждые 30 дней, включая годовые подписки)
+    const expectedPaidQuota =
+      plan === 'pro'
+        ? IMMUTABLE_WEEKLY_QUOTAS.pro
+        : maxMultiplier === 20
+          ? IMMUTABLE_WEEKLY_QUOTAS.max20
+          : IMMUTABLE_WEEKLY_QUOTAS.max10;
+    if (weeklyQuota !== expectedPaidQuota) {
+      weeklyQuota = expectedPaidQuota;
+      patch.weeklyQuota = weeklyQuota;
+    }
+    if (nextResetAt <= now) {
+      nextResetAt = Math.min(proUntil, now + MONTH_MS);
+      creditsRemaining = expectedPaidQuota;
+      patch.creditsRemaining = creditsRemaining;
+      patch.weeklyQuota = expectedPaidQuota;
+      patch.nextResetAt = new Date(nextResetAt).toISOString();
+    } else if (parsedNextReset === null) {
+      nextResetAt = Math.min(proUntil, now + MONTH_MS);
+      patch.nextResetAt = new Date(nextResetAt).toISOString();
+    }
   }
 
   const snapshot: EntitlementSnapshot = {
@@ -242,6 +317,7 @@ export async function getUserEntitlements(uid: string): Promise<EntitlementSnaps
     const db = getAdminDb();
     const now = Date.now();
     if (!db) {
+      assertDevFallbackAllowed();
       return getOrCreateMemoryEntry(uid);
     }
 
@@ -259,7 +335,7 @@ export async function getUserEntitlements(uid: string): Promise<EntitlementSnaps
       if (patch) {
         tx.update(userRef, { ...patch, updatedAt: FieldValue.serverTimestamp() });
       }
-      memoryLedger.set(uid, snapshot);
+      setMemoryLedgerEntry(uid, snapshot);
       return snapshot;
     });
   });
@@ -279,6 +355,7 @@ export async function consumeUserCredits(
     const now = Date.now();
 
     if (!db) {
+      assertDevFallbackAllowed();
       const entry = getOrCreateMemoryEntry(uid);
       if (cost > 0 && entry.creditsRemaining < cost) {
         throw new EntitlementError(
@@ -291,7 +368,7 @@ export async function consumeUserCredits(
         ...entry,
         creditsRemaining: Math.max(0, entry.creditsRemaining - cost),
       };
-      memoryLedger.set(uid, updated);
+      setMemoryLedgerEntry(uid, updated);
       return { snapshot: updated, deducted: cost };
     }
 
@@ -299,7 +376,6 @@ export async function consumeUserCredits(
     const updatedSnapshot = await db.runTransaction(async (tx) => {
       const snap = await tx.get(userRef);
       if (!snap.exists) {
-        // Пользователь ещё не завершил первичный bootstrap — используем консервативный серверный учёт
         const mem = getOrCreateMemoryEntry(uid);
         if (cost > 0 && mem.creditsRemaining < cost) {
           throw new EntitlementError(
@@ -309,7 +385,7 @@ export async function consumeUserCredits(
           );
         }
         const nextMem = { ...mem, creditsRemaining: Math.max(0, mem.creditsRemaining - cost) };
-        memoryLedger.set(uid, nextMem);
+        setMemoryLedgerEntry(uid, nextMem);
         return nextMem;
       }
 
@@ -340,11 +416,62 @@ export async function consumeUserCredits(
         ...snapshot,
         creditsRemaining: nextCredits,
       };
-      memoryLedger.set(uid, finalSnap);
+      setMemoryLedgerEntry(uid, finalSnap);
       return finalSnap;
     });
 
     return { snapshot: updatedSnapshot, deducted: cost };
+  });
+}
+
+/**
+ * Автоматический возврат списанных кредитов при сбое внешнего API (биржа / Gemini)
+ * после предварительного списания. Не превышает максимальную квоту тарифа.
+ */
+export async function refundUserCredits(
+  uid: string,
+  action: BillableAction,
+): Promise<EntitlementSnapshot | null> {
+  const refundAmount = IMMUTABLE_CREDIT_COSTS[action];
+  if (typeof refundAmount !== 'number' || refundAmount <= 0) return null;
+
+  return withUidLock(uid, async () => {
+    const db = getAdminDb();
+    const now = Date.now();
+
+    if (!db) {
+      if (process.env.NODE_ENV === 'production') return null;
+      const entry = getOrCreateMemoryEntry(uid);
+      const restored: EntitlementSnapshot = {
+        ...entry,
+        creditsRemaining: Math.min(entry.weeklyQuota, entry.creditsRemaining + refundAmount),
+      };
+      setMemoryLedgerEntry(uid, restored);
+      return restored;
+    }
+
+    const userRef = db.collection('users').doc(uid);
+    return db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) return null;
+      const { snapshot, patch } = normalizeFirestoreState(
+        uid,
+        (snap.data() || {}) as Record<string, unknown>,
+        now,
+      );
+      const nextCredits = Math.min(snapshot.weeklyQuota, snapshot.creditsRemaining + refundAmount);
+      tx.update(userRef, {
+        ...(patch || {}),
+        creditsRemaining: nextCredits,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      const finalSnap: EntitlementSnapshot = {
+        ...snapshot,
+        creditsRemaining: nextCredits,
+      };
+      setMemoryLedgerEntry(uid, finalSnap);
+      return finalSnap;
+    });
   });
 }
 
@@ -354,32 +481,20 @@ export function isPlanAtLeast(actual: PlanTier, required: PlanTier): boolean {
   return TIER_RANK[actual] >= TIER_RANK[required];
 }
 
-export function isDemoPreviewHost(): boolean {
-  if (process.env.NODE_ENV !== 'production') return true;
-  if (process.env.ALLOW_DEMO_TIER === 'true') return true;
-  const appUrl = (process.env.APP_URL || '').toLowerCase();
-  if (appUrl.includes('ais-dev-') || appUrl.includes('ais-pre-')) {
-    return true;
-  }
-  return false;
-}
-
-export async function resolveAuthoritativePlan(
-  uid: string | undefined,
-  devDemoTier?: unknown,
-): Promise<PlanTier> {
-  // В production на боевом домене demoTier ПОЛНОСТЬЮ игнорируется на сервере.
-  // В dev и на превью-стендах AI Studio (ais-dev / ais-pre) разрешаем тестирование Demo PRO / Demo MAX.
-  if (isDemoPreviewHost() && (devDemoTier === 'pro' || devDemoTier === 'max')) {
-    return devDemoTier;
-  }
-
+/**
+ * Авторитетное определение тарифа на сервере: исключительно из верифицированного UID и базы данных.
+ * Клиентские флаги demoTier полностью удалены из серверной логики (исключает обход paywall).
+ */
+export async function resolveAuthoritativePlan(uid: string | undefined): Promise<PlanTier> {
   if (!uid) {
     return 'free';
   }
-
-  const entitlements = await getUserEntitlements(uid);
-  return entitlements.plan;
+  try {
+    const entitlements = await getUserEntitlements(uid);
+    return entitlements.plan;
+  } catch {
+    return 'free';
+  }
 }
 
 export function isValidBillableAction(value: unknown): value is BillableAction {

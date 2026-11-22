@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, CheckSquare, ShieldAlert, ShieldCheck, Square, X } from 'lucide-react';
 import { triggerHaptic } from '../lib/securityDlp';
 import type { ExchangeId, MarketType } from '../types/domain';
@@ -298,7 +298,7 @@ export const TradeRiskConfirmModal: React.FC<TradeRiskConfirmModalProps> = ({
                     <strong>Я подтверждаю, что самостоятельно несу полную ответственность за свои финансы</strong>, возможные убытки, проскальзывание, комиссии и риск ликвидации позиции.
                   </span>
                   <span className="block text-[11px] text-amber-200/90 font-medium">
-                    I understand that AegisQuant is an analytical tool and I bear full responsibility for my financial decisions.
+                    I understand that Vernier is an analytical tool and I bear full responsibility for my financial decisions.
                   </span>
                 </span>
               </button>
@@ -475,7 +475,7 @@ export const PaperFundsConfirmModal: React.FC<PaperFundsConfirmModalProps> = ({
               )}
               <span className="leading-relaxed space-y-1 block">
                 <span className="block font-semibold text-white">
-                  I understand that AegisQuant is an analytical tool and I bear full responsibility for my financial decisions.
+                  I understand that Vernier is an analytical tool and I bear full responsibility for my financial decisions.
                 </span>
                 <span className="block text-[11px] text-slate-300">
                   Я понимаю, что это аналитический инструмент (без приёма и хранения средств клиентов), и самостоятельно несу полную ответственность за свои финансовые решения.

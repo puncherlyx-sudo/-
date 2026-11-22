@@ -34,7 +34,7 @@ import {
   Star,
   X,
 } from 'lucide-react';
-import { AnimatePresence, LayoutGroup, motion } from 'framer-motion';
+import { AnimatePresence, LayoutGroup, motion } from 'motion/react';
 import {
   CREDIT_COSTS,
   FREE_DAILY_SIGNAL_LIMIT,

@@ -14,14 +14,13 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { AnimatePresence, LayoutGroup, MotionConfig, motion, useScroll, useSpring } from 'framer-motion';
+import { AnimatePresence, LayoutGroup, MotionConfig, motion, useScroll, useSpring } from 'motion/react';
 import { BottomSheet, BottomSheetItem } from './components/BottomSheet';
 import { InterfaceTour, TOUR_STORAGE_KEY } from './components/InterfaceTour';
 import { LegalConsentModal, LegalDocumentModal, type LegalDocKind } from './components/LegalConsentModal';
 import { LockScreenOverlay } from './components/LockScreenOverlay';
 import type { ScreenerSection } from './components/MarketScreenerView';
 import type { StrategiesSection } from './components/StrategiesView';
-import { MarketTerminalView } from './components/MarketTerminalView';
 import { MiniPortfolioWidget } from './components/MiniPortfolioWidget';
 import { NATIVE_PILL_SPRING, tabSlideBlurVariants } from './components/MotionPrimitives';
 import { OfflineIndicator } from './components/OfflineIndicator';
@@ -39,6 +38,7 @@ import { ViewFallback } from './components/ViewFallback';
 import {
   AndroidWidgetsModal,
   MarketScreenerView,
+  MarketTerminalView,
   NewsFeedView,
   PortfolioDetailsModal,
   prefetchViews,
@@ -90,11 +90,18 @@ import {
 } from './data/strategies';
 import { playAlertChime } from './lib/alertSound';
 import { authFetch } from './lib/authFetch';
+import { parseJsonResponse } from './utils/safeFetchJson';
 import {
   appendExchangeSyncErrorLog,
   appendExchangeSyncSuccessLog,
+  classifyExchangeSyncError,
+  classifyExchangeSyncSeverity,
   clearExchangeSyncErrorLogs,
+  extractExchangeSyncTechnicalDetails,
+  readExchangeSyncAutoCleanupEnabled,
   readExchangeSyncErrorLogs,
+  runExchangeSyncLogAutoCleanup,
+  writeExchangeSyncAutoCleanupEnabled,
   type ExchangeSyncErrorLogEntry,
 } from './lib/exchangeSyncErrorLog';
 import type { ActiveStrategySignalOverlay } from './lib/strategyEngine';
@@ -315,10 +322,13 @@ export default function App() {
     setDemoPlanOverrideState(override);
   }, []);
 
+  const initialPaymentStatusRef = useRef<string | null>(
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('payment') : null
+  );
   const [paymentNotice, setPaymentNotice] = useState<string | null>(() => {
-    const status = new URLSearchParams(window.location.search).get('payment');
+    const status = initialPaymentStatusRef.current;
     if (status === 'success') {
-      return 'Подписка Google Play подтверждена. Тариф обновится автоматически в течение минуты.';
+      return 'Оплата принята. Синхронизируем статус подписки с сервером…';
     }
     if (status === 'cancel') return 'Оплата отменена. Деньги не списаны.';
     return null;
@@ -365,7 +375,18 @@ export default function App() {
     section: SecuritySection;
     sub?: 'chart' | 'log' | 'faq';
     nonce: number;
-  } | null>(null);
+  } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('tab') !== 'security') return null;
+    const sec = params.get('section');
+    const sub = params.get('sub');
+    const validSub = sub === 'chart' || sub === 'log' || sub === 'faq' ? sub : undefined;
+    if (sec === 'exchanges' || sec === 'audit' || sec === 'push' || sec === '2fa' || sec === 'sessions') {
+      return { section: sec, sub: validSub, nonce: Date.now() };
+    }
+    return null;
+  });
 
   const { scrollYProgress } = useScroll();
   const smoothScrollProgress = useSpring(scrollYProgress, {
@@ -495,6 +516,46 @@ export default function App() {
   } = useAuthAndVault();
 
   const isSignedIn = Boolean(authReady && firebaseUser);
+
+  // При возврате с платёжного шлюза (/?payment=success) очищаем URL и запрашиваем актуальные права у сервера
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('payment')) {
+      params.delete('payment');
+      const cleanQuery = params.toString();
+      const nextUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+
+    if (initialPaymentStatusRef.current !== 'success' || !isSignedIn) return;
+    initialPaymentStatusRef.current = null;
+    let cancelled = false;
+    void authFetch('/api/entitlements/me', { method: 'GET', cache: 'no-store' })
+      .then((res) =>
+        parseJsonResponse<{ plan?: PlanTier; proUntil?: number | null; creditsRemaining?: number }>(res)
+      )
+      .then((parsed) => {
+        if (cancelled) return;
+        if (parsed.ok && parsed.data && parsed.data.plan && parsed.data.plan !== 'free') {
+          setPaymentNotice(
+            `Подписка ${parsed.data.plan.toUpperCase()} активирована! Доступно ${parsed.data.creditsRemaining ?? 0} AI-кредитов.`
+          );
+        } else {
+          setPaymentNotice(
+            'Оплата получена. Тариф обновится автоматически сразу после подтверждения платежа (обычно до 1 минуты).'
+          );
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPaymentNotice('Оплата получена. Тариф обновится автоматически в течение минуты.');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSignedIn]);
+
   const paperPortfolio = usePaperPortfolio();
   const portfolioSourceRef = useRef(paperPortfolio.portfolioSource);
   portfolioSourceRef.current = paperPortfolio.portfolioSource;
@@ -503,6 +564,7 @@ export default function App() {
   const bgSyncedKeyIdsRef = useRef<Set<string>>(new Set());
   const bgSyncUidRef = useRef<string | null>(null);
   const [exchangeSyncErrorLogs, setExchangeSyncErrorLogs] = useState<ExchangeSyncErrorLogEntry[]>([]);
+  const [syncLogAutoCleanup30d, setSyncLogAutoCleanup30d] = useState<boolean>(true);
 
   useEffect(() => {
     const uid = firebaseUser?.uid ?? null;
@@ -510,6 +572,7 @@ export default function App() {
       bgSyncUidRef.current = uid;
       bgSyncedKeyIdsRef.current.clear();
     }
+    setSyncLogAutoCleanup30d(readExchangeSyncAutoCleanupEnabled(uid));
     setExchangeSyncErrorLogs(uid ? readExchangeSyncErrorLogs(uid) : []);
   }, [firebaseUser?.uid]);
 
@@ -521,6 +584,22 @@ export default function App() {
     }
     setExchangeSyncErrorLogs(clearExchangeSyncErrorLogs(uid));
   }, [firebaseUser?.uid]);
+
+  const handleToggleSyncLogAutoCleanup30d = useCallback(
+    (enabled: boolean): { removedCount: number } => {
+      const uid = firebaseUser?.uid;
+      setSyncLogAutoCleanup30d(enabled);
+      if (!uid) return { removedCount: 0 };
+      writeExchangeSyncAutoCleanupEnabled(uid, enabled);
+      if (enabled) {
+        const result = runExchangeSyncLogAutoCleanup(uid);
+        setExchangeSyncErrorLogs(result.logs);
+        return { removedCount: result.removedCount };
+      }
+      return { removedCount: 0 };
+    },
+    [firebaseUser?.uid]
+  );
 
   // Если в локальном кэше биржи есть более свежий снимок для активного биржевого портфеля — применяем мгновенно
   useEffect(() => {
@@ -552,9 +631,46 @@ export default function App() {
   }, []);
 
   // Фоновое обновление биржевых балансов (Stale-While-Revalidate) при открытии приложения
+  const notifyCriticalSyncPushRef = useRef<
+    | ((params: {
+        keyId: string;
+        exchange: ExchangeId;
+        label: string;
+        category: 'auth' | 'exchange_api' | 'unknown';
+        errorMessage: string;
+        testnet?: boolean;
+      }) => Promise<unknown>)
+    | null
+  >(null);
+
+  const dispatchCriticalSyncPushIfNeeded = useCallback(
+    (params: {
+      keyId: string;
+      exchange: ExchangeId;
+      label: string;
+      testnet?: boolean;
+      errorMessage: string;
+    }) => {
+      const category = classifyExchangeSyncError(params.errorMessage);
+      const severity = classifyExchangeSyncSeverity(category);
+      if (severity !== 'critical') return;
+      const pushCategory: 'auth' | 'exchange_api' | 'unknown' =
+        category === 'auth' || category === 'exchange_api' ? category : 'unknown';
+      void notifyCriticalSyncPushRef.current?.({
+        keyId: params.keyId,
+        exchange: params.exchange,
+        label: params.label,
+        category: pushCategory,
+        errorMessage: params.errorMessage,
+        testnet: params.testnet,
+      });
+    },
+    []
+  );
+
+  // Продолжение фоновой синхронизации ключей бирж
   useEffect(() => {
     if (!authReady || !firebaseUser || exchangeKeys.length === 0) return;
-
     const activeUid = firebaseUser.uid;
     const pendingKeys = exchangeKeys.filter(
       (k) => k.enabled && !bgSyncedKeyIdsRef.current.has(k.id)
@@ -601,14 +717,22 @@ export default function App() {
             testnet: key.testnet,
             errorMessage,
             source: 'background',
+            technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/sync'),
           });
           if (isMountedRef.current && bgSyncUidRef.current === activeUid) {
             setExchangeSyncErrorLogs(nextLogs);
           }
+          dispatchCriticalSyncPushIfNeeded({
+            keyId: key.id,
+            exchange: key.exchange,
+            label: key.label,
+            testnet: key.testnet,
+            errorMessage,
+          });
         }
       })
     );
-  }, [authReady, firebaseUser, exchangeKeys, syncExchangeKey, syncPortfolioFromExchange]);
+  }, [authReady, firebaseUser, exchangeKeys, syncExchangeKey, syncPortfolioFromExchange, dispatchCriticalSyncPushIfNeeded]);
 
   const isBackgroundSyncingActiveExchange = useMemo(() => {
     if (paperPortfolio.portfolioSource.mode !== 'exchange' || !paperPortfolio.portfolioSource.exchange) {
@@ -733,7 +857,12 @@ export default function App() {
     onDeleteSubscription: deletePushSubscriptionRecord,
   });
 
-  const { checkAndNotifyPortfolioPnl, checkAndNotifyPortfolioTarget } = pushState;
+  const {
+    checkAndNotifyPortfolioPnl,
+    checkAndNotifyPortfolioTarget,
+    notifyCriticalExchangeSyncError,
+  } = pushState;
+  notifyCriticalSyncPushRef.current = notifyCriticalExchangeSyncError;
 
   useEffect(() => {
     if (paperPortfolio.holdings.length === 0 || !paperPortfolio.dailyPnl.hasLive24hData) return;
@@ -1325,8 +1454,16 @@ export default function App() {
             testnet: key.testnet,
             errorMessage,
             source: 'manual',
+            technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/sync'),
           })
         );
+        dispatchCriticalSyncPushIfNeeded({
+          keyId: key.id,
+          exchange: key.exchange,
+          label: key.label,
+          testnet: key.testnet,
+          errorMessage,
+        });
       }
       throw err;
     }
@@ -1390,8 +1527,16 @@ export default function App() {
                 testnet: params.testnet,
                 errorMessage,
                 source: 'manual',
+                technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/connect'),
               })
             );
+            dispatchCriticalSyncPushIfNeeded({
+              keyId: existingKey.id,
+              exchange: existingKey.exchange,
+              label: params.label.trim() || existingKey.label,
+              testnet: params.testnet,
+              errorMessage,
+            });
           }
           throw err;
         }
@@ -1778,7 +1923,7 @@ export default function App() {
         </header>
 
       {/* Main Content Container */}
-      <main className="flex-1 w-full max-w-7xl mx-auto px-3 sm:px-6 py-2.5 sm:py-4 pb-24 md:pb-8 overflow-x-hidden">
+      <main className="flex-1 w-full max-w-7xl mx-auto px-3 sm:px-6 py-2.5 sm:py-4 pb-[calc(6.5rem+env(safe-area-inset-bottom,0px))] md:pb-8 overflow-x-hidden">
         {/* Unified Space-Efficient Scrollable Header Strip: Portfolio Summary + API Exchange Badge + Quick Actions + Live Ticker Tape */}
         <MiniPortfolioWidget
           holdingsCount={paperPortfolio.holdings.length}
@@ -1910,8 +2055,9 @@ export default function App() {
           </div>
         )}
 
+        {/* Скрываем и полностью размонтируем неактивные вкладки (mode="wait" + React.lazy), чтобы снизить расход RAM на мобильных устройствах */}
         <div className="relative w-full">
-          <AnimatePresence mode="popLayout" initial={false} custom={tabDirection}>
+          <AnimatePresence mode="wait" initial={false} custom={tabDirection}>
             <motion.div
               key={activeTab}
               custom={tabDirection}
@@ -2070,6 +2216,8 @@ export default function App() {
                 backgroundSyncingKeyIds={backgroundSyncingKeyIds}
                 exchangeSyncErrorLogs={exchangeSyncErrorLogs}
                 onClearExchangeSyncErrorLogs={handleClearExchangeSyncErrorLogs}
+                syncLogAutoCleanup30d={syncLogAutoCleanup30d}
+                onToggleSyncLogAutoCleanup30d={handleToggleSyncLogAutoCleanup30d}
                 portfolioSource={paperPortfolio.portfolioSource}
                 onConnectExchange={handleConnectExchangeWithSync}
                 onSyncExchange={handleSyncExchangeToPortfolio}
@@ -2111,7 +2259,7 @@ export default function App() {
       {/* Mobile Fixed Thumb-Zone Bottom Tab Bar */}
       <nav
         aria-label="Мобильная навигация"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-16 pb-safe border-t border-white/10 bg-[#0B0F17]/95 backdrop-blur-md grid grid-cols-5 items-center"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 min-h-[64px] pt-1 pb-[max(0.25rem,env(safe-area-inset-bottom,0px))] border-t border-white/10 bg-[#0B0F17]/95 backdrop-blur-md grid grid-cols-5 items-center"
       >
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
@@ -2161,15 +2309,19 @@ export default function App() {
             currentPlan={getActivePlanTier(effectiveProfile)}
             initialTier={pricingTier}
             initialMaxMultiplier={pricingMaxMultiplier}
-            onActivateDemoTier={(tier, maxMult) => {
-              handleChangeDemoPlan({ tier, maxMultiplier: maxMult ?? 10 });
-              setPaymentNotice(
-                `Демо-режим переключён на тариф ${tier.toUpperCase()}${
-                  tier === 'max' ? ` ×${maxMult ?? 10}` : ''
-                }. Все функции этого уровня разблокированы.`
-              );
-              setPricingOpen(false);
-            }}
+            onActivateDemoTier={
+              import.meta.env.DEV
+                ? (tier, maxMult) => {
+                    handleChangeDemoPlan({ tier, maxMultiplier: maxMult ?? 10 });
+                    setPaymentNotice(
+                      `Локальный DEV-режим переключён на тариф ${tier.toUpperCase()}${
+                        tier === 'max' ? ` ×${maxMult ?? 10}` : ''
+                      }.`
+                    );
+                    setPricingOpen(false);
+                  }
+                : undefined
+            }
           />
         </Suspense>
       )}
@@ -2274,7 +2426,7 @@ export default function App() {
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: 16 }}
                   transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
-                  className="upgrade-bar-breathe breathe-pulse fixed inset-x-3 bottom-[72px] md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:bottom-5 z-30 md:w-[min(560px,calc(100vw-2rem))] rounded-2xl border border-emerald-500/25 bg-[#0B1219]/92 backdrop-blur-md shadow-xl shadow-black/45 px-3 py-2 flex items-center justify-between gap-2.5"
+                  className="upgrade-bar-breathe breathe-pulse fixed inset-x-3 bottom-[calc(72px+env(safe-area-inset-bottom,0px))] md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:bottom-5 z-30 md:w-[min(560px,calc(100vw-2rem))] rounded-2xl border border-emerald-500/25 bg-[#0B1219]/92 backdrop-blur-md shadow-xl shadow-black/45 px-3 py-2 flex items-center justify-between gap-2.5"
                 >
                   <div className="flex items-center gap-2.5 min-w-0 flex-1">
                     <span className="upgrade-bar-icon-breathe w-8 h-8 rounded-xl border border-amber-400/30 bg-gradient-to-br from-amber-500/18 to-cyan-500/18 flex items-center justify-center shrink-0">
@@ -2395,59 +2547,63 @@ export default function App() {
         onClose={handleCloseTour}
       />
 
-      {/* Android Home Screen & Widgets Hub */}
-      <Suspense fallback={null}>
-        <AndroidWidgetsModal
-          open={widgetsModalOpen}
-          onClose={() => setWidgetsModalOpen(false)}
-          portfolioReport={paperPortfolio.report}
-          holdingsCount={paperPortfolio.holdings.length}
-          strategies={effectiveStrategies}
-          onLaunchStandaloneWidget={launchStandaloneWidget}
-        />
-      </Suspense>
+      {/* Android Home Screen & Widgets Hub — chunk загружается только при открытии */}
+      {widgetsModalOpen && (
+        <Suspense fallback={null}>
+          <AndroidWidgetsModal
+            open={widgetsModalOpen}
+            onClose={() => setWidgetsModalOpen(false)}
+            portfolioReport={paperPortfolio.report}
+            holdingsCount={paperPortfolio.holdings.length}
+            strategies={effectiveStrategies}
+            onLaunchStandaloneWidget={launchStandaloneWidget}
+          />
+        </Suspense>
+      )}
 
-      {/* Expanded Portfolio PnL Breakdown & Trade History Modal */}
-      <Suspense fallback={null}>
-        <PortfolioDetailsModal
-          open={portfolioModalOpen}
-          onClose={() => setPortfolioModalOpen(false)}
-          uid={firebaseUser?.uid ?? null}
-          isSignedIn={isSignedIn}
-          report={paperPortfolio.report}
-          dailyPnl={paperPortfolio.dailyPnl}
-          portfolioSource={paperPortfolio.portfolioSource}
-          portfolioIdentity={paperPortfolio.portfolioIdentity}
-          portfolioTargets={effectivePortfolioTargets}
-          pushSubscribed={pushState.isSubscribed}
-          notifyPortfolioPnlEnabled={pushState.preferences.notifyPortfolioPnl}
-          spotTickers={paperPortfolio.spotTickers}
-          analyses={analyses}
-          onRequireLogin={() => void handleLoginWithPush()}
-          onOpenPairOnMarket={handleOpenPairOnMarket}
-          onManageInScreener={() => {
-            setScreenerSectionSelection({ section: 'portfolio', nonce: Date.now() });
-            handleSwitchTab('screener');
-          }}
-          onOpenTradeJournal={() => {
-            setStrategiesSectionSelection({ section: 'journal', nonce: Date.now() });
-            handleSwitchTab('strategies');
-          }}
-          onOpenExchangeIntegrations={() => {
-            setSecuritySectionSelection({ section: 'exchanges', nonce: Date.now() });
-            handleSwitchTab('security');
-          }}
-          onOpenPushSettings={() => {
-            setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
-            handleSwitchTab('security');
-          }}
-          onSavePortfolioTarget={handleSavePortfolioTarget}
-          onDeletePortfolioTarget={handleDeletePortfolioTarget}
-          onRemoveHolding={paperPortfolio.removeHolding}
-          onClearPortfolio={paperPortfolio.clearHoldings}
-          onResetDemo={paperPortfolio.resetDemoPortfolio}
-        />
-      </Suspense>
+      {/* Expanded Portfolio PnL Breakdown & Trade History Modal — chunk загружается только при открытии */}
+      {portfolioModalOpen && (
+        <Suspense fallback={null}>
+          <PortfolioDetailsModal
+            open={portfolioModalOpen}
+            onClose={() => setPortfolioModalOpen(false)}
+            uid={firebaseUser?.uid ?? null}
+            isSignedIn={isSignedIn}
+            report={paperPortfolio.report}
+            dailyPnl={paperPortfolio.dailyPnl}
+            portfolioSource={paperPortfolio.portfolioSource}
+            portfolioIdentity={paperPortfolio.portfolioIdentity}
+            portfolioTargets={effectivePortfolioTargets}
+            pushSubscribed={pushState.isSubscribed}
+            notifyPortfolioPnlEnabled={pushState.preferences.notifyPortfolioPnl}
+            spotTickers={paperPortfolio.spotTickers}
+            analyses={analyses}
+            onRequireLogin={() => void handleLoginWithPush()}
+            onOpenPairOnMarket={handleOpenPairOnMarket}
+            onManageInScreener={() => {
+              setScreenerSectionSelection({ section: 'portfolio', nonce: Date.now() });
+              handleSwitchTab('screener');
+            }}
+            onOpenTradeJournal={() => {
+              setStrategiesSectionSelection({ section: 'journal', nonce: Date.now() });
+              handleSwitchTab('strategies');
+            }}
+            onOpenExchangeIntegrations={() => {
+              setSecuritySectionSelection({ section: 'exchanges', nonce: Date.now() });
+              handleSwitchTab('security');
+            }}
+            onOpenPushSettings={() => {
+              setSecuritySectionSelection({ section: 'push', nonce: Date.now() });
+              handleSwitchTab('security');
+            }}
+            onSavePortfolioTarget={handleSavePortfolioTarget}
+            onDeletePortfolioTarget={handleDeletePortfolioTarget}
+            onRemoveHolding={paperPortfolio.removeHolding}
+            onClearPortfolio={paperPortfolio.clearHoldings}
+            onResetDemo={paperPortfolio.resetDemoPortfolio}
+          />
+        </Suspense>
+      )}
 
       {/* Mandatory Per-Launch Non-Custodial API Trade Confirmation Modal */}
       <TradeRiskConfirmModal

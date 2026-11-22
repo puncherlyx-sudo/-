@@ -11,7 +11,7 @@ import {
   RotateCcw,
   Send,
 } from 'lucide-react';
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import type { SupportTicketCategory, SupportTicketRecord } from '../types/domain';
 import { PermanentFeaturesManual } from './FeatureGuide';
 import { NATIVE_PILL_SPRING, NATIVE_SPRING, TERMINAL_EASE } from './MotionPrimitives';

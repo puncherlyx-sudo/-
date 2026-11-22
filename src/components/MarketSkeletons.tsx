@@ -1,5 +1,5 @@
 import React from 'react';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 import { NATIVE_SPRING, TERMINAL_EASE } from './MotionPrimitives';
 
 const SKELETON_PULSE = {

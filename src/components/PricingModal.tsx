@@ -22,7 +22,9 @@ import {
   STRATEGY_CATALOG,
 } from '../data/strategies';
 import type { PlanTier } from '../types/domain';
+import { authFetch } from '../lib/authFetch';
 import { triggerHaptic } from '../lib/securityDlp';
+import { parseJsonResponse } from '../utils/safeFetchJson';
 
 type Period = 'month' | 'year';
 type CheckoutTier = 'pro' | 'max';
@@ -122,10 +124,10 @@ export const PricingModal: React.FC<PricingModalProps> = ({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    fetch('/api/billing/plans')
-      .then((r) => r.json() as Promise<PlansResponse>)
-      .then((json) => {
-        if (!cancelled) setData(json);
+    fetch('/api/billing/plans', { cache: 'no-store' })
+      .then((r) => parseJsonResponse<PlansResponse>(r))
+      .then((parsed) => {
+        if (!cancelled && parsed.ok && parsed.data) setData(parsed.data);
       })
       .catch(() => undefined);
     return () => {
@@ -172,50 +174,120 @@ export const PricingModal: React.FC<PricingModalProps> = ({
 
   const selectedQuota = isMaxSelected ? maxQuota : PRO_MONTHLY_QUOTA;
 
-  const handleGooglePlayCheckout = async () => {
+  const handleCheckout = async () => {
     triggerHaptic(12);
     setBusyAction('pay');
     setStatusNotice(null);
-    await new Promise((r) => setTimeout(r, 550));
 
-    // Проверяем поддержку Digital Goods API (Google Play Billing в TWA / Android Chrome)
-    const hasDigitalGoods =
-      typeof window !== 'undefined' &&
-      typeof (window as unknown as { getDigitalGoodsService?: unknown }).getDigitalGoodsService === 'function';
+    try {
+      const res = await authFetch('/api/billing/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          period,
+          tier: selectedTier,
+          maxMultiplier,
+        }),
+      });
+      const parsed = await parseJsonResponse<{ invoiceUrl?: string; error?: string }>(res);
 
-    if (hasDigitalGoods) {
+      if (parsed.ok && typeof parsed.data?.invoiceUrl === 'string') {
+        const invoiceUrl = parsed.data.invoiceUrl.trim();
+        if (/^https:\/\/([a-z0-9-]+\.)?nowpayments\.io\//i.test(invoiceUrl)) {
+          window.location.assign(invoiceUrl);
+          return;
+        }
+        setStatusNotice({
+          tone: 'err',
+          text: 'Платёжный шлюз вернул недопустимый адрес счёта. Попробуйте ещё раз позже.',
+        });
+        return;
+      }
+
+      if (res.status === 401) {
+        setStatusNotice({
+          tone: 'info',
+          text: 'Войдите в аккаунт Google, чтобы оформить подписку и привязать тариф к вашему профилю.',
+        });
+        return;
+      }
+
+      // В DEV-превью допускаем локальный тест тарифа только когда биллинг не сконфигурирован
+      if (import.meta.env.DEV && !data?.enabled && onActivateDemoTier) {
+        onActivateDemoTier(selectedTier, maxMultiplier);
+        setStatusNotice({
+          tone: 'ok',
+          text: `Локальный DEV-тест: включён тариф ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} (${selectedQuota.toLocaleString('ru-RU')} кр./мес). В production активация происходит только после подтверждённой оплаты.`,
+        });
+        return;
+      }
+
       setStatusNotice({
-        tone: 'ok',
-        text: `Запрос подписки ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} (${selectedQuota.toLocaleString('ru-RU')} кр./мес, ${period === 'year' ? 'Годовая' : 'Месячная'}, $${activePrice}) передан в Google Play Billing.`,
+        tone: 'err',
+        text:
+          parsed.data?.error ||
+          parsed.errorMessage ||
+          'Платёжный шлюз временно недоступен. Попробуйте повторить попытку позже.',
       });
-    } else if (onActivateDemoTier) {
-      onActivateDemoTier(selectedTier, maxMultiplier);
+    } catch {
       setStatusNotice({
-        tone: 'ok',
-        text: `Демо-активация Google Play Billing: включён тариф ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} (${selectedQuota.toLocaleString('ru-RU')} кр./мес) для проверки всех функций терминала.`,
+        tone: 'err',
+        text: 'Не удалось связаться с сервером оплаты. Проверьте подключение к сети.',
       });
-    } else {
-      setStatusNotice({
-        tone: 'info',
-        text: 'Оформление подписки через Google Pay / банковскую карту выполняется в приложении Android из Google Play.',
-      });
+    } finally {
+      setBusyAction(null);
     }
-    setBusyAction(null);
   };
 
   const handleRestorePurchases = async () => {
     triggerHaptic(8);
     setBusyAction('restore');
     setStatusNotice(null);
-    await new Promise((r) => setTimeout(r, 500));
-    setStatusNotice({
-      tone: 'info',
-      text:
-        proUntil && proUntil > Date.now()
-          ? `Покупки синхронизированы: активен тариф ${currentPlan.toUpperCase()} до ${formatDate(proUntil)}.`
-          : 'Синхронизация с Google Play завершена. Активных оплаченных подписок на этом аккаунте не найдено.',
-    });
-    setBusyAction(null);
+    try {
+      const res = await authFetch('/api/entitlements/me', {
+        method: 'GET',
+        cache: 'no-store',
+      });
+      const parsed = await parseJsonResponse<{
+        plan?: PlanTier;
+        proUntil?: number | null;
+        creditsRemaining?: number;
+        error?: string;
+      }>(res);
+
+      if (parsed.ok && parsed.data) {
+        const livePlan = parsed.data.plan ?? 'free';
+        const liveUntil = typeof parsed.data.proUntil === 'number' ? parsed.data.proUntil : null;
+        if (livePlan !== 'free' && liveUntil && liveUntil > Date.now()) {
+          setStatusNotice({
+            tone: 'ok',
+            text: `Подписка синхронизирована с сервером: активен ${livePlan.toUpperCase()} до ${formatDate(liveUntil)} (остаток: ${parsed.data.creditsRemaining ?? 0} кр.).`,
+          });
+        } else {
+          setStatusNotice({
+            tone: 'info',
+            text: 'Синхронизация с сервером завершена. Активных оплаченных подписок на этом аккаунте не найдено.',
+          });
+        }
+      } else if (res.status === 401) {
+        setStatusNotice({
+          tone: 'info',
+          text: 'Войдите в аккаунт, чтобы синхронизировать статус оплаченной подписки.',
+        });
+      } else {
+        setStatusNotice({
+          tone: 'err',
+          text: parsed.data?.error || parsed.errorMessage || 'Не удалось проверить статус подписки.',
+        });
+      }
+    } catch {
+      setStatusNotice({
+        tone: 'err',
+        text: 'Ошибка сети при синхронизации статуса подписки.',
+      });
+    } finally {
+      setBusyAction(null);
+    }
   };
 
   return (
@@ -324,12 +396,12 @@ export const PricingModal: React.FC<PricingModalProps> = ({
               </ul>
             </div>
             <div className="pt-2">
-              {onActivateDemoTier && currentPlan !== 'free' ? (
+              {import.meta.env.DEV && onActivateDemoTier && currentPlan !== 'free' ? (
                 <button
                   type="button"
                   onClick={() => {
                     onActivateDemoTier('free');
-                    setStatusNotice({ tone: 'info', text: 'Включён базовый тариф FREE.' });
+                    setStatusNotice({ tone: 'info', text: 'Включён базовый тариф FREE (DEV).' });
                   }}
                   className="w-full min-h-[38px] rounded-xl border border-white/12 bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-300"
                 >
@@ -555,8 +627,8 @@ export const PricingModal: React.FC<PricingModalProps> = ({
 
         {/* Credit Spend Summary */}
         <div className="rounded-xl border border-white/8 bg-[var(--surface-0)] px-3.5 py-2 text-[11px] text-slate-400 font-mono">
-          Списание кредитов: Спот AI {CREDIT_COSTS.spotAnalysis} кр. · Фьючерсы AI {CREDIT_COSTS.futuresAnalysis} кр. ·
-          Бэктест и Сентимент {isMaxSelected ? '0 кр. (MAX)' : '1 кр.'} · Графики, Дневник, Алерты — 0 кр.
+          Списание кредитов: AI-анализ пары (Спот / Фьючерсы) {CREDIT_COSTS.spotAnalysis} кр. ·
+          Бэктест, Сентимент, Графики, Дневник и Алерты — 0 кр.
         </div>
 
         {statusNotice && (
@@ -573,11 +645,11 @@ export const PricingModal: React.FC<PricingModalProps> = ({
           </div>
         )}
 
-        {/* Primary Fiat / Google Pay CTA */}
+        {/* Primary Checkout CTA */}
         <button
           type="button"
           disabled={busyAction !== null}
-          onClick={() => void handleGooglePlayCheckout()}
+          onClick={() => void handleCheckout()}
           className={`cta-shimmer min-h-[50px] w-full rounded-xl disabled:opacity-50 text-slate-950 text-sm font-bold transition-all flex items-center justify-center gap-2 shadow-lg ${
             isMaxSelected
               ? 'bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 hover:brightness-105'
@@ -591,17 +663,16 @@ export const PricingModal: React.FC<PricingModalProps> = ({
           )}
           <span>
             {busyAction === 'pay'
-              ? 'Подключение Google Play Billing…'
+              ? 'Создание защищённого счёта…'
               : `Оформить ${isMaxSelected ? `MAX ×${maxMultiplier} (${selectedQuota.toLocaleString('ru-RU')} кр./мес)` : `PRO (${selectedQuota.toLocaleString('ru-RU')} кр./мес)`} — $${activePrice}`}
           </span>
         </button>
 
-        {/* Transparent Auto-Renewal & Google Play / Ukrainian Law Compliance Notice */}
+        {/* Transparent Auto-Renewal & Billing Compliance Notice */}
         <div className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-400 border-t border-white/8 pt-3">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
           <p>
-            Оплата подписки осуществляется исключительно в фиатной валюте (банковская карта / Google Pay) через платёжную систему{' '}
-            <strong className="text-slate-200">Google Play Billing</strong> в соответствии с правилами Google Play и законодательством Украины. Подписка продлевается автоматически, если не отменена не позднее чем за 24 часа до конца оплаченного периода в настройках подписок Google Play. Криптовалютные платежи в приложении не принимаются.
+            Активация тарифа выполняется строго сервером после криптографического подтверждения оплаты (IPN / защищённый чек). Средства клиентов в терминале не хранятся — вы можете проверить актуальный статус подписки в любой момент кнопкой «Восстановить покупки».
           </p>
         </div>
       </div>

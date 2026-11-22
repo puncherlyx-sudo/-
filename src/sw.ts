@@ -133,7 +133,15 @@ self.addEventListener('push', (event: PushEvent) => {
 self.addEventListener('notificationclick', (event: NotificationEvent) => {
   event.notification.close();
   const rawUrl = (event.notification.data as { url?: string } | undefined)?.url || '/?tab=market';
-  const targetUrl = new URL(rawUrl, self.location.origin).href;
+  let targetUrl = new URL('/?tab=market', self.location.origin).href;
+  try {
+    const parsed = new URL(rawUrl, self.location.origin);
+    if (parsed.origin === self.location.origin) {
+      targetUrl = parsed.href;
+    }
+  } catch {
+    // Fallback to safe same-origin default
+  }
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {

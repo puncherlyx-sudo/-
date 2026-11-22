@@ -36,7 +36,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'motion/react';
 import { usePlan } from '../contexts/PlanContext';
 import {
   FREE_DAILY_SIGNAL_LIMIT,

@@ -9,10 +9,37 @@ import type {
   TickerOverview,
 } from '../types/domain';
 
+import {
+  buildPnlCacheKey,
+  clearPnlCache,
+  computeOrGetCachedPnl,
+  getPnlCacheMetrics,
+  PORTFOLIO_COLORS,
+  STABLE_PORTFOLIO_SYMBOLS,
+  type CachedPnlBundle,
+  type DailyPnlSummary,
+  type PaperPortfolioReport,
+  type PortfolioAllocationItem,
+  type PortfolioEvaluatedRow,
+} from '../utils/portfolioPnlCache';
+
+export {
+  buildPnlCacheKey,
+  clearPnlCache,
+  computeOrGetCachedPnl,
+  getPnlCacheMetrics,
+  PORTFOLIO_COLORS,
+  type CachedPnlBundle,
+  type DailyPnlSummary,
+  type PaperPortfolioReport,
+  type PortfolioAllocationItem,
+  type PortfolioEvaluatedRow,
+};
+
 export const PORTFOLIO_STORAGE_KEY = 'aegisquant_paper_portfolio_v1';
 export const PORTFOLIO_SOURCE_STORAGE_KEY = 'aegisquant_portfolio_source_v1';
 
-const STABLE_SYMBOLS = new Set(['USDTUSDT', 'USDCUSDT', 'FDUSDUSDT', 'BUSDUSDT', 'DAIUSDT', 'TUSDUSDT', 'USDEUSDT']);
+const STABLE_SYMBOLS = STABLE_PORTFOLIO_SYMBOLS;
 
 export interface PortfolioSourceMeta {
   mode: 'manual' | 'exchange';
@@ -43,57 +70,27 @@ export function getPortfolioIdentity(source: PortfolioSourceMeta): PortfolioIden
   };
 }
 
-export const PORTFOLIO_COLORS = [
-  '#10B981',
-  '#22D3EE',
-  '#F59E0B',
-  '#A78BFA',
-  '#FB7185',
-  '#38BDF8',
-] as const;
-
 /** VERNIER не хранит средства пользователей: портфель отображает только балансы, синхронизированные с бирж по API. */
 export const DEFAULT_PORTFOLIO_HOLDINGS: PortfolioHolding[] = [];
 
-export interface PortfolioEvaluatedRow extends PortfolioHolding {
-  baseAsset: string;
-  livePrice: number;
-  valueUsdt: number;
-  costUsdt: number;
-  pnlUsdt: number;
-  pnlPct: number;
-  dailyPnlUsdt: number;
-  dailyPnlPct: number;
-}
+let lastKnownSpotTickers: TickerOverview[] = [];
 
-export interface PortfolioAllocationItem {
-  symbol: string;
-  baseAsset: string;
-  valueUsdt: number;
-  sharePct: number;
-  pnlUsdt: number;
-  pnlPct: number;
-  dailyPnlUsdt: number;
-  dailyPnlPct: number;
-  color: string;
-}
-
-export interface DailyPnlSummary {
-  dailyPnlUsdt: number;
-  dailyPnlPct: number;
-  hasLive24hData: boolean;
-}
-
-export interface PaperPortfolioReport {
-  rows: PortfolioEvaluatedRow[];
-  allocations: PortfolioAllocationItem[];
-  totalValue: number;
-  totalCost: number;
-  totalPnl: number;
-  totalPnlPct: number;
-  dailyPnlUsdt: number;
-  dailyPnlPct: number;
-  hasLive24hData: boolean;
+function areTickerListsEquivalent(
+  prev: readonly TickerOverview[],
+  next: readonly TickerOverview[]
+): boolean {
+  if (prev === next) return true;
+  if (prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i += 1) {
+    if (
+      prev[i].symbol !== next[i].symbol ||
+      prev[i].price !== next[i].price ||
+      prev[i].change24hPct !== next[i].change24hPct
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function usePaperPortfolio() {
@@ -131,7 +128,14 @@ export function usePaperPortfolio() {
     return { mode: 'manual' };
   });
 
-  const [spotTickers, setSpotTickers] = useState<TickerOverview[]>([]);
+  const [spotTickers, setSpotTickers] = useState<TickerOverview[]>(() => lastKnownSpotTickers);
+
+  const commitSpotTickers = useCallback((nextTickers: TickerOverview[]) => {
+    if (!Array.isArray(nextTickers) || nextTickers.length === 0) return;
+    lastKnownSpotTickers = nextTickers;
+    setSpotTickers((prev) => (areTickerListsEquivalent(prev, nextTickers) ? prev : nextTickers));
+    ingestLiveTickers('spot', nextTickers, true);
+  }, []);
 
   useEffect(() => {
     try {
@@ -171,20 +175,18 @@ export function usePaperPortfolio() {
           signal: controller.signal,
           onBackgroundUpdate: (fresh) => {
             if (Array.isArray(fresh.tickers) && fresh.tickers.length > 0) {
-              setSpotTickers(fresh.tickers);
-              ingestLiveTickers('spot', fresh.tickers, true);
+              commitSpotTickers(fresh.tickers);
             }
           },
         }
       );
       if (!controller.signal.aborted && Array.isArray(data.tickers) && data.tickers.length > 0) {
-        setSpotTickers(data.tickers);
-        ingestLiveTickers('spot', data.tickers, true);
+        commitSpotTickers(data.tickers);
       }
     } catch {
       // Retain existing prices on temporary offline hiccup or abort
     }
-  }, []);
+  }, [commitSpotTickers]);
 
   useEffect(() => {
     void refreshSpotPrices();
@@ -273,128 +275,11 @@ export function usePaperPortfolio() {
 
   const hasLive24hData = spotTickers.length > 0;
 
-  const { rows, totalValue, totalCost, totalPnl, totalPnlPct } = useMemo(() => {
-    const evaluatedRows: PortfolioEvaluatedRow[] = holdings.map((h) => {
-      const isStable = STABLE_SYMBOLS.has(h.symbol.toUpperCase());
-      const ticker = isStable ? undefined : tickerMap.get(h.symbol);
-      const livePrice = isStable ? 1 : (ticker?.price ?? h.avgEntryPrice);
-      const valueUsdt = h.amount * livePrice;
-      const costUsdt = h.amount * h.avgEntryPrice;
-      const pnlUsdt = valueUsdt - costUsdt;
-      const pnlPct = costUsdt > 0 ? (pnlUsdt / costUsdt) * 100 : 0;
-
-      const change24hPct = isStable
-        ? 0
-        : ticker && Number.isFinite(ticker.change24hPct)
-          ? ticker.change24hPct
-          : 0;
-      const factor = 1 + change24hPct / 100;
-      const value24hAgo = factor > 0 ? valueUsdt / factor : valueUsdt;
-      const dailyPnlUsdt = valueUsdt - value24hAgo;
-
-      return {
-        ...h,
-        baseAsset: h.symbol.replace('USDT', ''),
-        livePrice,
-        valueUsdt,
-        costUsdt,
-        pnlUsdt,
-        pnlPct,
-        dailyPnlUsdt,
-        dailyPnlPct: change24hPct,
-      };
-    });
-
-    const nextTotalValue = evaluatedRows.reduce((acc, r) => acc + r.valueUsdt, 0);
-    const nextTotalCost = evaluatedRows.reduce((acc, r) => acc + r.costUsdt, 0);
-    const nextTotalPnl = nextTotalValue - nextTotalCost;
-    const nextTotalPnlPct = nextTotalCost > 0 ? (nextTotalPnl / nextTotalCost) * 100 : 0;
-
-    return {
-      rows: evaluatedRows,
-      totalValue: nextTotalValue,
-      totalCost: nextTotalCost,
-      totalPnl: nextTotalPnl,
-      totalPnlPct: nextTotalPnlPct,
-    };
-  }, [holdings, tickerMap]);
-
-  // Мемоизированный расчёт дневного PnL (24ч) — пересчитывается только при изменении позиций или живых котировок
-  const dailyPnl: DailyPnlSummary = useMemo(() => {
-    if (!hasLive24hData || rows.length === 0) {
-      return {
-        dailyPnlUsdt: 0,
-        dailyPnlPct: 0,
-        hasLive24hData,
-      };
-    }
-
-    const dailyPnlUsdt = rows.reduce((acc, r) => acc + r.dailyPnlUsdt, 0);
-    const totalValue24hAgo = totalValue - dailyPnlUsdt;
-    const dailyPnlPct = totalValue24hAgo > 0 ? (dailyPnlUsdt / totalValue24hAgo) * 100 : 0;
-
-    return {
-      dailyPnlUsdt,
-      dailyPnlPct,
-      hasLive24hData,
-    };
-  }, [rows, totalValue, hasLive24hData]);
-
-  const allocations: PortfolioAllocationItem[] = useMemo(() => {
-    // Aggregate by symbol for clean Recharts donut distribution
-    const grouped = new Map<
-      string,
-      { symbol: string; baseAsset: string; valueUsdt: number; costUsdt: number; dailyPnlUsdt: number }
-    >();
-    for (const r of rows) {
-      const cur = grouped.get(r.symbol) ?? {
-        symbol: r.symbol,
-        baseAsset: r.baseAsset,
-        valueUsdt: 0,
-        costUsdt: 0,
-        dailyPnlUsdt: 0,
-      };
-      cur.valueUsdt += r.valueUsdt;
-      cur.costUsdt += r.costUsdt;
-      cur.dailyPnlUsdt += r.dailyPnlUsdt;
-      grouped.set(r.symbol, cur);
-    }
-
-    return Array.from(grouped.values())
-      .sort((a, b) => b.valueUsdt - a.valueUsdt)
-      .map((item, idx) => {
-        const pnlUsdt = item.valueUsdt - item.costUsdt;
-        const pnlPct = item.costUsdt > 0 ? (pnlUsdt / item.costUsdt) * 100 : 0;
-        const sharePct = totalValue > 0 ? (item.valueUsdt / totalValue) * 100 : 0;
-        const prev24hVal = item.valueUsdt - item.dailyPnlUsdt;
-        const itemDailyPct = prev24hVal > 0 ? (item.dailyPnlUsdt / prev24hVal) * 100 : 0;
-        return {
-          symbol: item.symbol,
-          baseAsset: item.baseAsset,
-          valueUsdt: item.valueUsdt,
-          sharePct,
-          pnlUsdt,
-          pnlPct,
-          dailyPnlUsdt: item.dailyPnlUsdt,
-          dailyPnlPct: itemDailyPct,
-          color: PORTFOLIO_COLORS[idx % PORTFOLIO_COLORS.length],
-        };
-      });
-  }, [rows, totalValue]);
-
-  const report: PaperPortfolioReport = useMemo(
-    () => ({
-      rows,
-      allocations,
-      totalValue,
-      totalCost,
-      totalPnl,
-      totalPnlPct,
-      dailyPnlUsdt: dailyPnl.dailyPnlUsdt,
-      dailyPnlPct: dailyPnl.dailyPnlPct,
-      hasLive24hData: dailyPnl.hasLive24hData,
-    }),
-    [rows, allocations, totalValue, totalCost, totalPnl, totalPnlPct, dailyPnl]
+  // Кэшированный расчёт PnL и аллокаций: при неизменных позициях и котировках активов
+  // (включая переключение вкладок и обновления посторонних тикеров) возвращается готовый объект из LRU-кэша.
+  const { report, dailyPnl } = useMemo(
+    () => computeOrGetCachedPnl(holdings, tickerMap, hasLive24hData),
+    [holdings, tickerMap, hasLive24hData]
   );
 
   const portfolioIdentity = useMemo(

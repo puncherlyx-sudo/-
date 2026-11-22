@@ -10,3 +10,5 @@ coverage/
 .env*
 !.env.example
 .vapid-keys.json
+public/assets/aistudio/
+

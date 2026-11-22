@@ -28,9 +28,16 @@
     min-height: 100%;
     background-color: var(--surface-0);
     color: #F1F5F9;
-    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     -webkit-font-smoothing: antialiased;
     overflow-x: clip;
+  }
+
+  button,
+  a,
+  [role="button"] {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
 
   .font-mono {
@@ -187,9 +194,8 @@ html[data-theme="oled"] .app-aurora-bg {
   }
 }
 
-.animate-pulse,
 .shimmer-skeleton {
-  animation: shimmerSlide 1.75s linear infinite !important;
+  animation: shimmerSlide 1.75s linear infinite;
   background-image: linear-gradient(
     110deg,
     rgba(255, 255, 255, 0.025) 8%,
@@ -279,24 +285,20 @@ html[data-theme="oled"] .app-aurora-bg {
 @keyframes breathePulse {
   0%,
   100% {
-    transform: scale(1);
-    box-shadow:
-      0 14px 32px -12px rgba(0, 0, 0, 0.55),
-      0 0 0 1px rgba(16, 185, 129, 0.22),
-      0 0 16px -6px rgba(16, 185, 129, 0.22);
+    transform: translate3d(0, 0, 0) scale(1);
   }
   50% {
-    transform: scale(1.012);
-    box-shadow:
-      0 18px 38px -10px rgba(0, 0, 0, 0.62),
-      0 0 0 1px rgba(34, 211, 238, 0.45),
-      0 0 28px -4px rgba(16, 185, 129, 0.36);
+    transform: translate3d(0, 0, 0) scale(1.012);
   }
 }
 
 .breathe-pulse {
+  box-shadow:
+    0 14px 32px -12px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(16, 185, 129, 0.24),
+    0 0 20px -6px rgba(16, 185, 129, 0.26);
   animation: breathePulse 3.8s ease-in-out infinite;
-  will-change: transform, box-shadow;
+  will-change: transform;
 }
 
 .breathe-pulse:hover,
@@ -392,18 +394,19 @@ html[data-theme="oled"] .app-aurora-bg {
 @keyframes maxBadgeWrPulse {
   0%,
   100% {
-    transform: scale(1);
-    box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.28), 0 0 10px -2px rgba(16, 185, 129, 0.25);
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.94;
   }
   50% {
-    transform: scale(1.045);
-    box-shadow: 0 0 0 4px rgba(34, 211, 238, 0), 0 0 16px -1px rgba(34, 211, 238, 0.45);
+    transform: translate3d(0, 0, 0) scale(1.045);
+    opacity: 1;
   }
 }
 
 .max-badge-wr-pulse {
+  box-shadow: 0 0 12px -2px rgba(34, 211, 238, 0.32);
   animation: maxBadgeWrPulse 2.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  will-change: transform, box-shadow;
+  will-change: transform, opacity;
 }
 
 .max-badge-wr-pulse:hover {
@@ -438,15 +441,14 @@ html[data-theme="oled"] .app-aurora-bg {
 .upgrade-bar-breathe::after {
   content: '';
   position: absolute;
-  inset: -4px;
-  border-radius: 1.2rem;
+  inset: -6px;
+  border-radius: 1.25rem;
   background: radial-gradient(
-    72% 110% at 50% 50%,
+    75% 115% at 50% 50%,
     rgba(16, 185, 129, 0.16) 0%,
-    rgba(6, 182, 212, 0.12) 48%,
-    transparent 76%
+    rgba(6, 182, 212, 0.1) 46%,
+    transparent 74%
   );
-  filter: blur(8px);
   z-index: -1;
   pointer-events: none;
   animation: upgradeBarAuraBreathe 3.8s ease-in-out infinite;

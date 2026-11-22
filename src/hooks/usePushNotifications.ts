@@ -48,10 +48,26 @@ export interface PortfolioTargetCheckResult {
   reason?: 'no_live_data' | 'below_target' | 'disabled' | 'not_subscribed' | 'cooldown' | 'sent' | 'error';
 }
 
+export interface CriticalExchangeSyncPushInput {
+  keyId: string;
+  exchange: 'binance' | 'bybit' | 'okx';
+  label: string;
+  category: 'auth' | 'exchange_api' | 'unknown';
+  errorMessage: string;
+  testnet?: boolean;
+}
+
+export interface CriticalExchangeSyncPushResult {
+  notified: boolean;
+  reason: 'disabled' | 'not_subscribed' | 'cooldown' | 'sent' | 'error';
+}
+
 const PORTFOLIO_PNL_COOLDOWN_MS = 60 * 60_000;
 const PORTFOLIO_PNL_COOLDOWN_KEY = 'aegisquant_portfolio_pnl_push_v1';
 const PORTFOLIO_TARGET_COOLDOWN_MS = 5 * 60_000;
 const PORTFOLIO_TARGET_COOLDOWN_KEY = 'aegisquant_portfolio_target_push_v1';
+const EXCHANGE_SYNC_CRITICAL_COOLDOWN_MS = 30 * 60_000;
+const EXCHANGE_SYNC_CRITICAL_COOLDOWN_KEY = 'vernier_exchange_sync_critical_push_v1';
 
 interface UsePushNotificationsParams {
   uid: string | undefined;
@@ -120,6 +136,7 @@ export function usePushNotifications({
   const [error, setError] = useState<string | null>(null);
   const portfolioCooldownRef = useRef<Map<string, number>>(new Map());
   const portfolioTargetCooldownRef = useRef<Map<string, number>>(new Map());
+  const syncCriticalCooldownRef = useRef<Map<string, number>>(new Map());
   const [preferences, setPreferences] = useState<PushPreferences>({
     notifySignals: true,
     notifyMarketMoves: true,
@@ -647,6 +664,73 @@ export function usePushNotifications({
     [uid, isSignedIn, isSubscribed, preferences.notifyPortfolioPnl]
   );
 
+  const notifyCriticalExchangeSyncError = useCallback(
+    async (params: CriticalExchangeSyncPushInput): Promise<CriticalExchangeSyncPushResult> => {
+      if (!preferences.notifyAuthLogins) {
+        return { notified: false, reason: 'disabled' };
+      }
+      if (!uid || !isSignedIn || !isSubscribed) {
+        return { notified: false, reason: 'not_subscribed' };
+      }
+
+      const cooldownKey = `${uid}:${params.keyId}:${params.category}`;
+      const now = Date.now();
+      let lastSentAt = syncCriticalCooldownRef.current.get(cooldownKey) ?? 0;
+
+      if (typeof window !== 'undefined') {
+        try {
+          const rawStored = window.sessionStorage.getItem(
+            `${EXCHANGE_SYNC_CRITICAL_COOLDOWN_KEY}:${cooldownKey}`
+          );
+          const parsedStored = rawStored ? Number(rawStored) : 0;
+          if (Number.isFinite(parsedStored) && parsedStored > lastSentAt) {
+            lastSentAt = parsedStored;
+          }
+        } catch {
+          // Ignore sessionStorage restrictions
+        }
+      }
+
+      if (now - lastSentAt < EXCHANGE_SYNC_CRITICAL_COOLDOWN_MS) {
+        return { notified: false, reason: 'cooldown' };
+      }
+
+      syncCriticalCooldownRef.current.set(cooldownKey, now);
+
+      try {
+        const res = await authFetch('/api/push/exchange-sync-error', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(params),
+        });
+        if (!res.ok) {
+          syncCriticalCooldownRef.current.delete(cooldownKey);
+          return { notified: false, reason: 'error' };
+        }
+        const data = (await res.json()) as { sent?: number; skipped?: boolean };
+        const wasSent = (data.sent ?? 0) > 0;
+        if (typeof window !== 'undefined' && wasSent) {
+          try {
+            window.sessionStorage.setItem(
+              `${EXCHANGE_SYNC_CRITICAL_COOLDOWN_KEY}:${cooldownKey}`,
+              String(now)
+            );
+          } catch {
+            // Ignore sessionStorage restrictions
+          }
+        }
+        return {
+          notified: wasSent,
+          reason: wasSent ? 'sent' : 'cooldown',
+        };
+      } catch {
+        syncCriticalCooldownRef.current.delete(cooldownKey);
+        return { notified: false, reason: 'error' };
+      }
+    },
+    [uid, isSignedIn, isSubscribed, preferences.notifyAuthLogins]
+  );
+
   return {
     isSupported,
     permission,
@@ -663,5 +747,6 @@ export function usePushNotifications({
     triggerSecurityPush,
     checkAndNotifyPortfolioPnl,
     checkAndNotifyPortfolioTarget,
+    notifyCriticalExchangeSyncError,
   };
 }

@@ -129,6 +129,29 @@ export async function createCheckout(
   }
   const safeTier: SubscriptionTier = tier === 'max' ? 'max' : 'pro';
   const safeMultiplier: MaxMultiplier = maxMultiplier === 20 ? 20 : 10;
+
+  // Защита от спама незавершёнными счетами: максимум 3 pending-счёта за 24 часа на пользователя
+  const dayAgoMs = Date.now() - DAY_MS;
+  const recentPendingSnap = await db
+    .collection('payments')
+    .where('uid', '==', uid)
+    .where('status', '==', 'pending')
+    .limit(10)
+    .get();
+  const pendingLast24h = recentPendingSnap.docs.filter((doc) => {
+    const d = doc.data() as { createdAtMs?: unknown; createdAt?: { toMillis?: () => number } };
+    const ts =
+      typeof d.createdAtMs === 'number'
+        ? d.createdAtMs
+        : typeof d.createdAt?.toMillis === 'function'
+          ? d.createdAt.toMillis()
+          : Date.now();
+    return ts >= dayAgoMs;
+  }).length;
+  if (pendingLast24h >= 3) {
+    throw new Error('Превышен лимит незавершённых счетов (максимум 3 за 24 часа). Оплатите созданный счёт или повторите позже.');
+  }
+
   const plan =
     safeTier === 'max'
       ? getMaxMultiplierPlans()[safeMultiplier][period]
@@ -144,6 +167,7 @@ export async function createCheckout(
     priceUsd: plan.priceUsd,
     credits: plan.credits,
     status: 'pending',
+    createdAtMs: Date.now(),
     createdAt: FieldValue.serverTimestamp(),
   });
 
@@ -209,7 +233,10 @@ export function verifyIpnSignature(payload: unknown, signature: string | undefin
 
 export async function processIpn(payload: Record<string, unknown>): Promise<void> {
   const db = getDb();
-  if (!db) return;
+  if (!db) {
+    serverLogger.error('billing', 'CRITICAL: IPN получен, но Firebase Admin SDK не настроен — возвращаем 500 для ретрая.');
+    throw new Error('Firebase Admin SDK не настроен — обработка IPN невозможна.');
+  }
   const orderId = typeof payload.order_id === 'string' ? payload.order_id : '';
   const status = typeof payload.payment_status === 'string' ? payload.payment_status : '';
   if (!ORDER_ID_PATTERN.test(orderId) || !status) return;
@@ -251,17 +278,34 @@ export async function processIpn(payload: Record<string, unknown>): Promise<void
       tx.update(orderRef, { status: 'user_missing', updatedAt: FieldValue.serverTimestamp() });
       return;
     }
+    const now = Date.now();
+    const userData = (userSnap.data() || {}) as {
+      plan?: unknown;
+      proUntil?: unknown;
+      maxMultiplier?: unknown;
+    };
     const targetTier: SubscriptionTier = order.tier === 'max' ? 'max' : 'pro';
     const multiplier: MaxMultiplier = order.maxMultiplier === 20 ? 20 : 10;
     const creditsGrant = targetTier === 'max' ? (multiplier === 20 ? 2000 : 1000) : 100;
-    const currentUntil = Number((userSnap.data() as { proUntil?: unknown }).proUntil) || 0;
-    const base = Math.max(Date.now(), currentUntil);
+    const currentUntil = Number(userData.proUntil) || 0;
+    const currentPlan = userData.plan === 'max' || userData.plan === 'pro' ? userData.plan : 'free';
+    const currentMult = Number(userData.maxMultiplier) === 20 ? 20 : 10;
+
+    // Правило смены тарифа:
+    // - Продление того же тарифа (и того же множителя MAX) суммирует срок от max(now, currentUntil).
+    // - Переход на другой тариф (напр. PRO -> MAX) начинает новый период от now, чтобы не суммировать дешёвый период в дорогой тариф.
+    const isSamePlan =
+      currentPlan === targetTier && (targetTier !== 'max' || currentMult === multiplier);
+    const base = isSamePlan ? Math.max(now, currentUntil) : now;
     const proUntil = base + PERIOD_DAYS[order.period] * DAY_MS;
+    const nextResetAtIso = new Date(Math.min(proUntil, now + 30 * DAY_MS)).toISOString();
 
     tx.update(userRef, {
       plan: targetTier,
       proUntil,
       creditsRemaining: creditsGrant,
+      weeklyQuota: creditsGrant,
+      nextResetAt: nextResetAtIso,
       ...(targetTier === 'max' ? { maxMultiplier: multiplier } : {}),
       updatedAt: FieldValue.serverTimestamp(),
     });
@@ -317,7 +361,15 @@ export async function downgradeExpiredPro(): Promise<number> {
 }
 
 export function startProExpiryMonitor(): void {
-  if (!getDb()) return;
+  if (!getDb()) {
+    if (process.env.NODE_ENV === 'production') {
+      serverLogger.error(
+        'billing',
+        'PRODUCTION WARNING: FIREBASE_SERVICE_ACCOUNT_JSON не задан — приём оплаты отключён (enabled: false) и мониторинг подписок не запущен.'
+      );
+    }
+    return;
+  }
   const run = () => {
     void downgradeExpiredPro()
       .then((n) => {

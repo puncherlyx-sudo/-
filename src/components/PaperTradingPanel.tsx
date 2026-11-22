@@ -82,12 +82,24 @@ export const PaperTradingPanel: React.FC<PaperTradingPanelProps> = ({
       setTilt(readTiltGuardConfig());
     };
     window.addEventListener(VERNIER_PRO_MAX_EVENT, sync);
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => {
       window.removeEventListener(VERNIER_PRO_MAX_EVENT, sync);
-      window.clearInterval(timer);
     };
   }, []);
+
+  const hasActiveCooldown = Boolean(tilt.cooldownUntilMs && tilt.cooldownUntilMs > nowMs);
+  useEffect(() => {
+    if (!tilt.cooldownUntilMs || tilt.cooldownUntilMs <= Date.now()) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setNowMs(now);
+      if (tilt.cooldownUntilMs && now >= tilt.cooldownUntilMs) {
+        window.clearInterval(timer);
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [tilt.cooldownUntilMs, hasActiveCooldown]);
 
   const markPriceFor = (sym: string, fallback: number) => {
     if (sym === symbol && currentPrice > 0) return currentPrice;

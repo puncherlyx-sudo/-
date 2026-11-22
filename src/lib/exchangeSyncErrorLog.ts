@@ -1,7 +1,11 @@
 import type { ExchangeId } from '../types/domain';
 
 const SYNC_ERROR_LOG_PREFIX = 'aegisquant_exchange_sync_errors_v1:';
+const SYNC_LOG_AUTO_CLEANUP_PREFIX = 'aegisquant_exchange_sync_autoclean_30d_v1:';
 const MAX_SYNC_LOGS = 60;
+const MAX_TECHNICAL_FIELD_CHARS = 1600;
+export const SYNC_LOG_AUTO_CLEANUP_DAYS = 30;
+export const SYNC_LOG_AUTO_CLEANUP_MS = SYNC_LOG_AUTO_CLEANUP_DAYS * 24 * 60 * 60 * 1000;
 
 export type ExchangeSyncErrorCategory =
   | 'success'
@@ -12,6 +16,13 @@ export type ExchangeSyncErrorCategory =
   | 'unknown';
 
 export type ExchangeSyncSeverity = 'success' | 'warning' | 'critical';
+
+export interface ExchangeSyncTechnicalDetails {
+  stackTrace?: string;
+  rawApiResponse?: string;
+  httpStatus?: number;
+  endpoint?: string;
+}
 
 export interface ExchangeSyncErrorLogEntry {
   id: string;
@@ -27,6 +38,17 @@ export interface ExchangeSyncErrorLogEntry {
   occurredAt: string;
   occurredAtMs: number;
   source: 'background' | 'manual';
+  technicalDetails?: ExchangeSyncTechnicalDetails;
+}
+
+export class ExchangeSyncClientError extends Error {
+  technicalDetails?: ExchangeSyncTechnicalDetails;
+
+  constructor(message: string, technicalDetails?: ExchangeSyncTechnicalDetails) {
+    super(message);
+    this.name = 'ExchangeSyncClientError';
+    this.technicalDetails = technicalDetails;
+  }
 }
 
 export type ExchangeSyncLogEntry = ExchangeSyncErrorLogEntry;
@@ -52,6 +74,85 @@ function getStorageKey(uid: string): string {
   return `${SYNC_ERROR_LOG_PREFIX}${safeUid}`;
 }
 
+function getAutoCleanupStorageKey(uid: string): string {
+  const safeUid = uid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+  return `${SYNC_LOG_AUTO_CLEANUP_PREFIX}${safeUid}`;
+}
+
+export function sanitizeTechnicalString(value: unknown, maxLength = MAX_TECHNICAL_FIELD_CHARS): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed
+    .replace(
+      /((?:api[_-]?key|api[_-]?secret|secret|passphrase|signature|token|authorization|bearer|x-mbx-apikey|x-bapi-api-key|ok-access-key|ok-access-passphrase|ok-access-sign)["']?\s*[:=\s]\s*["']?)([^"',\s}\n]+)/gi,
+      '$1[скрыто]'
+    )
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '[скрыто]')
+    .slice(0, maxLength);
+}
+
+export function sanitizeTechnicalDetails(
+  raw: unknown
+): ExchangeSyncTechnicalDetails | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Partial<ExchangeSyncTechnicalDetails>;
+  const stackTrace = sanitizeTechnicalString(obj.stackTrace, MAX_TECHNICAL_FIELD_CHARS);
+  const rawApiResponse = sanitizeTechnicalString(obj.rawApiResponse, MAX_TECHNICAL_FIELD_CHARS);
+  const endpoint = sanitizeTechnicalString(obj.endpoint, 240);
+  const httpStatusNum = Number(obj.httpStatus);
+  const httpStatus =
+    Number.isInteger(httpStatusNum) && httpStatusNum >= 100 && httpStatusNum <= 599
+      ? httpStatusNum
+      : undefined;
+
+  if (!stackTrace && !rawApiResponse && !endpoint && httpStatus === undefined) {
+    return undefined;
+  }
+  return {
+    ...(stackTrace ? { stackTrace } : {}),
+    ...(rawApiResponse ? { rawApiResponse } : {}),
+    ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(endpoint ? { endpoint } : {}),
+  };
+}
+
+export function extractExchangeSyncTechnicalDetails(
+  err: unknown,
+  fallbackEndpoint?: string
+): ExchangeSyncTechnicalDetails | undefined {
+  const embedded =
+    err instanceof ExchangeSyncClientError
+      ? err.technicalDetails
+      : err && typeof err === 'object' && 'technicalDetails' in err
+        ? (err as { technicalDetails?: ExchangeSyncTechnicalDetails }).technicalDetails
+        : undefined;
+
+  const stackTrace =
+    embedded?.stackTrace ??
+    (err instanceof Error && typeof err.stack === 'string' ? err.stack : undefined);
+
+  const rawApiResponse =
+    embedded?.rawApiResponse ??
+    (err instanceof Error
+      ? JSON.stringify(
+          {
+            name: err.name,
+            message: err.message,
+          },
+          null,
+          2
+        )
+      : undefined);
+
+  return sanitizeTechnicalDetails({
+    stackTrace,
+    rawApiResponse,
+    httpStatus: embedded?.httpStatus,
+    endpoint: embedded?.endpoint ?? fallbackEndpoint,
+  });
+}
+
 export function classifyExchangeSyncError(message: string): ExchangeSyncErrorCategory {
   const lower = message.toLowerCase();
   if (
@@ -62,7 +163,7 @@ export function classifyExchangeSyncError(message: string): ExchangeSyncErrorCat
     return 'rate_limit';
   }
   if (
-    /401|403|-2015|-2014|-1022|10003|10004|10005|50111|50112|50113|50114|50119|invalid api|signature|passphrase|permission|apikey|secret|расшифровать|decrypt|переподключите|подпис|ключ|доступ/i.test(
+    /401|403|-2015|-2014|-1022|10003|10004|10005|33004|50101|50111|50112|50113|50114|50119|expired|revoked|ист[её]к|отозван|invalid api|signature|passphrase|permission|apikey|secret|расшифровать|decrypt|переподключите|подпис|ключ|доступ/i.test(
       lower
     )
   ) {
@@ -139,6 +240,19 @@ export function mapSyncErrorToQuickFix(
     };
   }
 
+  if (/33004|expired|revoked|ист[её]к|отозван|50119/i.test(lower)) {
+    return {
+      category: 'auth',
+      title: 'Срок действия API-ключа истёк',
+      suggestion:
+        'Биржа сообщила об истечении или отзыве API-ключа. Создайте новый ключ на бирже и обновите реквизиты в окне редактирования.',
+      recommendedAction: 'edit_key',
+      actionLabel: 'Устранить',
+      cooldownRemainingMs: 0,
+      cooldownLabel: null,
+    };
+  }
+
   if (/расшифровать|decrypt|переподключите/i.test(lower)) {
     return {
       category: 'auth',
@@ -146,7 +260,7 @@ export function mapSyncErrorToQuickFix(
       suggestion:
         'Не удалось расшифровать сохранённые реквизиты. Откройте редактирование ключа и введите API Key и Secret заново.',
       recommendedAction: 'edit_key',
-      actionLabel: 'Редактировать ключ',
+      actionLabel: 'Устранить',
       cooldownRemainingMs: 0,
       cooldownLabel: null,
     };
@@ -159,7 +273,7 @@ export function mapSyncErrorToQuickFix(
       suggestion:
         'Кодовая фраза (Passphrase) для OKX отсутствует или неверна. Откройте редактирование ключа и укажите корректный Passphrase.',
       recommendedAction: 'edit_key',
-      actionLabel: 'Редактировать ключ',
+      actionLabel: 'Устранить',
       cooldownRemainingMs: 0,
       cooldownLabel: null,
     };
@@ -295,6 +409,8 @@ function sanitizeEntry(raw: unknown): ExchangeSyncErrorLogEntry | null {
   const balanceUsdt = Number(obj.balanceUsdt);
   const assetsCount = Number(obj.assetsCount);
 
+  const technicalDetails = sanitizeTechnicalDetails(obj.technicalDetails);
+
   return {
     id:
       typeof obj.id === 'string' && obj.id.trim()
@@ -318,12 +434,78 @@ function sanitizeEntry(raw: unknown): ExchangeSyncErrorLogEntry | null {
         : new Date(safeMs).toISOString(),
     occurredAtMs: safeMs,
     source: obj.source === 'manual' ? 'manual' : 'background',
+    ...(technicalDetails ? { technicalDetails } : {}),
   };
 }
 
-export function readExchangeSyncErrorLogs(
+export function pruneExchangeSyncLogsOlderThan(
+  logs: ExchangeSyncErrorLogEntry[],
+  maxAgeDays: number = SYNC_LOG_AUTO_CLEANUP_DAYS,
+  nowMs: number = Date.now()
+): { logs: ExchangeSyncErrorLogEntry[]; removedCount: number } {
+  const safeDays = Math.max(1, Math.floor(Number(maxAgeDays) || SYNC_LOG_AUTO_CLEANUP_DAYS));
+  const cutoffMs = nowMs - safeDays * 24 * 60 * 60 * 1000;
+  const kept = logs.filter((entry) => entry.occurredAtMs >= cutoffMs);
+  return {
+    logs: kept,
+    removedCount: Math.max(0, logs.length - kept.length),
+  };
+}
+
+export function countExchangeSyncLogsOlderThan(
+  logs: ExchangeSyncErrorLogEntry[],
+  maxAgeDays: number = SYNC_LOG_AUTO_CLEANUP_DAYS,
+  nowMs: number = Date.now()
+): number {
+  const safeDays = Math.max(1, Math.floor(Number(maxAgeDays) || SYNC_LOG_AUTO_CLEANUP_DAYS));
+  const cutoffMs = nowMs - safeDays * 24 * 60 * 60 * 1000;
+  let count = 0;
+  for (const entry of logs) {
+    if (entry.occurredAtMs < cutoffMs) count += 1;
+  }
+  return count;
+}
+
+export function estimateExchangeSyncLogsBytes(logs: ExchangeSyncErrorLogEntry[]): number {
+  if (logs.length === 0) return 0;
+  try {
+    const serialized = JSON.stringify(logs);
+    if (typeof TextEncoder !== 'undefined') {
+      return new TextEncoder().encode(serialized).length;
+    }
+    return serialized.length * 2;
+  } catch {
+    return 0;
+  }
+}
+
+export function readExchangeSyncAutoCleanupEnabled(
   uid: string | null | undefined
-): ExchangeSyncErrorLogEntry[] {
+): boolean {
+  if (!uid || typeof window === 'undefined') return true;
+  try {
+    const raw = window.localStorage.getItem(getAutoCleanupStorageKey(uid));
+    if (raw === null) return true;
+    return raw !== '0' && raw !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+export function writeExchangeSyncAutoCleanupEnabled(
+  uid: string | null | undefined,
+  enabled: boolean
+): boolean {
+  if (!uid || typeof window === 'undefined') return enabled;
+  try {
+    window.localStorage.setItem(getAutoCleanupStorageKey(uid), enabled ? '1' : '0');
+  } catch {
+    // Ignore storage quota or private browsing errors
+  }
+  return enabled;
+}
+
+function readRawExchangeSyncLogs(uid: string): ExchangeSyncErrorLogEntry[] {
   if (!uid || typeof window === 'undefined') return [];
   try {
     const raw = window.localStorage.getItem(getStorageKey(uid));
@@ -337,6 +519,41 @@ export function readExchangeSyncErrorLogs(
   } catch {
     return [];
   }
+}
+
+export function readExchangeSyncErrorLogs(
+  uid: string | null | undefined
+): ExchangeSyncErrorLogEntry[] {
+  if (!uid || typeof window === 'undefined') return [];
+  const entries = readRawExchangeSyncLogs(uid);
+  if (entries.length === 0) return [];
+  if (!readExchangeSyncAutoCleanupEnabled(uid)) {
+    return entries;
+  }
+  const { logs: pruned, removedCount } = pruneExchangeSyncLogsOlderThan(
+    entries,
+    SYNC_LOG_AUTO_CLEANUP_DAYS
+  );
+  if (removedCount > 0) {
+    persistLogs(uid, pruned);
+  }
+  return pruned;
+}
+
+export function runExchangeSyncLogAutoCleanup(
+  uid: string,
+  maxAgeDays: number = SYNC_LOG_AUTO_CLEANUP_DAYS,
+  nowMs: number = Date.now()
+): { logs: ExchangeSyncErrorLogEntry[]; removedCount: number } {
+  if (!uid || typeof window === 'undefined') {
+    return { logs: [], removedCount: 0 };
+  }
+  const entries = readRawExchangeSyncLogs(uid);
+  const result = pruneExchangeSyncLogsOlderThan(entries, maxAgeDays, nowMs);
+  if (result.removedCount > 0) {
+    persistLogs(uid, result.logs);
+  }
+  return result;
 }
 
 function persistLogs(uid: string, logs: ExchangeSyncErrorLogEntry[]): void {
@@ -414,6 +631,7 @@ export function appendExchangeSyncErrorLog(
     testnet: boolean;
     errorMessage: string;
     source?: 'background' | 'manual';
+    technicalDetails?: ExchangeSyncTechnicalDetails;
   }
 ): ExchangeSyncErrorLogEntry[] {
   const nowMs = Date.now();
@@ -431,6 +649,7 @@ export function appendExchangeSyncErrorLog(
   }
 
   const category = classifyExchangeSyncError(cleanMessage);
+  const sanitizedTech = sanitizeTechnicalDetails(params.technicalDetails);
   const nextEntry: ExchangeSyncErrorLogEntry = {
     id: `synclog_${nowMs}_${Math.random().toString(36).slice(2, 6)}`,
     keyId: params.keyId.slice(0, 80),
@@ -443,6 +662,7 @@ export function appendExchangeSyncErrorLog(
     occurredAt: new Date(nowMs).toISOString(),
     occurredAtMs: nowMs,
     source: params.source ?? 'background',
+    ...(sanitizedTech ? { technicalDetails: sanitizedTech } : {}),
   };
 
   const next = [nextEntry, ...current].slice(0, MAX_SYNC_LOGS);
@@ -540,4 +760,278 @@ export function groupConsecutiveBackgroundSyncErrors(
 
   return grouped;
 }
+
+export interface KnownSyncErrorCodeMatch {
+  code: string;
+  label: string;
+  reason: string;
+  canResolveByEditingKey: boolean;
+}
+
+const KNOWN_KEY_FIX_RULES: Array<{
+  pattern: RegExp;
+  code: string;
+  label: string;
+  reason: string;
+}> = [
+  {
+    pattern: /(?:\b33004\b|api\s*key\s*(?:has\s*)?expired|ист[её]к(?:ший)?\s*(?:срок|api|ключ)|ключ\s*ист[её]к)/i,
+    code: '33004',
+    label: 'API-ключ истёк',
+    reason: 'Срок действия ключа завершён — замените API Key и Secret.',
+  },
+  {
+    pattern: /-2015\b/i,
+    code: '-2015',
+    label: 'Binance -2015',
+    reason: 'Ключ отклонён, истёк или заблокирован по IP / правам.',
+  },
+  {
+    pattern: /-2014\b/i,
+    code: '-2014',
+    label: 'Binance -2014',
+    reason: 'Некорректный формат API-ключа Binance.',
+  },
+  {
+    pattern: /-1022\b/i,
+    code: '-1022',
+    label: 'Binance -1022',
+    reason: 'Неверная подпись API Secret.',
+  },
+  {
+    pattern: /\b10003\b/i,
+    code: '10003',
+    label: 'Bybit 10003',
+    reason: 'Недействительный или истёкший API-ключ Bybit.',
+  },
+  {
+    pattern: /\b10004\b/i,
+    code: '10004',
+    label: 'Bybit 10004',
+    reason: 'Ошибка подписи API Secret Bybit.',
+  },
+  {
+    pattern: /\b10005\b/i,
+    code: '10005',
+    label: 'Bybit 10005',
+    reason: 'Недостаточно прав доступа у ключа Bybit.',
+  },
+  {
+    pattern: /\b50119\b/i,
+    code: '50119',
+    label: 'OKX 50119',
+    reason: 'API-ключ OKX не существует, удалён или истёк.',
+  },
+  {
+    pattern: /\b50111\b/i,
+    code: '50111',
+    label: 'OKX 50111',
+    reason: 'Недействительный OK-ACCESS-KEY.',
+  },
+  {
+    pattern: /\b50113\b/i,
+    code: '50113',
+    label: 'OKX 50113',
+    reason: 'Неверная подпись или Passphrase OKX.',
+  },
+  {
+    pattern: /\b50114\b/i,
+    code: '50114',
+    label: 'OKX 50114',
+    reason: 'Ошибка авторизации API-ключа OKX.',
+  },
+  {
+    pattern: /\b50101\b/i,
+    code: '50101',
+    label: 'OKX 50101',
+    reason: 'Несовпадение режима Mainnet / Testnet для ключа OKX.',
+  },
+  {
+    pattern: /(?:расшифровать|decrypt|переподключите)/i,
+    code: 'DECRYPT',
+    label: 'Ошибка расшифровки',
+    reason: 'Сохранённый ключ требует повторного ввода реквизитов.',
+  },
+  {
+    pattern: /(?:passphrase|кодовая фраза)/i,
+    code: 'PASSPHRASE',
+    label: 'Неверный Passphrase',
+    reason: 'Проверьте кодовую фразу (Passphrase) для API-ключа.',
+  },
+  {
+    pattern: /(?:revoked|отозван|invalid api|permission|whitelist|ip-ограничен)/i,
+    code: 'AUTH',
+    label: 'Ошибка прав / ключа',
+    reason: 'Обновите API Key, Secret или права доступа ключа.',
+  },
+];
+
+/**
+ * Распознаёт известные коды ошибок бирж (Binance/Bybit/OKX/HTTP 401/403, истечение ключа),
+ * которые можно напрямую устранить через окно редактирования API-ключа.
+ */
+export function detectKnownExchangeSyncError(
+  entry: Pick<
+    ExchangeSyncErrorLogEntry,
+    'severity' | 'category' | 'errorMessage' | 'technicalDetails'
+  >
+): KnownSyncErrorCodeMatch | null {
+  if (entry.severity === 'success') return null;
+
+  const haystack = [
+    entry.errorMessage,
+    entry.technicalDetails?.rawApiResponse ?? '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  for (const rule of KNOWN_KEY_FIX_RULES) {
+    if (rule.pattern.test(haystack)) {
+      return {
+        code: rule.code,
+        label: rule.label,
+        reason: rule.reason,
+        canResolveByEditingKey: true,
+      };
+    }
+  }
+
+  const httpStatus = entry.technicalDetails?.httpStatus;
+  if (httpStatus === 401 || httpStatus === 403 || /\b(?:401|403)\b/.test(entry.errorMessage)) {
+    const code = httpStatus === 403 || /\b403\b/.test(entry.errorMessage) ? 'HTTP 403' : 'HTTP 401';
+    return {
+      code,
+      label: code,
+      reason: 'Биржа отклонила авторизацию API-ключа — обновите ключ и права доступа.',
+      canResolveByEditingKey: true,
+    };
+  }
+
+  if (entry.category === 'auth') {
+    return {
+      code: 'AUTH',
+      label: 'Ошибка API-ключа',
+      reason: 'Проверьте API Key, Secret и режим Mainnet / Testnet.',
+      canResolveByEditingKey: true,
+    };
+  }
+
+  return null;
+}
+
+export interface HourlyErrorIntensityPoint {
+  hourStartMs: number;
+  label: string;
+  fullRangeLabel: string;
+  errors: number;
+  critical: number;
+  warning: number;
+  isAnomaly: boolean;
+}
+
+export interface HourlyErrorIntensitySeries {
+  windowHours: 24 | 72;
+  points: HourlyErrorIntensityPoint[];
+  totalErrors: number;
+  criticalErrors: number;
+  warningErrors: number;
+  peakErrorsPerHour: number;
+  peakHourLabel: string;
+  avgErrorsPerHour: number;
+  anomalyThreshold: number;
+  anomalyHoursCount: number;
+}
+
+/**
+ * Агрегирует ошибки синхронизации (warning + critical) по часам за выбранное скользящее окно
+ * (24ч или 72ч) и помечает часы с аномальной интенсивностью сбоев.
+ */
+export function buildHourlyErrorIntensitySeries(
+  logs: ExchangeSyncErrorLogEntry[],
+  options?: {
+    windowHours?: 24 | 72;
+    nowMs?: number;
+  }
+): HourlyErrorIntensitySeries {
+  const windowHours: 24 | 72 = options?.windowHours === 72 ? 72 : 24;
+  const HOUR_MS = 60 * 60 * 1000;
+  const nowMs = options?.nowMs ?? Date.now();
+  const currentHourStartMs = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
+  const firstHourStartMs = currentHourStartMs - (windowHours - 1) * HOUR_MS;
+
+  const points: HourlyErrorIntensityPoint[] = Array.from({ length: windowHours }, (_, idx) => {
+    const hourStartMs = firstHourStartMs + idx * HOUR_MS;
+    const dt = new Date(hourStartMs);
+    const hh = String(dt.getHours()).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+    const label = windowHours === 72 ? `${dd}.${mm} ${hh}:00` : `${hh}:00`;
+    const fullRangeLabel = `${dd}.${mm}, ${hh}:00–${hh}:59`;
+    return {
+      hourStartMs,
+      label,
+      fullRangeLabel,
+      errors: 0,
+      critical: 0,
+      warning: 0,
+      isAnomaly: false,
+    };
+  });
+
+  let totalErrors = 0;
+  let criticalErrors = 0;
+  let warningErrors = 0;
+
+  for (const entry of logs) {
+    if (entry.severity === 'success') continue;
+    const bucketIndex = Math.floor((entry.occurredAtMs - firstHourStartMs) / HOUR_MS);
+    if (bucketIndex < 0 || bucketIndex >= windowHours) continue;
+    const bucket = points[bucketIndex];
+    if (!bucket) continue;
+    bucket.errors += 1;
+    totalErrors += 1;
+    if (entry.severity === 'critical') {
+      bucket.critical += 1;
+      criticalErrors += 1;
+    } else {
+      bucket.warning += 1;
+      warningErrors += 1;
+    }
+  }
+
+  const avgRaw = totalErrors / windowHours;
+  const variance =
+    points.reduce((acc, p) => acc + (p.errors - avgRaw) ** 2, 0) / windowHours;
+  const stdDev = Math.sqrt(variance);
+  const anomalyThreshold = Math.max(2, Math.ceil(avgRaw + Math.max(1, 1.5 * stdDev)));
+
+  let peakErrorsPerHour = 0;
+  let peakHourLabel = '—';
+  let anomalyHoursCount = 0;
+
+  for (const point of points) {
+    if (point.errors >= anomalyThreshold && point.errors > 0) {
+      point.isAnomaly = true;
+      anomalyHoursCount += 1;
+    }
+    if (point.errors > peakErrorsPerHour) {
+      peakErrorsPerHour = point.errors;
+      peakHourLabel = `${point.label} (${point.errors}/ч)`;
+    }
+  }
+
+  return {
+    windowHours,
+    points,
+    totalErrors,
+    criticalErrors,
+    warningErrors,
+    peakErrorsPerHour,
+    peakHourLabel,
+    avgErrorsPerHour: Number(avgRaw.toFixed(2)),
+    anomalyThreshold,
+    anomalyHoursCount,
+  };
+}
+
 

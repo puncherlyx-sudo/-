@@ -58,6 +58,7 @@ import {
 } from '../types/domain';
 import { playAlertChime } from '../lib/alertSound';
 import { authFetch } from '../lib/authFetch';
+import { ExchangeSyncClientError } from '../lib/exchangeSyncErrorLog';
 import {
   buildCachedExchangeSyncEntry,
   pruneExchangeSyncCache,
@@ -102,7 +103,16 @@ const SESSION_STORAGE_KEY = 'aegisquant_session_id';
 
 function createFreshSessionId(): string {
   const ts = Date.now().toString(36);
-  const rand = Math.random().toString(36).slice(2, 10);
+  let rand = '';
+  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(8);
+    window.crypto.getRandomValues(bytes);
+    rand = Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } else {
+    rand = Math.random().toString(36).slice(2, 12);
+  }
   return sanitizeId(`sess_${ts}_${rand}`);
 }
 
@@ -1722,17 +1732,31 @@ export function useAuthAndVault() {
           testnet: params.testnet,
         }),
       });
-      const data = (await res.json()) as {
+      const rawBodyText = await res.text();
+      let data: {
         ok?: boolean;
         error?: string;
+        details?: { httpStatus?: number; endpoint?: string; rawResponse?: string };
         apiKeyPreview?: string;
         encryptedApiKey?: string;
         encryptedApiSecret?: string;
         encryptedPassphrase?: string;
         sync?: ExchangeSyncResult;
-      };
+      } = {};
+      try {
+        data = rawBodyText ? (JSON.parse(rawBodyText) as typeof data) : {};
+      } catch {
+        data = {};
+      }
       if (!res.ok || !data.encryptedApiKey || !data.encryptedApiSecret || !data.apiKeyPreview || !data.sync) {
-        throw new Error(data.error || 'Не удалось проверить обновлённый API-ключ на бирже.');
+        const errMsg = data.error || 'Не удалось проверить обновлённый API-ключ на бирже.';
+        throw new ExchangeSyncClientError(errMsg, {
+          httpStatus: data.details?.httpStatus ?? res.status,
+          endpoint: data.details?.endpoint ?? 'POST /api/exchanges/connect',
+          rawApiResponse:
+            data.details?.rawResponse ??
+            (rawBodyText.trim() || JSON.stringify({ status: res.status, error: errMsg }, null, 2)),
+        });
       }
 
       const updatedRecord: ExchangeKeyRecord = {
@@ -1824,11 +1848,18 @@ export function useAuthAndVault() {
             testnet: keyRecord.testnet,
           }),
         });
-        const data = (await res.json()) as {
+        const rawBodyText = await res.text();
+        let data: {
           ok?: boolean;
           error?: string;
+          details?: { httpStatus?: number; endpoint?: string; rawResponse?: string };
           sync?: ExchangeSyncResult;
-        };
+        } = {};
+        try {
+          data = rawBodyText ? (JSON.parse(rawBodyText) as typeof data) : {};
+        } catch {
+          data = {};
+        }
 
         if (!res.ok || !data.sync) {
           const errMsg = (data.error || 'Ошибка синхронизации с биржей.').slice(0, 240);
@@ -1844,7 +1875,13 @@ export function useAuthAndVault() {
               }
             }
           }
-          throw new Error(errMsg);
+          throw new ExchangeSyncClientError(errMsg, {
+            httpStatus: data.details?.httpStatus ?? res.status,
+            endpoint: data.details?.endpoint ?? 'POST /api/exchanges/sync',
+            rawApiResponse:
+              data.details?.rawResponse ??
+              (rawBodyText.trim() || JSON.stringify({ status: res.status, error: errMsg }, null, 2)),
+          });
         }
 
         // Обновляем локальный кэш сразу после ответа биржи

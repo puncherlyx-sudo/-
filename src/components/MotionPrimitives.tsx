@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AnimatePresence, LayoutGroup, motion, type Variants } from 'framer-motion';
+import { AnimatePresence, LayoutGroup, motion, type Variants } from 'motion/react';
 
 export const TERMINAL_EASE = [0.16, 1, 0.3, 1] as const;
 

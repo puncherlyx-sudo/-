@@ -31,10 +31,11 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
   const connectSrc = [
     "'self'",
     'https://generativelanguage.googleapis.com',
-    'https://*.googleapis.com',
     'https://firestore.googleapis.com',
     'https://identitytoolkit.googleapis.com',
     'https://securetoken.googleapis.com',
+    'https://firebaseinstallations.googleapis.com',
+    'https://content-firebaseappcheck.googleapis.com',
     'https://*.firebaseio.com',
     'https://*.firebaseapp.com',
     'wss://*.firebaseio.com',
@@ -50,16 +51,27 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
 
   const cspDirectives: Record<string, string[]> = {
     'default-src': ["'self'"],
-    'script-src': ["'self'", 'https://apis.google.com'],
+    'script-src': ["'self'", 'https://apis.google.com', 'https://www.google.com/recaptcha/', 'https://www.gstatic.com/recaptcha/'],
     'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
     'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
-    'img-src': ["'self'", 'data:', 'blob:', 'https:'],
+    'img-src': [
+      "'self'",
+      'data:',
+      'blob:',
+      'https://lh3.googleusercontent.com',
+      'https://assets.coingecko.com',
+      'https://coin-images.coingecko.com',
+      'https://www.cryptocompare.com',
+      'https://images.cryptocompare.com',
+      'https://s3.tradingview.com',
+    ],
     'connect-src': connectSrc,
     'frame-src': [
       "'self'",
       'https://*.firebaseapp.com',
       'https://accounts.google.com',
       'https://apis.google.com',
+      'https://www.google.com/recaptcha/',
       'https://www.tradingview-widget.com',
       'https://s.tradingview.com',
       'https://*.tradingview.com',
@@ -74,6 +86,7 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
     'upgrade-insecure-requests': [],
   };
 
+  // Единый источник заголовков безопасности (Helmet) без дублирования
   app.use(
     helmet({
       // В production действует строгий CSP без unsafe-eval; в dev Vite требует inline-модули.
@@ -96,17 +109,12 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
     })
   );
 
+  // Permissions-Policy не входит в стандартный набор helmet
   app.use((_req, res, next) => {
     res.setHeader(
       'Permissions-Policy',
       'camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()'
     );
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    if (isProd && allowEmbedOrigins.length === 0) {
-      res.setHeader('X-Frame-Options', 'DENY');
-    }
     next();
   });
 }

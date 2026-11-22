@@ -61,7 +61,7 @@ service cloud.firestore {
         && data.plan in ['free', 'pro', 'max']
         && data.creditsRemaining is int && data.creditsRemaining >= 0 && data.creditsRemaining <= 2000
         && (data.plan == 'max' || (data.plan == 'pro' && data.creditsRemaining <= 100) || (data.plan == 'free' && data.creditsRemaining <= 25))
-        && data.weeklyQuota is int && data.weeklyQuota in [10, 15, 25]
+        && data.weeklyQuota is int && data.weeklyQuota in [10, 15, 25, 100, 1000, 2000]
         && data.nextResetAt is string && data.nextResetAt.size() >= 10 && data.nextResetAt.size() <= 64
         && data.twoFactorEnabled is bool
         && data.autoLockMinutes is int && data.autoLockMinutes >= 1 && data.autoLockMinutes <= 60
@@ -428,6 +428,16 @@ service cloud.firestore {
         allow delete: if false;
       }
 
+      // Server-Only Subcollection: Authoritative 2FA State (Admin SDK only)
+      match /serverSecurity/{docId} {
+        allow read, write: if false;
+      }
+
+      // Server-Only Subcollection: Exchange Secrets Vault (Admin SDK only)
+      match /serverExchangeSecrets/{keyId} {
+        allow read, write: if false;
+      }
+
       // Subcollection: Configured Spot & Futures Strategies
       match /strategies/{strategyId} {
         allow get: if isValidId(userId) && isShortId(strategyId) && isOwnerRead(userId);
@@ -724,6 +734,15 @@ service cloud.firestore {
 
         allow delete: if isValidId(userId) && isShortId(targetId) && isVerifiedOwner(userId);
       }
+    }
+
+    // Server-Only Root Collections (Admin SDK only — billing IPN ledger & support inbox)
+    match /payments/{orderId} {
+      allow read, write: if false;
+    }
+
+    match /supportInbox/{ticketId} {
+      allow read, write: if false;
     }
   }
 }

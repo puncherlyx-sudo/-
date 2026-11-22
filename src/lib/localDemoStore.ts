@@ -346,6 +346,8 @@ export function saveAiReportTicket(report: {
   ]);
 }
 
+let inMemoryOAuthCsrfState: string | null = null;
+
 export function createOAuthCsrfState(): string {
   const bytes = new Uint8Array(16);
   if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
@@ -354,22 +356,33 @@ export function createOAuthCsrfState(): string {
   const token = Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+  inMemoryOAuthCsrfState = token;
   try {
     window.sessionStorage.setItem(STORAGE_KEYS.oauthCsrfState, token);
   } catch {
-    // Ignore storage restriction
+    // Fallback remains in inMemoryOAuthCsrfState
   }
   return token;
 }
 
 export function verifyOAuthCsrfState(expected: string): boolean {
+  let stored: string | null = null;
   try {
-    const stored = window.sessionStorage.getItem(STORAGE_KEYS.oauthCsrfState);
+    stored = window.sessionStorage.getItem(STORAGE_KEYS.oauthCsrfState);
     window.sessionStorage.removeItem(STORAGE_KEYS.oauthCsrfState);
-    return Boolean(stored && stored === expected);
   } catch {
-    return true;
+    stored = null;
   }
+  const candidate = stored || inMemoryOAuthCsrfState;
+  inMemoryOAuthCsrfState = null;
+  if (!candidate || !expected || candidate.length !== expected.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < candidate.length; i += 1) {
+    diff |= candidate.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 export function exportAllUserDataJson(extra?: Record<string, unknown>): string {

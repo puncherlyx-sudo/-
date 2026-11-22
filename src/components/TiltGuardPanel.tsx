@@ -8,7 +8,11 @@ import {
   Timer,
 } from 'lucide-react';
 import { usePlan } from '../contexts/PlanContext';
-import { hasThreeConsecutiveLosses24h, readLocalTrades } from '../lib/localDemoStore';
+import {
+  hasThreeConsecutiveLosses24h,
+  readLocalTrades,
+  VERNIER_TRADES_EVENT,
+} from '../lib/localDemoStore';
 import {
   clearCooldownWithChecklist,
   computeDisciplineIndex,
@@ -30,20 +34,35 @@ const CHECKLIST_ITEMS = [
 export const TiltGuardPanel: React.FC = () => {
   const { isMax, maskValue } = usePlan();
   const [cfg, setCfg] = useState<TiltGuardConfig>(() => readTiltGuardConfig());
+  const [trades, setTrades] = useState(() => readLocalTrades());
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [checked, setChecked] = useState<number[]>([]);
 
   useEffect(() => {
-    const sync = () => setCfg(readTiltGuardConfig());
-    window.addEventListener(VERNIER_PRO_MAX_EVENT, sync);
-    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const syncCfg = () => setCfg(readTiltGuardConfig());
+    const syncTrades = () => setTrades(readLocalTrades());
+    window.addEventListener(VERNIER_PRO_MAX_EVENT, syncCfg);
+    window.addEventListener(VERNIER_TRADES_EVENT, syncTrades);
     return () => {
-      window.removeEventListener(VERNIER_PRO_MAX_EVENT, sync);
-      window.clearInterval(id);
+      window.removeEventListener(VERNIER_PRO_MAX_EVENT, syncCfg);
+      window.removeEventListener(VERNIER_TRADES_EVENT, syncTrades);
     };
   }, []);
 
-  const trades = readLocalTrades();
+  const isCooldownActive = Boolean(cfg.cooldownUntilMs && cfg.cooldownUntilMs > nowMs);
+  useEffect(() => {
+    if (!cfg.cooldownUntilMs || cfg.cooldownUntilMs <= Date.now()) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => {
+      const now = Date.now();
+      setNowMs(now);
+      if (cfg.cooldownUntilMs && now >= cfg.cooldownUntilMs) {
+        window.clearInterval(id);
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [cfg.cooldownUntilMs, isCooldownActive]);
+
   const closedCount = trades.filter((t) => t.status === 'CLOSED').length;
   const hasBadStreak = hasThreeConsecutiveLosses24h(trades);
   const disciplineIndex = computeDisciplineIndex(cfg, closedCount, hasBadStreak ? 1 : 0);

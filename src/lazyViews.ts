@@ -1,10 +1,11 @@
 import { lazy } from 'react';
 
 /**
- * Тяжёлые экраны подключаются лениво: стартовая вкладка «Рынок» грузится сразу,
- * остальные скачиваются отдельными частями (и заранее, в простое — см. prefetchViews).
+ * Все тяжёлые экраны вкладок подключаются лениво (React.lazy):
+ * неактивные вкладки размонтируются при переключении, освобождая память на мобильных устройствах.
  */
 const loaders = {
+  market: () => import('./components/MarketTerminalView'),
   screener: () => import('./components/MarketScreenerView'),
   strategies: () => import('./components/StrategiesView'),
   news: () => import('./components/NewsFeedView'),
@@ -16,6 +17,9 @@ const loaders = {
   quickAnswers: () => import('./components/QuickAnswersCard'),
 };
 
+export const MarketTerminalView = lazy(() =>
+  loaders.market().then((m) => ({ default: m.MarketTerminalView }))
+);
 export const MarketScreenerView = lazy(() =>
   loaders.screener().then((m) => ({ default: m.MarketScreenerView }))
 );
@@ -40,24 +44,40 @@ export const QuickAnswersCard = lazy(() =>
   loaders.quickAnswers().then((m) => ({ default: m.QuickAnswersCard }))
 );
 
-/** Заранее подгружает остальные экраны, когда браузер свободен, чтобы переключение вкладок было мгновенным. */
+/**
+ * Заранее подгружает остальные экраны, когда браузер свободен, чтобы переключение вкладок было мгновенным.
+ * Уважает режим экономии трафика (Save-Data) и медленные мобильные сети (2G/3G), чтобы не мешать первому рендеру графика.
+ */
 export function prefetchViews(): void {
-  const run = () => {
-    for (const load of [
-      loaders.screener,
-      loaders.strategies,
-      loaders.news,
-      loaders.security,
-    ]) {
-      void load().catch(() => {
-        // нет сети — подгрузится при первом открытии вкладки
-      });
-    }
+  const nav = navigator as Navigator & {
+    connection?: { saveData?: boolean; effectiveType?: string };
   };
+  if (nav.connection?.saveData) return;
+  const netType = nav.connection?.effectiveType;
+  if (netType === 'slow-2g' || netType === '2g' || netType === '3g') return;
+
+  const queue = [
+    loaders.screener,
+    loaders.strategies,
+    loaders.news,
+    loaders.security,
+  ];
+
+  const runStaggered = () => {
+    queue.forEach((load, index) => {
+      window.setTimeout(() => {
+        if (document.visibilityState === 'hidden') return;
+        void load().catch(() => {
+          // нет сети — подгрузится при первом открытии вкладки
+        });
+      }, index * 450);
+    });
+  };
+
   const w = window as Window & { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
   if (typeof w.requestIdleCallback === 'function') {
-    w.requestIdleCallback(run, { timeout: 5000 });
+    w.requestIdleCallback(runStaggered, { timeout: 6000 });
   } else {
-    window.setTimeout(run, 3000);
+    window.setTimeout(runStaggered, 3500);
   }
 }

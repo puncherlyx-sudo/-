@@ -630,7 +630,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
       ...(marketType === 'futures' ? [(t.fundingRatePct ?? 0.01).toFixed(4)] : []),
     ]);
     const dateStamp = new Date().toISOString().slice(0, 10);
-    downloadCsvWithBom(`aegisquant-screener-${marketType}-${dateStamp}.csv`, headers, rows);
+    downloadCsvWithBom(`vernier-screener-${marketType}-${dateStamp}.csv`, headers, rows);
   };
 
   const handleExportPortfolioCsv = () => {
@@ -647,7 +647,7 @@ export const MarketScreenerView: React.FC<MarketScreenerViewProps> = ({
       r.pnlPct.toFixed(2),
     ]);
     const dateStamp = new Date().toISOString().slice(0, 10);
-    downloadCsvWithBom(`aegisquant-portfolio-${dateStamp}.csv`, headers, rows);
+    downloadCsvWithBom(`vernier-portfolio-${dateStamp}.csv`, headers, rows);
   };
 
   const sectionTabs = useMemo(

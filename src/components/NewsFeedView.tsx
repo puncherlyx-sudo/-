@@ -13,7 +13,7 @@ import {
   TrendingDown,
   TrendingUp,
 } from 'lucide-react';
-import { motion } from 'framer-motion';
+import { motion } from 'motion/react';
 import type { GroundedNewsItem } from '../types/domain';
 import { usePlan } from '../contexts/PlanContext';
 import { EconomicCalendarWidget } from './EconomicCalendarWidget';

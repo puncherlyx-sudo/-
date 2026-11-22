@@ -168,6 +168,35 @@ async function withAttemptTimeout<T>(promise: Promise<T>, timeoutMs: number): Pr
   }
 }
 
+// Суточный бюджет вызовов Gemini API (выключатель защиты бюджета, сбрасывается в 00:00 UTC)
+let geminiBudgetDayKey = new Date().toISOString().slice(0, 10);
+let geminiDailyCallCount = 0;
+
+function getGeminiDailyBudgetLimit(): number {
+  const raw = Number(process.env.GEMINI_DAILY_BUDGET);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 100_000) {
+    return Math.floor(raw);
+  }
+  return 500;
+}
+
+function consumeGeminiDailyBudgetOrThrow(): void {
+  const todayKey = new Date().toISOString().slice(0, 10);
+  if (todayKey !== geminiBudgetDayKey) {
+    geminiBudgetDayKey = todayKey;
+    geminiDailyCallCount = 0;
+  }
+  const limit = getGeminiDailyBudgetLimit();
+  if (geminiDailyCallCount >= limit) {
+    throw new AiServiceError(
+      429,
+      'DAILY_BUDGET_EXCEEDED',
+      `Достигнут суточный лимит обращений к Gemini API (${limit}/день). Сервис восстановится в 00:00 UTC.`
+    );
+  }
+  geminiDailyCallCount += 1;
+}
+
 async function callGeminiWithBackoff<T>(
   scope: string,
   fn: (ai: GoogleGenAI) => Promise<T>,
@@ -190,6 +219,8 @@ async function callGeminiWithBackoff<T>(
       'Исчерпана текущая квота Gemini API (429 RESOURCE_EXHAUSTED). Повторите позже или выберите API-ключ с биллингом в панели Settings > Secrets.'
     );
   }
+
+  consumeGeminiDailyBudgetOrThrow();
 
   const maxAttempts = options?.maxAttempts ?? 3;
   const timeoutMs = options?.timeoutMs ?? 14_000;

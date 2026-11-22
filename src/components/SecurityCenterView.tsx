@@ -24,9 +24,7 @@ import {
   Lock,
   Moon,
   Palette,
-  PauseCircle,
   RefreshCw,
-  Repeat,
   Scale,
   Send,
   ShieldAlert,
@@ -35,7 +33,6 @@ import {
   Trash2,
   TrendingUp,
   Webhook,
-  Wrench,
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import type { PortfolioSourceMeta } from '../hooks/usePaperPortfolio';
@@ -57,28 +54,37 @@ import type {
 } from '../types/domain';
 import { ActiveSessionsPanel } from './ActiveSessionsPanel';
 import { EditExchangeKeyModal } from './EditExchangeKeyModal';
-import { ExchangeApiGuide } from './ExchangeApiGuide';
 import { ExchangeIntegrationPanel } from './ExchangeIntegrationPanel';
 import { FeatureGuide } from './FeatureGuide';
 import { StaggerDeck } from './MotionPrimitives';
 import { PriceAlertsPanel } from './PriceAlertsPanel';
 import { SecurityAuditActivityChart } from './SecurityAuditActivityChart';
 import { SecurityStrengthIndicator } from './SecurityStrengthIndicator';
+import { SyncErrorIntensityChart } from './SyncErrorIntensityChart';
+import {
+  VirtualizedAuditLogList,
+  VirtualizedExchangeSyncLogList,
+} from './VirtualizedSecurityLogs';
 
+const LazyExchangeApiGuide = React.lazy(() =>
+  import('./ExchangeApiGuide').then((m) => ({ default: m.ExchangeApiGuide }))
+);
 const LazySecurityFaqSection = React.lazy(() =>
   import('./SecurityFaqSection').then((m) => ({ default: m.SecurityFaqSection }))
 );
-import { SessionGeoMapPanel } from './SessionGeoMapPanel';
+const LazySessionGeoMapPanel = React.lazy(() =>
+  import('./SessionGeoMapPanel').then((m) => ({ default: m.SessionGeoMapPanel }))
+);
 import { TiltGuardPanel } from './TiltGuardPanel';
 import { WebhookBuilderModal } from './WebhookBuilderModal';
 import { authFetch } from '../lib/authFetch';
 import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
 import {
-  getExchangeSyncQuickFix,
+  countExchangeSyncLogsOlderThan,
+  estimateExchangeSyncLogsBytes,
   groupConsecutiveBackgroundSyncErrors,
-  type ExchangeSyncErrorCategory,
+  SYNC_LOG_AUTO_CLEANUP_DAYS,
   type ExchangeSyncErrorLogEntry,
-  type ExchangeSyncQuickFixActionType,
   type ExchangeSyncSeverity,
 } from '../lib/exchangeSyncErrorLog';
 import {
@@ -168,6 +174,8 @@ interface SecurityCenterViewProps {
   backgroundSyncingKeyIds?: string[];
   exchangeSyncErrorLogs?: ExchangeSyncErrorLogEntry[];
   onClearExchangeSyncErrorLogs?: () => void;
+  syncLogAutoCleanup30d?: boolean;
+  onToggleSyncLogAutoCleanup30d?: (enabled: boolean) => { removedCount: number };
   portfolioSource: PortfolioSourceMeta;
   onConnectExchange: (params: {
     exchange: ExchangeId;
@@ -251,6 +259,8 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   backgroundSyncingKeyIds,
   exchangeSyncErrorLogs = [],
   onClearExchangeSyncErrorLogs,
+  syncLogAutoCleanup30d = true,
+  onToggleSyncLogAutoCleanup30d,
   portfolioSource,
   onConnectExchange,
   onSyncExchange,
@@ -281,6 +291,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const [sessionsSub, setSessionsSub] = useState<'map' | 'list'>('map');
   const [auditSub, setAuditSub] = useState<'chart' | 'log' | 'faq'>('chart');
   const [syncLogFilter, setSyncLogFilter] = useState<'all' | ExchangeSyncSeverity>('all');
+  const [syncExchangeFilter, setSyncExchangeFilter] = useState<'all' | ExchangeId>('all');
   const [editingExchangeKey, setEditingExchangeKey] = useState<ExchangeKeyRecord | null>(null);
   const [quickFixBusyId, setQuickFixBusyId] = useState<string | null>(null);
   const [quickFixNotice, setQuickFixNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
@@ -437,25 +448,121 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   };
 
   const syncLogStats = useMemo(() => {
+    const categoryLabels: Record<string, string> = {
+      rate_limit: 'Лимит API',
+      auth: 'Ключ / права',
+      network: 'Сбой сети',
+      exchange_api: 'Ошибка API',
+      unknown: 'Сбой синхр.',
+    };
+
     let success = 0;
     let warning = 0;
     let critical = 0;
+
+    const exchangeTotals = new Map<ExchangeId, number>();
+    const exchangeErrorMap = new Map<
+      ExchangeId,
+      {
+        exchange: ExchangeId;
+        errorCount: number;
+        criticalCount: number;
+        warningCount: number;
+        lastErrorAtMs: number;
+        categories: Map<string, number>;
+      }
+    >();
+    const globalCategories = new Map<string, number>();
+
     for (const entry of exchangeSyncErrorLogs) {
-      if (entry.severity === 'success') success += 1;
-      else if (entry.severity === 'warning') warning += 1;
-      else critical += 1;
+      exchangeTotals.set(entry.exchange, (exchangeTotals.get(entry.exchange) ?? 0) + 1);
+      if (entry.severity === 'success') {
+        success += 1;
+      } else {
+        if (entry.severity === 'warning') warning += 1;
+        else critical += 1;
+
+        globalCategories.set(entry.category, (globalCategories.get(entry.category) ?? 0) + 1);
+
+        const bucket = exchangeErrorMap.get(entry.exchange) ?? {
+          exchange: entry.exchange,
+          errorCount: 0,
+          criticalCount: 0,
+          warningCount: 0,
+          lastErrorAtMs: 0,
+          categories: new Map<string, number>(),
+        };
+        bucket.errorCount += 1;
+        if (entry.severity === 'critical') bucket.criticalCount += 1;
+        else bucket.warningCount += 1;
+        if (entry.occurredAtMs > bucket.lastErrorAtMs) {
+          bucket.lastErrorAtMs = entry.occurredAtMs;
+        }
+        bucket.categories.set(entry.category, (bucket.categories.get(entry.category) ?? 0) + 1);
+        exchangeErrorMap.set(entry.exchange, bucket);
+      }
     }
+
+    const issues = warning + critical;
+    const topErrorExchanges = Array.from(exchangeErrorMap.values())
+      .sort(
+        (a, b) =>
+          b.errorCount - a.errorCount ||
+          b.criticalCount - a.criticalCount ||
+          b.lastErrorAtMs - a.lastErrorAtMs
+      )
+      .slice(0, 3)
+      .map((item) => {
+        let topCatKey = 'unknown';
+        let topCatCount = 0;
+        for (const [cat, cnt] of item.categories.entries()) {
+          if (cnt > topCatCount) {
+            topCatCount = cnt;
+            topCatKey = cat;
+          }
+        }
+        const totalForExchange = exchangeTotals.get(item.exchange) ?? item.errorCount;
+        return {
+          exchange: item.exchange,
+          errorCount: item.errorCount,
+          criticalCount: item.criticalCount,
+          warningCount: item.warningCount,
+          totalForExchange,
+          errorRatePct: totalForExchange > 0 ? (item.errorCount / totalForExchange) * 100 : 0,
+          shareOfErrorsPct: issues > 0 ? (item.errorCount / issues) * 100 : 0,
+          topCategoryLabel: categoryLabels[topCatKey] ?? 'Сбой синхр.',
+        };
+      });
+
+    let dominantCategoryKey: string | null = null;
+    let dominantCategoryCount = 0;
+    for (const [cat, cnt] of globalCategories.entries()) {
+      if (cnt > dominantCategoryCount) {
+        dominantCategoryCount = cnt;
+        dominantCategoryKey = cat;
+      }
+    }
+    const topErrorCategoryLabel = dominantCategoryKey
+      ? categoryLabels[dominantCategoryKey] ?? 'Сбой синхр.'
+      : null;
+
     const groupedAll = groupConsecutiveBackgroundSyncErrors(exchangeSyncErrorLogs);
     const total = exchangeSyncErrorLogs.length;
     const groupedTotal = groupedAll.length;
     const successPct = total > 0 ? (success / total) * 100 : 0;
     const warningPct = total > 0 ? (warning / total) * 100 : 0;
     const criticalPct = total > 0 ? (critical / total) * 100 : 0;
-    const filtered =
-      syncLogFilter === 'all'
-        ? groupedAll
-        : groupedAll.filter((group) => group.entry.severity === syncLogFilter);
+    const filtered = groupedAll.filter((group) => {
+      if (syncLogFilter !== 'all' && group.entry.severity !== syncLogFilter) return false;
+      if (syncExchangeFilter !== 'all' && group.entry.exchange !== syncExchangeFilter) return false;
+      return true;
+    });
     const timeline = exchangeSyncErrorLogs.slice(0, 24).reverse();
+    const storageBytes = estimateExchangeSyncLogsBytes(exchangeSyncErrorLogs);
+    const expiredOlderThan30d = countExchangeSyncLogsOlderThan(
+      exchangeSyncErrorLogs,
+      SYNC_LOG_AUTO_CLEANUP_DAYS
+    );
 
     return {
       total,
@@ -463,14 +570,18 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
       success,
       warning,
       critical,
-      issues: warning + critical,
+      issues,
       successPct,
       warningPct,
       criticalPct,
+      topErrorExchanges,
+      topErrorCategoryLabel,
       filtered,
       timeline,
+      storageBytes,
+      expiredOlderThan30d,
     };
-  }, [exchangeSyncErrorLogs, syncLogFilter]);
+  }, [exchangeSyncErrorLogs, syncLogFilter, syncExchangeFilter]);
 
   // Компактный расчёт Индекса защиты (0–100%) и первого невыполненного шага для Hero-карточки
   const securityHeroSummary = useMemo(() => {
@@ -1943,7 +2054,13 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             </section>
 
             {/* Пошаговые инструкции с визуальными схемами для Binance, Bybit и OKX */}
-            <ExchangeApiGuide initialExchange="binance" />
+            <React.Suspense
+              fallback={
+                <div className="h-64 rounded-2xl border border-white/8 bg-[#111827] shimmer-skeleton" />
+              }
+            >
+              <LazyExchangeApiGuide initialExchange="binance" />
+            </React.Suspense>
 
             {/* Переход к подключению API-ключа */}
             <div className="flex justify-end">
@@ -2347,12 +2464,18 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                 </div>
 
                 {sessionsSub === 'map' ? (
-                  <SessionGeoMapPanel
-                    sessions={sessions}
-                    currentSessionId={currentSessionId}
-                    onRevokeSession={onRevokeSession}
-                    onToggleSuspicious={onToggleSessionSuspicious}
-                  />
+                  <React.Suspense
+                    fallback={
+                      <div className="h-72 rounded-2xl border border-white/8 bg-[#111827] shimmer-skeleton" />
+                    }
+                  >
+                    <LazySessionGeoMapPanel
+                      sessions={sessions}
+                      currentSessionId={currentSessionId}
+                      onRevokeSession={onRevokeSession}
+                      onToggleSuspicious={onToggleSessionSuspicious}
+                    />
+                  </React.Suspense>
                 ) : (
                   <ActiveSessionsPanel
                     sessions={sessions}
@@ -2583,7 +2706,10 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                 'Все входы, проверки 2FA, сбои синхронизации бирж и изменения параметров фиксируются автоматически.'
               )
             ) : auditSub === 'chart' ? (
-              <SecurityAuditActivityChart auditLogs={auditLogs} />
+              <div className="space-y-4">
+                <SecurityAuditActivityChart auditLogs={auditLogs} />
+                <SyncErrorIntensityChart logs={exchangeSyncErrorLogs} />
+              </div>
             ) : (
               <div className="space-y-4">
                 {/* Визуализация и журнал синхронизации бирж */}
@@ -2618,6 +2744,70 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       </button>
                     )}
                   </div>
+
+                  {/* Настройка авто-очистки логов ошибок старше 30 дней для экономии localStorage */}
+                  {onToggleSyncLogAutoCleanup30d && (
+                    <div className="rounded-xl border border-white/8 bg-[#0B0F17]/75 px-3.5 py-2.5 flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-white">
+                          <Clock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span>Авто-очистка логов старше {SYNC_LOG_AUTO_CLEANUP_DAYS} дней</span>
+                          <span className="font-mono text-[10px] text-slate-400 tabular-nums">
+                            ·{' '}
+                            {syncLogStats.storageBytes > 0
+                              ? `${(syncLogStats.storageBytes / 1024).toFixed(1)} КБ`
+                              : '0 КБ'}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-[11px] text-slate-400 leading-snug">
+                          {syncLogAutoCleanup30d
+                            ? 'Включено: устаревшие записи автоматически удаляются при загрузке и записи для экономии локального хранилища.'
+                            : syncLogStats.expiredOlderThan30d > 0
+                              ? `Отключено · найдено записей старше ${SYNC_LOG_AUTO_CLEANUP_DAYS} дн.: ${syncLogStats.expiredOlderThan30d}.`
+                              : 'Отключено: старые записи хранятся в localStorage до ручной очистки или лимита в 60 событий.'}
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={syncLogAutoCleanup30d}
+                        aria-label={`Авто-очистка логов ошибок старше ${SYNC_LOG_AUTO_CLEANUP_DAYS} дней`}
+                        onClick={() => {
+                          triggerHaptic(8);
+                          const next = !syncLogAutoCleanup30d;
+                          const { removedCount } = onToggleSyncLogAutoCleanup30d(next);
+                          if (next) {
+                            setQuickFixNotice({
+                              tone: 'ok',
+                              text:
+                                removedCount > 0
+                                  ? `Авто-очистка (30 дн.) включена — удалено устаревших записей: ${removedCount}.`
+                                  : `Авто-очистка логов старше ${SYNC_LOG_AUTO_CLEANUP_DAYS} дней включена.`,
+                            });
+                          } else {
+                            setQuickFixNotice({
+                              tone: 'ok',
+                              text: `Авто-очистка логов старше ${SYNC_LOG_AUTO_CLEANUP_DAYS} дней отключена.`,
+                            });
+                          }
+                        }}
+                        className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                          syncLogAutoCleanup30d
+                            ? 'border-emerald-400/50 bg-emerald-500/35'
+                            : 'border-white/15 bg-white/10'
+                        }`}
+                      >
+                        <span
+                          className={`pointer-events-none inline-block h-4 w-4 transform rounded-full shadow transition-transform ${
+                            syncLogAutoCleanup30d
+                              ? 'translate-x-5.5 bg-emerald-300'
+                              : 'translate-x-1 bg-slate-400'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  )}
 
                   {/* Сводка 3 уровней + шкала распределения + лента последних событий */}
                   {syncLogStats.total > 0 && (
@@ -2721,8 +2911,117 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                         </div>
                       </div>
 
+                      {/* Линейный график интенсивности ошибок (ошибки/час) и периоды аномальной активности */}
+                      <SyncErrorIntensityChart
+                        logs={exchangeSyncErrorLogs}
+                        exchangeFilter={syncExchangeFilter}
+                        compact
+                      />
+
+                      {/* Краткая статистика ошибок: Топ-3 биржи по частоте сбоев */}
+                      <div className="space-y-2 pt-2 border-t border-white/8">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <div className="flex items-center gap-1.5 text-slate-300 font-medium">
+                            <AlertTriangle
+                              className={`w-3.5 h-3.5 shrink-0 ${
+                                syncLogStats.issues > 0 ? 'text-amber-400' : 'text-emerald-400'
+                              }`}
+                            />
+                            <span>Топ-3 биржи по частоте ошибок</span>
+                          </div>
+                          {syncLogStats.topErrorCategoryLabel ? (
+                            <span className="font-mono text-[10px] text-slate-400">
+                              Частая причина:{' '}
+                              <span className="text-amber-300 font-semibold">
+                                {syncLogStats.topErrorCategoryLabel}
+                              </span>
+                            </span>
+                          ) : (
+                            <span className="font-mono text-[10px] text-emerald-400">
+                              0 сбоев · все биржи стабильны
+                            </span>
+                          )}
+                        </div>
+
+                        {syncLogStats.topErrorExchanges.length > 0 ? (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                            {syncLogStats.topErrorExchanges.map((item, idx) => {
+                              const isSelected = syncExchangeFilter === item.exchange;
+                              const isCriticalDominant = item.criticalCount >= item.warningCount && item.criticalCount > 0;
+                              return (
+                                <button
+                                  key={`top-err-${item.exchange}`}
+                                  type="button"
+                                  onClick={() =>
+                                    setSyncExchangeFilter((prev) =>
+                                      prev === item.exchange ? 'all' : item.exchange
+                                    )
+                                  }
+                                  className={`text-left rounded-lg border px-3 py-2 transition-colors space-y-1.5 ${
+                                    isSelected
+                                      ? 'border-cyan-400/60 bg-cyan-500/12 ring-1 ring-cyan-400/30'
+                                      : isCriticalDominant
+                                        ? 'border-rose-500/30 bg-rose-500/[0.08] hover:border-rose-400/45'
+                                        : 'border-orange-500/30 bg-orange-500/[0.08] hover:border-orange-400/45'
+                                  }`}
+                                  title="Нажмите, чтобы отфильтровать журнал по этой бирже"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <span className="font-mono text-[10px] font-bold text-slate-400">
+                                        #{idx + 1}
+                                      </span>
+                                      <span className="text-xs font-semibold text-white truncate">
+                                        {item.exchange.toUpperCase()}
+                                      </span>
+                                    </div>
+                                    <span
+                                      className={`font-mono text-xs font-bold tabular-nums shrink-0 ${
+                                        isCriticalDominant ? 'text-rose-300' : 'text-orange-300'
+                                      }`}
+                                    >
+                                      {item.errorCount}{' '}
+                                      <span className="text-[10px] font-normal text-slate-400">
+                                        ({item.shareOfErrorsPct.toFixed(0)}%)
+                                      </span>
+                                    </span>
+                                  </div>
+
+                                  <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                                    <div
+                                      style={{ width: `${Math.max(8, Math.min(100, item.shareOfErrorsPct))}%` }}
+                                      className={`h-full rounded-full transition-all ${
+                                        isCriticalDominant ? 'bg-rose-500' : 'bg-orange-400'
+                                      }`}
+                                    />
+                                  </div>
+
+                                  <div className="flex items-center justify-between gap-2 text-[10px] font-mono tabular-nums text-slate-400">
+                                    <span className="truncate text-slate-300">{item.topCategoryLabel}</span>
+                                    <span className="shrink-0">
+                                      {item.criticalCount > 0 && (
+                                        <span className="text-rose-300">{item.criticalCount} крит.</span>
+                                      )}
+                                      {item.criticalCount > 0 && item.warningCount > 0 && ' · '}
+                                      {item.warningCount > 0 && (
+                                        <span className="text-orange-300">{item.warningCount} пред.</span>
+                                      )}
+                                    </span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/[0.07] px-3 py-2 text-[11px] text-emerald-200 flex items-center gap-2">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span>Ошибок синхронизации не зафиксировано — все подключённые биржи отвечают стабильно.</span>
+                          </div>
+                        )}
+                      </div>
+
                       {/* Фильтр по уровню события */}
-                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-white/8">
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/8">
                         <div className="flex flex-wrap items-center gap-1.5">
                           {(
                             [
@@ -2748,6 +3047,15 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                               </button>
                             );
                           })}
+                          {syncExchangeFilter !== 'all' && (
+                            <button
+                              type="button"
+                              onClick={() => setSyncExchangeFilter('all')}
+                              className="min-h-[28px] px-2.5 rounded-lg border border-cyan-400/45 bg-cyan-500/15 text-[11px] font-medium text-cyan-200 hover:bg-cyan-500/25 transition-colors"
+                            >
+                              Биржа: {syncExchangeFilter.toUpperCase()} ×
+                            </button>
+                          )}
                         </div>
                         {syncLogStats.groupedTotal < syncLogStats.total && (
                           <span className="text-[11px] font-mono text-slate-400 tabular-nums">
@@ -2786,342 +3094,34 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       В выбранной категории событий пока нет.
                     </p>
                   ) : (
-                    <div className="space-y-2 max-h-[28rem] overflow-y-auto pr-1">
-                      {syncLogStats.filtered.map((group) => {
-                        const { entry, repeatCount, firstOccurredAtMs, lastOccurredAtMs, entryIds } = group;
-                        const categoryMeta: Record<
-                          ExchangeSyncErrorCategory,
-                          { label: string }
-                        > = {
-                          success: { label: 'Успешно' },
-                          rate_limit: { label: 'Лимит API' },
-                          auth: { label: 'Ошибка ключа / прав' },
-                          network: { label: 'Сбой сети' },
-                          exchange_api: { label: 'Ошибка API биржи' },
-                          unknown: { label: 'Сбой синхронизации' },
-                        };
-                        const severityStyles: Record<
-                          ExchangeSyncSeverity,
-                          { rowClass: string; dotClass: string; badgeClass: string; badgeText: string }
-                        > = {
-                          success: {
-                            rowClass: 'border-emerald-500/30 border-l-4 border-l-emerald-400 bg-emerald-500/[0.10]',
-                            dotClass: 'bg-emerald-400',
-                            badgeClass: 'border-emerald-500/35 bg-emerald-500/20 text-emerald-200',
-                            badgeText: 'Успешно',
-                          },
-                          warning: {
-                            rowClass: 'border-orange-500/35 border-l-4 border-l-orange-400 bg-orange-500/[0.13]',
-                            dotClass: 'bg-orange-400',
-                            badgeClass: 'border-orange-500/40 bg-orange-500/20 text-orange-200',
-                            badgeText: categoryMeta[entry.category].label,
-                          },
-                          critical: {
-                            rowClass: 'border-rose-500/40 border-l-4 border-l-rose-500 bg-rose-500/[0.14]',
-                            dotClass: 'bg-rose-500',
-                            badgeClass: 'border-rose-500/45 bg-rose-500/22 text-rose-100',
-                            badgeText: categoryMeta[entry.category].label,
-                          },
-                        };
-                        const sev = severityStyles[entry.severity];
-                        const timeLabel = new Date(lastOccurredAtMs).toLocaleString('ru-RU', {
-                          day: '2-digit',
-                          month: '2-digit',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                        });
-                        const firstTimeLabel = new Date(firstOccurredAtMs).toLocaleTimeString('ru-RU', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                        });
-
-                        const linkedKey = exchangeKeys.find((k) => k.id === entry.keyId) ?? null;
-                        const quickFix = getExchangeSyncQuickFix(entry, nowTickMs);
-                        const isQuickFixBusy = quickFixBusyId !== null && entryIds.includes(quickFixBusyId);
-
-                        const handleQuickRetry = async () => {
-                          if (!linkedKey) return;
-                          setQuickFixBusyId(entry.id);
-                          setQuickFixNotice(null);
-                          try {
-                            if (!linkedKey.enabled) {
-                              await onToggleExchange(linkedKey.id, true);
-                            }
-                            const res = await onSyncExchange(linkedKey, true);
-                            setQuickFixNotice({
-                              tone: 'ok',
-                              text: `Синхронизация ${linkedKey.exchange.toUpperCase()} (${linkedKey.label}) выполнена: $${res.totalBalanceUsdt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.`,
-                            });
-                          } catch (err) {
-                            setQuickFixNotice({
-                              tone: 'err',
-                              text: err instanceof Error ? err.message : 'Повторная синхронизация завершилась ошибкой.',
-                            });
-                          } finally {
-                            setQuickFixBusyId(null);
-                          }
-                        };
-
-                        const handleQuickPause = async () => {
-                          if (!linkedKey || !linkedKey.enabled) return;
-                          setQuickFixBusyId(entry.id);
-                          setQuickFixNotice(null);
-                          try {
-                            await onToggleExchange(linkedKey.id, false);
-                            setQuickFixNotice({
-                              tone: 'ok',
-                              text: `Ключ «${linkedKey.label}» поставлен на паузу на время охлаждения лимитов API.`,
-                            });
-                          } catch (err) {
-                            setQuickFixNotice({
-                              tone: 'err',
-                              text: err instanceof Error ? err.message : 'Не удалось поставить ключ на паузу.',
-                            });
-                          } finally {
-                            setQuickFixBusyId(null);
-                          }
-                        };
-
-                        const renderQuickFixActionButton = (
-                          actionType: ExchangeSyncQuickFixActionType,
-                          label: string,
-                          isSecondary = false
-                        ) => {
-                          if (!linkedKey) return null;
-                          if (actionType === 'pause_key') {
-                            if (!linkedKey.enabled) return null;
-                            return (
-                              <button
-                                key={`${entry.id}-pause`}
-                                type="button"
-                                disabled={isQuickFixBusy}
-                                onClick={() => void handleQuickPause()}
-                                className="min-h-[30px] px-2.5 rounded-md border border-amber-500/35 bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 text-[11px] font-semibold text-amber-200 inline-flex items-center gap-1.5 transition-colors"
-                              >
-                                <PauseCircle className="w-3 h-3" />
-                                <span>{label}</span>
-                              </button>
-                            );
-                          }
-                          if (actionType === 'edit_key') {
-                            return (
-                              <button
-                                key={`${entry.id}-edit`}
-                                type="button"
-                                disabled={isQuickFixBusy}
-                                onClick={() => setEditingExchangeKey(linkedKey)}
-                                className="min-h-[30px] px-2.5 rounded-md border border-cyan-500/40 bg-cyan-500/15 hover:bg-cyan-500/25 disabled:opacity-50 text-[11px] font-semibold text-cyan-200 inline-flex items-center gap-1.5 transition-colors"
-                              >
-                                <KeyRound className="w-3 h-3" />
-                                <span>{label}</span>
-                              </button>
-                            );
-                          }
-                          return (
-                            <button
-                              key={`${entry.id}-retry`}
-                              type="button"
-                              disabled={isQuickFixBusy}
-                              onClick={() => void handleQuickRetry()}
-                              className={`min-h-[30px] px-2.5 rounded-md border disabled:opacity-50 text-[11px] font-semibold inline-flex items-center gap-1.5 transition-colors ${
-                                isSecondary
-                                  ? 'border-white/15 bg-white/5 hover:bg-white/10 text-slate-200'
-                                  : 'border-emerald-500/35 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200'
-                              }`}
-                            >
-                              <RefreshCw
-                                className={`w-3 h-3 ${isQuickFixBusy ? 'animate-spin' : ''}`}
-                              />
-                              <span>
-                                {isQuickFixBusy
-                                  ? 'Синхр...'
-                                  : !linkedKey.enabled
-                                    ? 'Включить и повторить'
-                                    : label}
-                              </span>
-                            </button>
-                          );
-                        };
-
-                        return (
-                          <div
-                            key={entry.id}
-                            className={`rounded-lg border px-3 py-2.5 space-y-2 text-xs ${sev.rowClass}`}
-                          >
-                            <div className="flex items-start justify-between gap-4">
-                              <div className="flex items-start gap-2.5 min-w-0">
-                                <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${sev.dotClass}`} />
-                                <div className="min-w-0">
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <span className="font-medium text-white break-words">
-                                      {entry.errorMessage}
-                                    </span>
-                                    {repeatCount > 1 && (
-                                      <span
-                                        title={`Повторялось подряд в фоновом режиме: ${repeatCount}`}
-                                        className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums shrink-0 ${
-                                          entry.severity === 'critical'
-                                            ? 'border-rose-500/45 bg-rose-500/25 text-rose-100'
-                                            : 'border-orange-500/45 bg-orange-500/25 text-orange-100'
-                                        }`}
-                                      >
-                                        <Repeat className="w-3 h-3" />
-                                        <span>×{repeatCount}</span>
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="mt-0.5 text-slate-300/80 font-mono text-[11px] flex flex-wrap items-center gap-2">
-                                    <span>
-                                      {entry.exchange.toUpperCase()} · {entry.label}
-                                      {entry.testnet ? ' (Testnet)' : ''}
-                                    </span>
-                                    <span aria-hidden="true">·</span>
-                                    <span>
-                                      {entry.source === 'manual' ? 'Ручная проверка' : 'Фоновое обновление'}
-                                    </span>
-                                    {repeatCount > 1 && (
-                                      <>
-                                        <span aria-hidden="true">·</span>
-                                        <span className="text-slate-200">
-                                          Повторов подряд: {repeatCount}
-                                        </span>
-                                      </>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="text-right shrink-0 font-mono tabular-nums">
-                                <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${sev.badgeClass}`}>
-                                  {sev.badgeText}
-                                </span>
-                                <div className="mt-1 text-slate-400 text-[11px]">{timeLabel}</div>
-                                {repeatCount > 1 && firstOccurredAtMs < lastOccurredAtMs && (
-                                  <div className="text-[10px] text-slate-400/80">
-                                    с {firstTimeLabel}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-
-                            {quickFix && (
-                              <div className="ml-4.5 rounded-lg border border-white/10 bg-[#0B0F17]/75 px-3 py-2 flex flex-wrap items-center justify-between gap-2.5">
-                                <div className="flex items-start gap-2 min-w-0 flex-1">
-                                  <Wrench className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
-                                  <div className="text-[11px] text-slate-300 leading-relaxed">
-                                    <span className="font-semibold text-cyan-300">
-                                      Быстрое решение · {quickFix.title}:{' '}
-                                    </span>
-                                    <span>{quickFix.suggestion}</span>
-                                  </div>
-                                </div>
-
-                                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                                  {quickFix.cooldownLabel && (
-                                    <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 font-mono text-[11px] text-amber-200 tabular-nums">
-                                      <Clock className="w-3 h-3" />
-                                      <span>{quickFix.cooldownLabel}</span>
-                                    </span>
-                                  )}
-
-                                  {linkedKey ? (
-                                    <>
-                                      {renderQuickFixActionButton(
-                                        quickFix.recommendedAction,
-                                        quickFix.actionLabel
-                                      )}
-                                      {quickFix.secondaryAction &&
-                                        quickFix.secondaryActionLabel &&
-                                        renderQuickFixActionButton(
-                                          quickFix.secondaryAction,
-                                          quickFix.secondaryActionLabel,
-                                          true
-                                        )}
-                                    </>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => setSection('exchanges')}
-                                      className="min-h-[30px] px-2.5 rounded-md border border-white/15 bg-white/5 hover:bg-white/10 text-[11px] font-medium text-slate-200 inline-flex items-center gap-1.5 transition-colors"
-                                    >
-                                      <Link2 className="w-3 h-3 text-emerald-400" />
-                                      <span>Ключ удалён — добавить новый</span>
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
+                    <VirtualizedExchangeSyncLogList
+                      groups={syncLogStats.filtered}
+                      exchangeKeys={exchangeKeys}
+                      nowTickMs={nowTickMs}
+                      quickFixBusyId={quickFixBusyId}
+                      onSetQuickFixBusyId={setQuickFixBusyId}
+                      onSetQuickFixNotice={setQuickFixNotice}
+                      onToggleExchange={onToggleExchange}
+                      onSyncExchange={onSyncExchange}
+                      onEditExchangeKey={setEditingExchangeKey}
+                      onOpenExchangesSection={() => setSection('exchanges')}
+                    />
                   )}
                 </div>
 
-                {/* Облачный журнал аудита безопасности Firestore */}
+                {/* Облачный журнал аудита безопасности Firestore (виртуализированный) */}
                 <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5">
                   <div className="flex items-center justify-between mb-3">
                     <h2 className="text-base font-semibold text-white">Журнал аудита безопасности</h2>
-                    <span className="text-xs text-slate-500">Последние 20 событий</span>
+                    <span className="text-xs text-slate-500 font-mono tabular-nums">
+                      {auditLogs.length > 0 ? `Событий: ${auditLogs.length}` : 'Все события'}
+                    </span>
                   </div>
 
                   {auditLogs.length === 0 ? (
                     <p className="text-xs text-slate-400">События безопасности будут фиксироваться здесь автоматически.</p>
                   ) : (
-                    <div className="space-y-1.5">
-                      {auditLogs.slice(0, 20).map((log) => {
-                        const ts = (log.createdAt as { seconds?: number } | undefined)?.seconds;
-                        const dateLabel = ts
-                          ? new Date(ts * 1000).toLocaleString('ru-RU', {
-                              day: '2-digit',
-                              month: '2-digit',
-                              hour: '2-digit',
-                              minute: '2-digit',
-                            })
-                          : 'Сейчас';
-                        const statusStyle =
-                          log.status === 'SUCCESS'
-                            ? {
-                                row: 'border-emerald-500/25 border-l-4 border-l-emerald-400 bg-emerald-500/[0.09]',
-                                dot: 'bg-emerald-400',
-                                badge: 'border-emerald-500/35 bg-emerald-500/18 text-emerald-200',
-                              }
-                            : log.status === 'BLOCKED'
-                              ? {
-                                  row: 'border-rose-500/35 border-l-4 border-l-rose-500 bg-rose-500/[0.13]',
-                                  dot: 'bg-rose-500',
-                                  badge: 'border-rose-500/45 bg-rose-500/22 text-rose-100',
-                                }
-                              : {
-                                  row: 'border-orange-500/35 border-l-4 border-l-orange-400 bg-orange-500/[0.12]',
-                                  dot: 'bg-orange-400',
-                                  badge: 'border-orange-500/40 bg-orange-500/20 text-orange-200',
-                                };
-                        return (
-                          <div
-                            key={log.id}
-                            className={`rounded-lg border px-3 py-2.5 flex items-start justify-between gap-4 text-xs ${statusStyle.row}`}
-                          >
-                            <div className="flex items-start gap-2.5 min-w-0">
-                              <span className={`mt-1.5 w-2 h-2 rounded-full shrink-0 ${statusStyle.dot}`} />
-                              <div className="min-w-0">
-                                <div className="font-medium text-white">{log.description}</div>
-                                <div className="mt-0.5 text-slate-300/80 font-mono">
-                                  {log.eventType} · {log.deviceLabel}
-                                </div>
-                              </div>
-                            </div>
-                            <div className="text-right shrink-0 font-mono tabular-nums">
-                              <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-semibold ${statusStyle.badge}`}>
-                                {log.status}
-                              </span>
-                              <div className="mt-1 text-slate-400">{dateLabel}</div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
+                    <VirtualizedAuditLogList auditLogs={auditLogs} />
                   )}
                 </div>
               </div>

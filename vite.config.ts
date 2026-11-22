@@ -164,6 +164,7 @@ export default defineConfig(() => {
         injectManifest: {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globIgnores: ['**/api_guide_*', '**/assets/aistudio/**'],
         },
         devOptions: {
           enabled: true,

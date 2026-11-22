@@ -47,6 +47,7 @@ export interface PushNotificationPayload {
     | 'auth_login'
     | 'strategy_change'
     | 'signal_limit'
+    | 'exchange_sync_critical'
     | 'price_alert'
     | 'test';
 }
@@ -93,7 +94,7 @@ function loadOrCreateVapidKeys(): VapidKeys {
   }
   const generated = generateVAPIDKeys();
   try {
-    fs.writeFileSync(VAPID_FILE, JSON.stringify(generated, null, 2), 'utf8');
+    fs.writeFileSync(VAPID_FILE, JSON.stringify(generated, null, 2), { encoding: 'utf8', mode: 0o600 });
   } catch {
     // Non-fatal if read-only fs
   }
@@ -101,7 +102,12 @@ function loadOrCreateVapidKeys(): VapidKeys {
 }
 
 const vapidKeys = loadOrCreateVapidKeys();
-setVapidDetails('mailto:security@vernier-terminal.app', vapidKeys.publicKey, vapidKeys.privateKey);
+const rawVapidSubject = (process.env.VAPID_SUBJECT || '').trim();
+const vapidSubject =
+  /^(mailto:[^\s@]+@[^\s@]+\.[^\s@]+|https:\/\/[^\s]+)$/i.test(rawVapidSubject)
+    ? rawVapidSubject
+    : 'mailto:admin@localhost.invalid';
+setVapidDetails(vapidSubject, vapidKeys.publicKey, vapidKeys.privateKey);
 
 // Keyed by endpoint so each browser/device has a single canonical entry
 const subscriptionRegistry = new Map<string, StoredPushEntry>();
@@ -115,7 +121,56 @@ export function getVapidPublicKey(): string {
   return vapidKeys.publicKey;
 }
 
+const MAX_SUBSCRIPTIONS_GLOBAL = 5_000;
+const MAX_SUBSCRIPTIONS_PER_UID = 10;
+const MAX_COOLDOWN_ENTRIES = 5_000;
+const MAX_TRIGGERED_ALERTS = 5_000;
+
+function prunePushMemoryMaps(): void {
+  const now = Date.now();
+  if (alertCooldowns.size > MAX_COOLDOWN_ENTRIES) {
+    for (const [k, ts] of alertCooldowns.entries()) {
+      if (now - ts > 2 * 60 * 60_000) alertCooldowns.delete(k);
+    }
+    while (alertCooldowns.size > MAX_COOLDOWN_ENTRIES) {
+      const oldest = alertCooldowns.keys().next().value;
+      if (!oldest) break;
+      alertCooldowns.delete(oldest);
+    }
+  }
+  if (triggeredPriceAlerts.size > MAX_TRIGGERED_ALERTS) {
+    for (const [k, v] of triggeredPriceAlerts.entries()) {
+      if (now - v.triggeredAtMs > 24 * 60 * 60_000) triggeredPriceAlerts.delete(k);
+    }
+    while (triggeredPriceAlerts.size > MAX_TRIGGERED_ALERTS) {
+      const oldest = triggeredPriceAlerts.keys().next().value;
+      if (!oldest) break;
+      triggeredPriceAlerts.delete(oldest);
+    }
+  }
+}
+
 export function registerPushSubscription(entry: Omit<StoredPushEntry, 'updatedAt'>): void {
+  const existing = subscriptionRegistry.get(entry.endpoint);
+  if (existing && existing.uid !== entry.uid) {
+    // Предотвращаем перехват чужой push-подписки по известному endpoint
+    return;
+  }
+
+  if (!existing) {
+    const userSubs = Array.from(subscriptionRegistry.values())
+      .filter((s) => s.uid === entry.uid)
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+    while (userSubs.length >= MAX_SUBSCRIPTIONS_PER_UID) {
+      const oldest = userSubs.shift();
+      if (oldest) subscriptionRegistry.delete(oldest.endpoint);
+    }
+    if (subscriptionRegistry.size >= MAX_SUBSCRIPTIONS_GLOBAL) {
+      const firstKey = subscriptionRegistry.keys().next().value;
+      if (firstKey) subscriptionRegistry.delete(firstKey);
+    }
+  }
+
   subscriptionRegistry.set(entry.endpoint, {
     ...entry,
     updatedAt: Date.now(),
@@ -161,7 +216,9 @@ export async function dispatchPushToUser(
       return item.notifyPortfolioPnl;
     }
     if (payload.category === 'news') return item.notifyNews;
-    if (payload.category === 'auth_login') return item.notifyAuthLogins;
+    if (payload.category === 'auth_login' || payload.category === 'exchange_sync_critical') {
+      return item.notifyAuthLogins;
+    }
     if (payload.category === 'strategy_change') return item.notifyStrategyChanges;
     if (payload.category === 'signal_limit') return item.notifySignalLimits;
     return true;
@@ -438,6 +495,87 @@ export async function notifyPortfolioTargetReached(
   return result;
 }
 
+const EXCHANGE_SYNC_CRITICAL_COOLDOWN_MS = 30 * 60_000;
+
+function sanitizeSyncErrorSnippet(rawMessage: string): string {
+  return rawMessage
+    .replace(/[\r\n\t]+/g, ' ')
+    // Удаляем потенциальные API-ключи, токены и длинные hex/base64 строки перед отправкой в Push
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/g, '[скрыто]')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
+export function buildCriticalSyncPushMessage(params: {
+  keyId: string;
+  exchange: 'binance' | 'bybit' | 'okx';
+  label: string;
+  category: 'auth' | 'exchange_api' | 'unknown';
+  errorMessage: string;
+  testnet?: boolean;
+}): PushNotificationPayload {
+  const exchangeCode = params.exchange.toUpperCase();
+  const cleanKeyId = params.keyId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'key';
+  const safeLabel = params.label.replace(/[\r\n]+/g, ' ').trim().slice(0, 64) || exchangeCode;
+  const netTag = params.testnet ? ' (Testnet)' : '';
+  const snippet = sanitizeSyncErrorSnippet(params.errorMessage) || 'Проверьте статус подключения в терминале.';
+
+  if (params.category === 'auth') {
+    return {
+      title: `Vernier · API-ключ ${exchangeCode} требует обновления`,
+      body: `Ключ «${safeLabel}»${netTag}: ${snippet} Перейдите в Центр безопасности, чтобы обновить или перевыпустить ключ.`,
+      tag: `exchange-sync-critical-${cleanKeyId}`,
+      url: '/?tab=security&section=exchanges',
+      impact: 'HIGH',
+      category: 'exchange_sync_critical',
+    };
+  }
+
+  return {
+    title: `Vernier · Критический сбой синхронизации ${exchangeCode}`,
+    body: `Подключение «${safeLabel}»${netTag}: ${snippet} Откройте журнал логов для быстрого исправления.`,
+    tag: `exchange-sync-critical-${cleanKeyId}`,
+    url: '/?tab=security&section=audit&sub=log',
+    impact: 'HIGH',
+    category: 'exchange_sync_critical',
+  };
+}
+
+export async function notifyCriticalExchangeSyncError(
+  uid: string,
+  params: {
+    keyId: string;
+    exchange: 'binance' | 'bybit' | 'okx';
+    label: string;
+    category: 'auth' | 'exchange_api' | 'unknown';
+    errorMessage: string;
+    testnet?: boolean;
+  }
+): Promise<{ sent: number; failed: number; skipped?: boolean; reason?: 'no_subscriptions' | 'cooldown' }> {
+  const userSubs = Array.from(subscriptionRegistry.values()).filter(
+    (s) => s.uid === uid && s.enabled && s.notifyAuthLogins
+  );
+  if (userSubs.length === 0) {
+    return { sent: 0, failed: 0, skipped: true, reason: 'no_subscriptions' };
+  }
+
+  const cleanKeyId = params.keyId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'key';
+  const cooldownKey = `sync-critical:${uid}:${cleanKeyId}:${params.category}`;
+  const lastAlert = alertCooldowns.get(cooldownKey) ?? 0;
+  if (Date.now() - lastAlert < EXCHANGE_SYNC_CRITICAL_COOLDOWN_MS) {
+    return { sent: 0, failed: 0, skipped: true, reason: 'cooldown' };
+  }
+
+  const payload = buildCriticalSyncPushMessage(params);
+  const result = await dispatchPushToUser(uid, payload);
+
+  if (result.sent > 0) {
+    alertCooldowns.set(cooldownKey, Date.now());
+  }
+  return result;
+}
+
 export function syncUserPriceAlerts(
   uid: string,
   alerts: ServerPriceAlert[]
@@ -581,6 +719,7 @@ export function startMarketAlertMonitor(): void {
   if (monitorStarted) return;
   monitorStarted = true;
   setInterval(() => {
+    prunePushMemoryMaps();
     if (subscriptionRegistry.size === 0) return;
     void scanMarketAndNotify().catch(() => {
       // Ignore transient poll errors
