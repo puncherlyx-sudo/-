@@ -248,6 +248,47 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "portfolioId", "portfolioLabel", "targetBalanceUsdt", "baselineBalanceUsdt", "targetPnlPct", "active", "triggeredAt", "triggeredBalanceUsdt", "createdAt", "updatedAt"]
+    },
+    "SyncErrorLogRecord": {
+      "title": "SyncErrorLogRecord",
+      "description": "Cloud-synced exchange synchronization log entry (sanitized, no secrets) persisted across devices for active PRO and MAX subscribers.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "keyId": { "type": "string", "maxLength": 80 },
+        "exchange": { "type": "string", "enum": ["binance", "bybit", "okx"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "testnet": { "type": "boolean" },
+        "severity": { "type": "string", "enum": ["success", "warning", "critical"] },
+        "category": { "type": "string", "enum": ["success", "rate_limit", "auth", "network", "exchange_api", "unknown"] },
+        "errorMessage": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "occurredAt": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "occurredAtMs": { "type": "integer", "minimum": 1 },
+        "source": { "type": "string", "enum": ["background", "manual"] },
+        "balanceUsdt": { "type": "number", "minimum": 0 },
+        "assetsCount": { "type": "integer", "minimum": 0 },
+        "httpStatus": { "type": "integer", "minimum": 0, "maximum": 599 },
+        "endpoint": { "type": "string", "maxLength": 240 },
+        "rawApiResponse": { "type": "string", "maxLength": 1600 },
+        "stackTrace": { "type": "string", "maxLength": 1600 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "keyId", "exchange", "label", "testnet", "severity", "category", "errorMessage", "occurredAt", "occurredAtMs", "source", "balanceUsdt", "assetsCount", "httpStatus", "endpoint", "rawApiResponse", "stackTrace", "createdAt"]
+    },
+    "SecurityLogRecord": {
+      "title": "SecurityLogRecord",
+      "description": "Server-authored immutable security event log (2FA changes, session revocations, step-up events) written strictly via Firebase Admin SDK.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "event": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "details": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+        "createdAtMs": { "type": "integer" }
+      },
+      "required": ["id", "userId", "event", "details", "severity", "createdAtMs"]
     }
   },
   "firestore": {
@@ -298,6 +339,14 @@
     "/users/{userId}/portfolioTargets/{targetId}": {
       "schema": { "$ref": "#/entities/PortfolioTargetRecord" },
       "description": "Per-portfolio Target PnL / target balance goals for push alert notifications."
+    },
+    "/users/{userId}/syncErrorLogs/{logId}": {
+      "schema": { "$ref": "#/entities/SyncErrorLogRecord" },
+      "description": "Cross-device cloud-synced exchange sync logs gated to active PRO and MAX subscribers."
+    },
+    "/users/{userId}/securityLog/{logId}": {
+      "schema": { "$ref": "#/entities/SecurityLogRecord" },
+      "description": "Server-only immutable security audit log for 2FA and session revocation events."
     }
   }
 }

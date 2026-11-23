@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
-import { ChevronDown, Compass, Search, X } from 'lucide-react';
-import { AnimatePresence, motion } from 'motion/react';
+import { Compass, Search, X } from 'lucide-react';
+import { motion } from 'motion/react';
+import { Accordion, type AccordionEntry } from './Accordion';
 
 type FaqCategory = 'all' | '2fa' | 'api' | 'credits' | 'pwa';
 
@@ -76,6 +77,24 @@ const FAQ_ITEMS: FaqItem[] = [
     answer:
       'Да. Все графики, AI-анализ, бэктесты, сканер и лента сигналов работают без API-ключей. На карточке любого сигнала и на графике доступна кнопка «План» / «Копировать», которая копирует точные уровни Entry, Stop-Loss, TP1 и TP2 для переноса в терминал вашей биржи.',
     meta: 'Универсально · Копирование плана в 1 клик',
+  },
+  {
+    id: 'api-sync-errors-logs',
+    category: 'api',
+    categoryLabel: 'API бирж и синхронизация',
+    question: 'Как диагностировать и устранить ошибки синхронизации бирж (-2015, 429, таймаут)?',
+    answer:
+      'Откройте «Логи активности → Логи» или «График» в Центре безопасности. Для известных ошибок (например, истечение API-ключа -2015 / 33004 / 50111) доступна кнопка «Устранить», которая открывает форму редактирования ключа. Вы также можете скачать PDF-отчёт аномалий или отправить детальный отчёт в поддержку с автоматической маскировкой секретов.',
+    meta: 'Кнопка «Устранить» · PDF и отчёт в поддержку',
+  },
+  {
+    id: 'api-sync-cloud-cleanup',
+    category: 'api',
+    categoryLabel: 'API бирж и синхронизация',
+    question: 'Как работает авто-очистка логов старше 30 дней и облачная синхронизация в PRO?',
+    answer:
+      'Переключатель авто-очистки в журнале синхронизации автоматически удаляет записи старше 30 дней для экономии localStorage. На тарифах PRO и MAX история ошибок синхронизации дополнительно сохраняется в вашей защищённой коллекции Firestore, чтобы быть доступной на всех устройствах.',
+    meta: 'Авто-очистка 30 дн. · PRO Облако Firestore',
   },
   {
     id: 'credits-weekly-quota',
@@ -163,9 +182,17 @@ export const SecurityFaqSection: React.FC<SecurityFaqSectionProps> = ({ onStartT
     });
   }, [activeCategory, searchQuery]);
 
-  const handleToggle = (id: string) => {
-    setOpenId((prev) => (prev === id ? null : id));
-  };
+  const accordionItems: AccordionEntry[] = useMemo(
+    () =>
+      filteredItems.map((item) => ({
+        id: item.id,
+        title: item.question,
+        badge: item.categoryLabel,
+        meta: item.meta,
+        content: <p>{item.answer}</p>,
+      })),
+    [filteredItems]
+  );
 
   return (
     <motion.section
@@ -278,63 +305,11 @@ export const SecurityFaqSection: React.FC<SecurityFaqSectionProps> = ({ onStartT
           </button>
         </div>
       ) : (
-        <div className="divide-y divide-white/8 border-t border-white/8">
-          {filteredItems.map((item, idx) => {
-            const isOpen = openId === item.id;
-            const panelId = `faq-panel-${item.id}`;
-            return (
-              <div key={item.id} className="py-1">
-                <button
-                  type="button"
-                  aria-expanded={isOpen}
-                  aria-controls={panelId}
-                  onClick={() => handleToggle(item.id)}
-                  className="w-full min-h-[48px] py-3 text-left flex items-start justify-between gap-4 group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-lg"
-                >
-                  <div className="space-y-1">
-                    <div className="text-[11px] text-slate-400 tabular-nums">
-                      <span className="font-mono text-emerald-400">
-                        {String(idx + 1).padStart(2, '0')}.
-                      </span>{' '}
-                      <span>{item.categoryLabel}</span>
-                      <span aria-hidden="true" className="mx-1.5 text-slate-600">
-                        ·
-                      </span>
-                      <span className="text-slate-500">{item.meta}</span>
-                    </div>
-                    <div
-                      className={`text-sm font-medium transition-colors ${
-                        isOpen ? 'text-white' : 'text-slate-200 group-hover:text-white'
-                      }`}
-                    >
-                      {item.question}
-                    </div>
-                  </div>
-                  <ChevronDown
-                    className={`w-4 h-4 text-slate-400 shrink-0 mt-1 transition-transform duration-200 ${
-                      isOpen ? 'rotate-180 text-emerald-400' : 'group-hover:text-slate-200'
-                    }`}
-                  />
-                </button>
-
-                <AnimatePresence initial={false}>
-                  {isOpen && (
-                    <motion.div
-                      id={panelId}
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -4 }}
-                      transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-                      className="pb-4 pr-6 text-xs sm:text-sm text-slate-300 leading-relaxed"
-                    >
-                      {item.answer}
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-            );
-          })}
-        </div>
+        <Accordion
+          items={accordionItems}
+          openIds={openId ? [openId] : []}
+          onToggle={(id, nextOpen) => setOpenId(nextOpen ? id : null)}
+        />
       )}
     </motion.section>
   );

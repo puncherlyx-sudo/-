@@ -25,36 +25,102 @@ export const WORKSPACE_SHARED_SPRING = {
 };
 
 /**
- * Native mobile-app directional Page Transition with spring physics + subtle blur.
- * Animates only compositor-friendly transform, opacity, and filter properties.
+ * Premium directional Page Transition (fade-out / fade-in + X-parallax glide + glassy blur).
+ * Uses a gentle enter delay after the exiting tab clears so cross-tab transitions feel silky-smooth.
  * Omits ancestor scale so inner layoutId Shared Element Transitions project without distortion.
  */
 export const tabSlideBlurVariants: Variants = {
   initial: (direction: number) => ({
     opacity: 0,
-    x: direction * 42,
-    filter: 'blur(3px)',
+    x: direction * 34,
+    y: 4,
+    filter: 'blur(7px)',
   }),
   animate: {
     opacity: 1,
     x: 0,
+    y: 0,
     filter: 'blur(0px)',
     transition: {
-      x: NATIVE_SPRING,
-      opacity: { duration: 0.2, ease: TERMINAL_EASE },
-      filter: { duration: 0.22, ease: TERMINAL_EASE },
+      opacity: { duration: 0.28, delay: 0.08, ease: TERMINAL_EASE },
+      x: { duration: 0.34, delay: 0.08, ease: TERMINAL_EASE },
+      y: { duration: 0.3, delay: 0.08, ease: TERMINAL_EASE },
+      filter: { duration: 0.34, delay: 0.08, ease: TERMINAL_EASE },
     },
   },
   exit: (direction: number) => ({
     opacity: 0,
-    x: direction * -32,
-    filter: 'blur(3px)',
+    x: direction * -22,
+    y: -3,
+    filter: 'blur(6px)',
     transition: {
-      x: { duration: 0.22, ease: [0.4, 0, 1, 1] },
-      opacity: { duration: 0.16, ease: [0.4, 0, 1, 1] },
-      filter: { duration: 0.16, ease: [0.4, 0, 1, 1] },
+      opacity: { duration: 0.18, ease: [0.4, 0, 1, 1] },
+      x: { duration: 0.2, ease: [0.4, 0, 1, 1] },
+      y: { duration: 0.18, ease: [0.4, 0, 1, 1] },
+      filter: { duration: 0.18, ease: [0.4, 0, 1, 1] },
     },
   }),
+};
+
+/**
+ * Secondary foreground parallax plane: glides along the X axis with slightly longer inertia
+ * in parallel with the outer blur dissipation to create authentic layered depth.
+ */
+export const tabParallaxContentVariants: Variants = {
+  initial: (direction: number) => ({
+    x: direction * 18,
+  }),
+  animate: {
+    x: 0,
+    transition: {
+      x: { duration: 0.4, delay: 0.09, ease: TERMINAL_EASE },
+    },
+  },
+  exit: (direction: number) => ({
+    x: direction * -10,
+    transition: {
+      x: { duration: 0.17, ease: [0.4, 0, 1, 1] },
+    },
+  }),
+};
+
+/**
+ * Subtle ambient depth sheen drifting at a wider parallax offset while the tab enters and exits.
+ */
+export const tabParallaxDepthSheenVariants: Variants = {
+  initial: (direction: number) => ({
+    opacity: 0.42,
+    x: direction * 76,
+  }),
+  animate: {
+    opacity: 0,
+    x: 0,
+    transition: {
+      x: { duration: 0.44, delay: 0.06, ease: TERMINAL_EASE },
+      opacity: { duration: 0.36, delay: 0.1, ease: TERMINAL_EASE },
+    },
+  },
+  exit: (direction: number) => ({
+    opacity: 0.22,
+    x: direction * -54,
+    transition: {
+      x: { duration: 0.18, ease: [0.4, 0, 1, 1] },
+      opacity: { duration: 0.18, ease: [0.4, 0, 1, 1] },
+    },
+  }),
+};
+
+/** Reduced-motion safe fade-only variant for top-level tab switching. */
+export const tabFadeOnlyVariants: Variants = {
+  initial: { opacity: 0 },
+  animate: {
+    opacity: 1,
+    transition: { duration: 0.15, ease: TERMINAL_EASE },
+  },
+  exit: {
+    opacity: 0,
+    transition: { duration: 0.1, ease: [0.4, 0, 1, 1] },
+  },
 };
 
 const staggerDeckVariants: Variants = {
@@ -206,19 +272,15 @@ export const SubSectionFrame: React.FC<SubSectionFrameProps> = ({
   children,
   className = '',
 }) => (
-  <AnimatePresence mode="wait">
+  <AnimatePresence mode="wait" initial={false}>
     <motion.div
       key={sectionKey}
-      layout="position"
-      initial={{ opacity: 0, x: 14, scale: 0.992, filter: 'blur(3px)' }}
-      animate={{ opacity: 1, x: 0, scale: 1, filter: 'blur(0px)' }}
-      exit={{ opacity: 0, x: -10, scale: 0.994, filter: 'blur(2px)' }}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
       transition={{
-        x: NATIVE_SPRING,
-        scale: NATIVE_SPRING,
-        layout: NATIVE_SPRING,
         opacity: { duration: 0.16, ease: TERMINAL_EASE },
-        filter: { duration: 0.16, ease: TERMINAL_EASE },
+        y: { duration: 0.18, ease: TERMINAL_EASE },
       }}
       className={className}
     >

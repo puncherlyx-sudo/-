@@ -1,4 +1,3 @@
-import crypto from 'crypto';
 import { serverLogger } from './logger.ts';
 import fs from 'fs';
 import path from 'path';
@@ -6,13 +5,8 @@ import { applicationDefault, cert, getApps, initializeApp, type App } from 'fire
 import { FieldValue, getFirestore, type Firestore } from 'firebase-admin/firestore';
 
 /**
- * Оплата PRO через NOWPayments (криптовалюта), счёт-инвойс + подписанные IPN-уведомления.
- *
- * Принципы безопасности:
- *  - Тариф PRO выдаёт ТОЛЬКО сервер, после проверки подписи IPN (HMAC-SHA512, секрет IPN).
- *  - Сумма и валюта из уведомления сверяются с заказом, сохранённым на сервере.
- *  - Повторное уведомление не продлевает подписку второй раз (идемпотентность).
- *  - Ключи API/IPN и сервисный аккаунт хранятся только в переменных окружения сервера.
+ * Серверный каталог тарифов PRO / MAX, расчёт переходов между планами
+ * и фоновый мониторинг истечения оплаченных подписок.
  */
 
 export type BillingPeriod = 'month' | 'year';
@@ -21,8 +15,6 @@ export type MaxMultiplier = 10 | 20;
 
 const PERIOD_DAYS: Record<BillingPeriod, number> = { month: 30, year: 365 };
 const DAY_MS = 24 * 60 * 60 * 1000;
-const ORDER_ID_PATTERN = /^aq-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const NOWPAYMENTS_INVOICE_URL = 'https://api.nowpayments.io/v1/invoice';
 
 function readPrice(envName: string, fallback: number): number {
   const value = Number(process.env[envName]);
@@ -66,20 +58,7 @@ export function getTieredPlanPrices(): Record<
   };
 }
 
-function getAppUrl(): string {
-  return (process.env.APP_URL || '').replace(/\/+$/, '');
-}
-
-export function isBillingConfigured(): boolean {
-  return Boolean(
-    process.env.NOWPAYMENTS_API_KEY &&
-      process.env.NOWPAYMENTS_IPN_SECRET &&
-      /^https:\/\//.test(getAppUrl()) &&
-      getDb(),
-  );
-}
-
-// ---------- Firebase Admin (запись тарифа в обход клиентских правил) ----------
+// ---------- Firebase Admin (проверка и истечение тарифа на сервере) ----------
 
 let cachedDb: Firestore | null | undefined;
 
@@ -115,202 +94,86 @@ function getDb(): Firestore | null {
   return cachedDb;
 }
 
-// ---------- Создание счёта ----------
+// ---------- Расчёт срока при продлении или смене тарифа (Audit H1: без сгорания остатка дней) ----------
 
-export async function createCheckout(
-  uid: string,
-  period: BillingPeriod,
-  tier: SubscriptionTier = 'pro',
-  maxMultiplier: MaxMultiplier = 10,
-): Promise<{ invoiceUrl: string; orderId: string }> {
-  const db = getDb();
-  if (!isBillingConfigured() || !db) {
-    throw new Error('Оплата ещё не настроена владельцем приложения.');
-  }
-  const safeTier: SubscriptionTier = tier === 'max' ? 'max' : 'pro';
-  const safeMultiplier: MaxMultiplier = maxMultiplier === 20 ? 20 : 10;
-
-  // Защита от спама незавершёнными счетами: максимум 3 pending-счёта за 24 часа на пользователя
-  const dayAgoMs = Date.now() - DAY_MS;
-  const recentPendingSnap = await db
-    .collection('payments')
-    .where('uid', '==', uid)
-    .where('status', '==', 'pending')
-    .limit(10)
-    .get();
-  const pendingLast24h = recentPendingSnap.docs.filter((doc) => {
-    const d = doc.data() as { createdAtMs?: unknown; createdAt?: { toMillis?: () => number } };
-    const ts =
-      typeof d.createdAtMs === 'number'
-        ? d.createdAtMs
-        : typeof d.createdAt?.toMillis === 'function'
-          ? d.createdAt.toMillis()
-          : Date.now();
-    return ts >= dayAgoMs;
-  }).length;
-  if (pendingLast24h >= 3) {
-    throw new Error('Превышен лимит незавершённых счетов (максимум 3 за 24 часа). Оплатите созданный счёт или повторите позже.');
-  }
-
-  const plan =
-    safeTier === 'max'
-      ? getMaxMultiplierPlans()[safeMultiplier][period]
-      : getTieredPlanPrices().pro[period];
-  const orderId = `aq-${crypto.randomUUID()}`;
-  const appUrl = getAppUrl();
-
-  await db.collection('payments').doc(orderId).set({
-    uid,
-    tier: safeTier,
-    ...(safeTier === 'max' ? { maxMultiplier: safeMultiplier } : {}),
-    period,
-    priceUsd: plan.priceUsd,
-    credits: plan.credits,
-    status: 'pending',
-    createdAtMs: Date.now(),
-    createdAt: FieldValue.serverTimestamp(),
-  });
-
-  const orderLabel =
-    safeTier === 'max'
-      ? `Vernier MAX ×${safeMultiplier} (${plan.credits} кр.)`
-      : 'Vernier PRO (100 кр.)';
-
-  const res = await fetch(NOWPAYMENTS_INVOICE_URL, {
-    method: 'POST',
-    headers: {
-      'x-api-key': process.env.NOWPAYMENTS_API_KEY as string,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      price_amount: plan.priceUsd,
-      price_currency: 'usd',
-      order_id: orderId,
-      order_description: `${orderLabel} — ${period === 'year' ? '1 год' : '1 месяц'}`,
-      ipn_callback_url: `${appUrl}/api/billing/ipn`,
-      success_url: `${appUrl}/?payment=success`,
-      cancel_url: `${appUrl}/?payment=cancel`,
-    }),
-    signal: AbortSignal.timeout(15_000),
-  });
-
-  const data = (await res.json().catch(() => ({}))) as { invoice_url?: unknown; message?: unknown };
-  const invoiceUrl = typeof data.invoice_url === 'string' ? data.invoice_url : '';
-  if (!res.ok || !/^https:\/\/([a-z0-9-]+\.)?nowpayments\.io\//i.test(invoiceUrl)) {
-    await db.collection('payments').doc(orderId).update({ status: 'failed_to_create' });
-    throw new Error('Платёжный сервис не создал счёт. Попробуйте позже.');
-  }
-  return { invoiceUrl, orderId };
+export interface PlanTransitionInput {
+  currentPlan: 'free' | 'pro' | 'max';
+  currentMultiplier: MaxMultiplier;
+  currentUntilMs: number;
+  targetTier: SubscriptionTier;
+  targetMultiplier: MaxMultiplier;
+  targetPeriod: BillingPeriod;
+  nowMs?: number;
 }
 
-// ---------- Проверка подписи IPN ----------
-
-function sortObjectDeep(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortObjectDeep);
-  if (value && typeof value === 'object') {
-    return Object.keys(value as Record<string, unknown>)
-      .sort()
-      .reduce<Record<string, unknown>>((acc, key) => {
-        acc[key] = sortObjectDeep((value as Record<string, unknown>)[key]);
-        return acc;
-      }, {});
-  }
-  return value;
+export interface PlanTransitionResult {
+  proUntil: number;
+  isSamePlan: boolean;
+  proratedCreditDays: number;
+  grantedPeriodDays: number;
+  creditsGrant: number;
+  nextResetAtIso: string;
 }
 
-export function verifyIpnSignature(payload: unknown, signature: string | undefined): boolean {
-  const secret = process.env.NOWPAYMENTS_IPN_SECRET;
-  if (!secret || typeof signature !== 'string' || !/^[0-9a-f]{128}$/i.test(signature)) return false;
-  const expected = crypto
-    .createHmac('sha512', secret)
-    .update(JSON.stringify(sortObjectDeep(payload)))
-    .digest();
-  const received = Buffer.from(signature, 'hex');
-  return received.length === expected.length && crypto.timingSafeEqual(received, expected);
+function getDailyPlanValueUsd(tier: SubscriptionTier, mult: MaxMultiplier): number {
+  if (tier === 'max') {
+    const monthly = getMaxMultiplierPlans()[mult].month;
+    return monthly.priceUsd / monthly.days;
+  }
+  const monthly = getTieredPlanPrices().pro.month;
+  return monthly.priceUsd / monthly.days;
 }
 
-// ---------- Обработка уведомления об оплате ----------
+/**
+ * Честный расчёт срока подписки:
+ * - Продление того же тарифа (и того же множителя MAX): суммирует срок от max(now, currentUntil).
+ * - Переход между тарифами (PRO ↔ MAX×10 ↔ MAX×20) при активной подписке: остаток оплаченных дней
+ *   НЕ сгорает, а пропорционально конвертируется по соотношению суточной стоимости тарифов
+ *   в эквивалентные дни нового тарифа (cap: 730 дн.).
+ */
+export function computeSubscriptionTransition(input: PlanTransitionInput): PlanTransitionResult {
+  const now = input.nowMs ?? Date.now();
+  const grantedPeriodDays = PERIOD_DAYS[input.targetPeriod];
+  const creditsGrant =
+    input.targetTier === 'max' ? (input.targetMultiplier === 20 ? 2000 : 1000) : 100;
 
-export async function processIpn(payload: Record<string, unknown>): Promise<void> {
-  const db = getDb();
-  if (!db) {
-    serverLogger.error('billing', 'CRITICAL: IPN получен, но Firebase Admin SDK не настроен — возвращаем 500 для ретрая.');
-    throw new Error('Firebase Admin SDK не настроен — обработка IPN невозможна.');
-  }
-  const orderId = typeof payload.order_id === 'string' ? payload.order_id : '';
-  const status = typeof payload.payment_status === 'string' ? payload.payment_status : '';
-  if (!ORDER_ID_PATTERN.test(orderId) || !status) return;
+  const isSamePlan =
+    input.currentPlan === input.targetTier &&
+    (input.targetTier !== 'max' || input.currentMultiplier === input.targetMultiplier);
 
-  const orderRef = db.collection('payments').doc(orderId);
-
-  await db.runTransaction(async (tx) => {
-    const orderSnap = await tx.get(orderRef);
-    if (!orderSnap.exists) return;
-    const order = orderSnap.data() as {
-      uid: string;
-      tier?: SubscriptionTier;
-      maxMultiplier?: MaxMultiplier;
-      period: BillingPeriod;
-      priceUsd: number;
-      status: string;
-    };
-    if (order.status === 'paid') return; // идемпотентность
-
-    if (status !== 'finished') {
-      tx.update(orderRef, { status: `ipn_${status}`.slice(0, 40), updatedAt: FieldValue.serverTimestamp() });
-      return;
-    }
-
-    const paidOk =
-      String(payload.price_currency || '').toLowerCase() === 'usd' &&
-      Number(payload.price_amount) >= order.priceUsd &&
-      (!Number.isFinite(Number(payload.pay_amount)) ||
-        !Number.isFinite(Number(payload.actually_paid)) ||
-        Number(payload.actually_paid) >= Number(payload.pay_amount));
-    if (!paidOk) {
-      tx.update(orderRef, { status: 'amount_mismatch', updatedAt: FieldValue.serverTimestamp() });
-      return;
-    }
-
-    const userRef = db.collection('users').doc(order.uid);
-    const userSnap = await tx.get(userRef);
-    if (!userSnap.exists) {
-      tx.update(orderRef, { status: 'user_missing', updatedAt: FieldValue.serverTimestamp() });
-      return;
-    }
-    const now = Date.now();
-    const userData = (userSnap.data() || {}) as {
-      plan?: unknown;
-      proUntil?: unknown;
-      maxMultiplier?: unknown;
-    };
-    const targetTier: SubscriptionTier = order.tier === 'max' ? 'max' : 'pro';
-    const multiplier: MaxMultiplier = order.maxMultiplier === 20 ? 20 : 10;
-    const creditsGrant = targetTier === 'max' ? (multiplier === 20 ? 2000 : 1000) : 100;
-    const currentUntil = Number(userData.proUntil) || 0;
-    const currentPlan = userData.plan === 'max' || userData.plan === 'pro' ? userData.plan : 'free';
-    const currentMult = Number(userData.maxMultiplier) === 20 ? 20 : 10;
-
-    // Правило смены тарифа:
-    // - Продление того же тарифа (и того же множителя MAX) суммирует срок от max(now, currentUntil).
-    // - Переход на другой тариф (напр. PRO -> MAX) начинает новый период от now, чтобы не суммировать дешёвый период в дорогой тариф.
-    const isSamePlan =
-      currentPlan === targetTier && (targetTier !== 'max' || currentMult === multiplier);
-    const base = isSamePlan ? Math.max(now, currentUntil) : now;
-    const proUntil = base + PERIOD_DAYS[order.period] * DAY_MS;
-    const nextResetAtIso = new Date(Math.min(proUntil, now + 30 * DAY_MS)).toISOString();
-
-    tx.update(userRef, {
-      plan: targetTier,
+  if (isSamePlan) {
+    const base = Math.max(now, input.currentUntilMs);
+    const proUntil = base + grantedPeriodDays * DAY_MS;
+    return {
       proUntil,
-      creditsRemaining: creditsGrant,
-      weeklyQuota: creditsGrant,
-      nextResetAt: nextResetAtIso,
-      ...(targetTier === 'max' ? { maxMultiplier: multiplier } : {}),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-    tx.update(orderRef, { status: 'paid', paidAt: FieldValue.serverTimestamp() });
-  });
+      isSamePlan: true,
+      proratedCreditDays: 0,
+      grantedPeriodDays,
+      creditsGrant,
+      nextResetAtIso: new Date(Math.min(proUntil, now + 30 * DAY_MS)).toISOString(),
+    };
+  }
+
+  let proratedCreditDays = 0;
+  if ((input.currentPlan === 'pro' || input.currentPlan === 'max') && input.currentUntilMs > now) {
+    const remainingDays = (input.currentUntilMs - now) / DAY_MS;
+    const oldDailyUsd = getDailyPlanValueUsd(input.currentPlan, input.currentMultiplier);
+    const newDailyUsd = getDailyPlanValueUsd(input.targetTier, input.targetMultiplier);
+    if (oldDailyUsd > 0 && newDailyUsd > 0) {
+      const converted = (remainingDays * oldDailyUsd) / newDailyUsd;
+      proratedCreditDays = Math.min(730, Math.max(0, Math.round(converted)));
+    }
+  }
+
+  const proUntil = now + (grantedPeriodDays + proratedCreditDays) * DAY_MS;
+  return {
+    proUntil,
+    isSamePlan: false,
+    proratedCreditDays,
+    grantedPeriodDays,
+    creditsGrant,
+    nextResetAtIso: new Date(Math.min(proUntil, now + 30 * DAY_MS)).toISOString(),
+  };
 }
 
 // ---------- Чтение тарифа пользователя ----------
@@ -365,7 +228,7 @@ export function startProExpiryMonitor(): void {
     if (process.env.NODE_ENV === 'production') {
       serverLogger.error(
         'billing',
-        'PRODUCTION WARNING: FIREBASE_SERVICE_ACCOUNT_JSON не задан — приём оплаты отключён (enabled: false) и мониторинг подписок не запущен.'
+        'PRODUCTION WARNING: FIREBASE_SERVICE_ACCOUNT_JSON не задан — фоновый мониторинг истёкших подписок не запущен.'
       );
     }
     return;

@@ -2,11 +2,30 @@ import {
   buildHourlyErrorIntensitySeries,
   detectKnownExchangeSyncError,
   sanitizeTechnicalString,
+  type ExchangeSyncErrorCategory,
   type ExchangeSyncErrorLogEntry,
   type HourlyErrorIntensityPoint,
   type HourlyErrorIntensitySeries,
 } from '../lib/exchangeSyncErrorLog';
 import type { ExchangeId } from '../types/domain';
+
+export type AnomalySeverityFilter = 'all' | 'critical' | 'warning';
+export type AnomalyCategoryFilter = 'all' | Exclude<ExchangeSyncErrorCategory, 'success'>;
+
+const CATEGORY_FILTER_LABELS: Record<AnomalyCategoryFilter, string> = {
+  all: 'Все типы',
+  auth: 'Ключ / права',
+  rate_limit: 'Лимит API',
+  network: 'Сеть / таймаут',
+  exchange_api: 'API биржи',
+  unknown: 'Прочие',
+};
+
+const SEVERITY_FILTER_LABELS: Record<AnomalySeverityFilter, string> = {
+  all: 'Все уровни',
+  critical: 'Критические',
+  warning: 'Предупреждения',
+};
 
 export interface AnomalyPeriodItem {
   hourStartMs: number;
@@ -41,6 +60,7 @@ export interface AnomalyPdfReportData {
   periodLabel: string;
   windowHours: 24 | 72;
   exchangeScopeLabel: string;
+  filterScopeLabel: string;
   series: HourlyErrorIntensitySeries;
   anomalies: AnomalyPeriodItem[];
   exchangeBreakdown: ExchangeBreakdownItem[];
@@ -52,18 +72,24 @@ export function buildAnomalyPdfReportData(
   options?: {
     windowHours?: 24 | 72;
     exchangeFilter?: 'all' | ExchangeId;
+    severityFilter?: AnomalySeverityFilter;
+    categoryFilter?: AnomalyCategoryFilter;
     nowMs?: number;
   }
 ): AnomalyPdfReportData {
   const windowHours: 24 | 72 = options?.windowHours === 72 ? 72 : 24;
   const exchangeFilter = options?.exchangeFilter ?? 'all';
+  const severityFilter: AnomalySeverityFilter = options?.severityFilter ?? 'all';
+  const categoryFilter: AnomalyCategoryFilter = options?.categoryFilter ?? 'all';
   const nowMs = options?.nowMs ?? Date.now();
   const HOUR_MS = 60 * 60 * 1000;
 
-  const scopedLogs =
-    exchangeFilter === 'all'
-      ? logs
-      : logs.filter((entry) => entry.exchange === exchangeFilter);
+  const scopedLogs = logs.filter((entry) => {
+    if (exchangeFilter !== 'all' && entry.exchange !== exchangeFilter) return false;
+    if (severityFilter !== 'all' && entry.severity !== severityFilter) return false;
+    if (categoryFilter !== 'all' && entry.category !== categoryFilter) return false;
+    return true;
+  });
 
   const series = buildHourlyErrorIntensitySeries(scopedLogs, { windowHours, nowMs });
 
@@ -140,12 +166,18 @@ export function buildAnomalyPdfReportData(
       };
     });
 
+  const activeFilters: string[] = [];
+  if (severityFilter !== 'all') activeFilters.push(SEVERITY_FILTER_LABELS[severityFilter]);
+  if (categoryFilter !== 'all') activeFilters.push(CATEGORY_FILTER_LABELS[categoryFilter]);
+  const filterScopeLabel = activeFilters.length > 0 ? activeFilters.join(' · ') : 'Все ошибки';
+
   return {
     generatedAtIso: new Date(nowMs).toISOString(),
     generatedAtLabel: formatDateTime(nowMs),
     periodLabel: `${formatDateTime(startMs)} — ${formatDateTime(nowMs)}`,
     windowHours,
     exchangeScopeLabel: exchangeFilter === 'all' ? 'Все биржи' : exchangeFilter.toUpperCase(),
+    filterScopeLabel,
     series,
     anomalies,
     exchangeBreakdown,
@@ -477,9 +509,13 @@ function renderAnomalyReportCanvas(data: AnomalyPdfReportData): HTMLCanvasElemen
   ctx.fillText('Сводка интенсивности ошибок API бирж', M, 60);
 
   ctx.fillStyle = '#CBD5E1';
-  ctx.font = '16px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  ctx.font = '15px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   ctx.fillText(
-    `Период: ${data.periodLabel} (${data.windowHours}ч)  ·  Охват: ${data.exchangeScopeLabel}`,
+    truncateText(
+      ctx,
+      `Период: ${data.periodLabel} (${data.windowHours}ч) · Охват: ${data.exchangeScopeLabel} · Фильтр: ${data.filterScopeLabel}`,
+      contentW - 240
+    ),
     M,
     112
   );
@@ -788,6 +824,8 @@ export function downloadAnomalyPdfReport(
   options?: {
     windowHours?: 24 | 72;
     exchangeFilter?: 'all' | ExchangeId;
+    severityFilter?: AnomalySeverityFilter;
+    categoryFilter?: AnomalyCategoryFilter;
     nowMs?: number;
   }
 ): { filename: string; report: AnomalyPdfReportData } {
@@ -811,7 +849,15 @@ export function downloadAnomalyPdfReport(
     options?.exchangeFilter && options.exchangeFilter !== 'all'
       ? `-${options.exchangeFilter}`
       : '';
-  const filename = `vernier-anomalies-${report.windowHours}h${scopeSlug}-${dateStamp}.pdf`;
+  const sevSlug =
+    options?.severityFilter && options.severityFilter !== 'all'
+      ? `-${options.severityFilter}`
+      : '';
+  const catSlug =
+    options?.categoryFilter && options.categoryFilter !== 'all'
+      ? `-${options.categoryFilter}`
+      : '';
+  const filename = `vernier-anomalies-${report.windowHours}h${scopeSlug}${sevSlug}${catSlug}-${dateStamp}.pdf`;
 
   const arrayBuffer = pdfBytes.buffer.slice(
     pdfBytes.byteOffset,

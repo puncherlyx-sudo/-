@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock,
+  Cloud,
   Copy,
   Crown,
   Download,
@@ -48,6 +49,7 @@ import type {
   PriceAlertCondition,
   PriceAlertRecord,
   SecurityAuditLog,
+  SupportTicketCategory,
   UserPrivateSecurity,
   UserProfile,
   UserSessionRecord,
@@ -60,7 +62,13 @@ import { StaggerDeck } from './MotionPrimitives';
 import { PriceAlertsPanel } from './PriceAlertsPanel';
 import { SecurityAuditActivityChart } from './SecurityAuditActivityChart';
 import { SecurityStrengthIndicator } from './SecurityStrengthIndicator';
-import { SyncErrorIntensityChart } from './SyncErrorIntensityChart';
+import { SecuritySyncFaqWidget } from './SecuritySyncFaqWidget';
+import {
+  SyncErrorIntensityChart,
+  type ChartCategoryFilter,
+  type ChartSeverityFilter,
+} from './SyncErrorIntensityChart';
+import { SyncErrorSupportModal } from './SyncErrorSupportModal';
 import {
   VirtualizedAuditLogList,
   VirtualizedExchangeSyncLogList,
@@ -174,8 +182,16 @@ interface SecurityCenterViewProps {
   backgroundSyncingKeyIds?: string[];
   exchangeSyncErrorLogs?: ExchangeSyncErrorLogEntry[];
   onClearExchangeSyncErrorLogs?: () => void;
+  userEmail?: string;
+  onCreateSupportTicket?: (params: {
+    contactEmail: string;
+    category: SupportTicketCategory;
+    subject: string;
+    message: string;
+  }) => Promise<string>;
   syncLogAutoCleanup30d?: boolean;
   onToggleSyncLogAutoCleanup30d?: (enabled: boolean) => { removedCount: number };
+  syncLogCloudStatus?: 'idle' | 'syncing' | 'synced' | 'locked';
   portfolioSource: PortfolioSourceMeta;
   onConnectExchange: (params: {
     exchange: ExchangeId;
@@ -259,8 +275,11 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   backgroundSyncingKeyIds,
   exchangeSyncErrorLogs = [],
   onClearExchangeSyncErrorLogs,
+  userEmail = '',
+  onCreateSupportTicket,
   syncLogAutoCleanup30d = true,
   onToggleSyncLogAutoCleanup30d,
+  syncLogCloudStatus = 'locked',
   portfolioSource,
   onConnectExchange,
   onSyncExchange,
@@ -291,8 +310,10 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const [sessionsSub, setSessionsSub] = useState<'map' | 'list'>('map');
   const [auditSub, setAuditSub] = useState<'chart' | 'log' | 'faq'>('chart');
   const [syncLogFilter, setSyncLogFilter] = useState<'all' | ExchangeSyncSeverity>('all');
+  const [syncCategoryFilter, setSyncCategoryFilter] = useState<ChartCategoryFilter>('all');
   const [syncExchangeFilter, setSyncExchangeFilter] = useState<'all' | ExchangeId>('all');
   const [editingExchangeKey, setEditingExchangeKey] = useState<ExchangeKeyRecord | null>(null);
+  const [supportReportOpen, setSupportReportOpen] = useState<boolean>(false);
   const [quickFixBusyId, setQuickFixBusyId] = useState<string | null>(null);
   const [quickFixNotice, setQuickFixNotice] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
   const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
@@ -309,6 +330,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
   const [localApiKey, setLocalApiKey] = useState('');
   const [localApiSecret, setLocalApiSecret] = useState('');
   const [localVaultPassphrase, setLocalVaultPassphrase] = useState('');
+  const [localKeyConsentAccepted, setLocalKeyConsentAccepted] = useState(false);
   const [localKeyDlpError, setLocalKeyDlpError] = useState<string | null>(null);
   const [localKeySavedNotice, setLocalKeySavedNotice] = useState<string | null>(null);
   const [deleteStepOpen, setDeleteStepOpen] = useState(false);
@@ -554,6 +576,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
     const criticalPct = total > 0 ? (critical / total) * 100 : 0;
     const filtered = groupedAll.filter((group) => {
       if (syncLogFilter !== 'all' && group.entry.severity !== syncLogFilter) return false;
+      if (syncCategoryFilter !== 'all' && group.entry.category !== syncCategoryFilter) return false;
       if (syncExchangeFilter !== 'all' && group.entry.exchange !== syncExchangeFilter) return false;
       return true;
     });
@@ -581,7 +604,14 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
       storageBytes,
       expiredOlderThan30d,
     };
-  }, [exchangeSyncErrorLogs, syncLogFilter, syncExchangeFilter]);
+  }, [exchangeSyncErrorLogs, syncLogFilter, syncCategoryFilter, syncExchangeFilter]);
+
+  const chartSeverityFilter: ChartSeverityFilter =
+    syncLogFilter === 'critical' || syncLogFilter === 'warning' ? syncLogFilter : 'all';
+
+  const handleChartSeverityChange = (next: ChartSeverityFilter) => {
+    setSyncLogFilter(next === 'all' ? 'all' : next);
+  };
 
   // Компактный расчёт Индекса защиты (0–100%) и первого невыполненного шага для Hero-карточки
   const securityHeroSummary = useMemo(() => {
@@ -1269,6 +1299,21 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
               </button>
             </div>
           </section>
+
+          {/* SECTION 5 — Интерактивный FAQ-виджет по безопасности и синхронизации (Accordion + поиск) */}
+          <SecuritySyncFaqWidget
+            onOpenFullFaq={() => {
+              setAuditSub('faq');
+              openInnerSection('audit');
+            }}
+            onOpenSupportReport={
+              onCreateSupportTicket
+                ? () => {
+                    setSupportReportOpen(true);
+                  }
+                : undefined
+            }
+          />
         </div>
       ) : (
         <div className="max-w-4xl mx-auto space-y-4">
@@ -1839,6 +1884,12 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       setLocalKeyDlpError('Заполните API Key и API Secret (только Read-Only).');
                       return;
                     }
+                    if (!localKeyConsentAccepted) {
+                      setLocalKeyDlpError(
+                        'Подтвердите добровольный ввод API-ключей, согласие с Политикой конфиденциальности и вашу личную ответственность.'
+                      );
+                      return;
+                    }
                     try {
                       const encryptedPayload = await encryptLocalSecret(
                         JSON.stringify({ apiKey: localApiKey.trim(), apiSecret: localApiSecret.trim() }),
@@ -1860,6 +1911,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       setLocalApiKey('');
                       setLocalApiSecret('');
                       setLocalVaultPassphrase('');
+                      setLocalKeyConsentAccepted(false);
                       setLocalKeySavedNotice(
                         'Ключ зашифрован PBKDF2 + AES-256-GCM и сохранён локально с меткой Read-Only.'
                       );
@@ -1960,9 +2012,54 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       className="w-full min-h-[38px] rounded-xl border border-white/10 bg-[#0B0F17] px-3 text-xs text-white"
                     />
                   </div>
+                  <label className="sm:col-span-2 flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 cursor-pointer text-[11px] text-slate-200 leading-relaxed">
+                    <input
+                      type="checkbox"
+                      checked={localKeyConsentAccepted}
+                      onChange={(e) => setLocalKeyConsentAccepted(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded accent-emerald-500 shrink-0"
+                    />
+                    <span>
+                      Я подтверждаю, что самостоятельно и добровольно ввожу Read-Only API-ключи (без права вывода средств Withdrawals), принимаю{' '}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onOpenLegalDoc?.('privacy');
+                        }}
+                        className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                      >
+                        Политику конфиденциальности
+                      </button>{' '}
+                      и{' '}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onOpenLegalDoc?.('terms');
+                        }}
+                        className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                      >
+                        Условия использования
+                      </button>
+                      , и осознаю полную личную ответственность за сохранность ключей и действия со счётом (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          onOpenLegalDoc?.('disclaimer');
+                        }}
+                        className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2"
+                      >
+                        Отказ от ответственности
+                      </button>
+                      ).
+                    </span>
+                  </label>
                   <button
                     type="submit"
-                    className="sm:col-span-2 min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors"
+                    disabled={!localKeyConsentAccepted}
+                    className="sm:col-span-2 min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-45 disabled:cursor-not-allowed text-white text-xs font-semibold transition-colors"
                   >
                     Зашифровать и сохранить локально (PBKDF2 + AES-GCM Read-Only)
                   </button>
@@ -2708,7 +2805,14 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
             ) : auditSub === 'chart' ? (
               <div className="space-y-4">
                 <SecurityAuditActivityChart auditLogs={auditLogs} />
-                <SyncErrorIntensityChart logs={exchangeSyncErrorLogs} />
+                <SyncErrorIntensityChart
+                  logs={exchangeSyncErrorLogs}
+                  exchangeFilter={syncExchangeFilter}
+                  severityFilter={chartSeverityFilter}
+                  onSeverityFilterChange={handleChartSeverityChange}
+                  categoryFilter={syncCategoryFilter}
+                  onCategoryFilterChange={setSyncCategoryFilter}
+                />
               </div>
             ) : (
               <div className="space-y-4">
@@ -2716,7 +2820,7 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                 <div className="rounded-2xl border border-white/8 bg-[#111827] card-surface-glow p-5 space-y-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
-                      <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                      <h2 className="text-base font-semibold text-white flex flex-wrap items-center gap-2">
                         {syncLogStats.critical > 0 ? (
                           <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
                         ) : syncLogStats.warning > 0 ? (
@@ -2727,22 +2831,60 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                           <Activity className="w-4 h-4 shrink-0 text-slate-400" />
                         )}
                         <span>Логи синхронизации бирж ({syncLogStats.total})</span>
+                        {syncLogCloudStatus === 'synced' || syncLogCloudStatus === 'syncing' ? (
+                          <span className="inline-flex items-center gap-1 rounded-md border border-emerald-500/35 bg-emerald-500/12 px-2 py-0.5 text-[10px] font-mono font-medium text-emerald-300">
+                            <Cloud className="w-3 h-3 shrink-0" />
+                            <span>
+                              {syncLogCloudStatus === 'syncing'
+                                ? 'PRO · Синхронизация…'
+                                : 'PRO · Облако Firestore'}
+                            </span>
+                          </span>
+                        ) : (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] font-mono text-slate-400"
+                            title="В подписке PRO/MAX логи ошибок автоматически синхронизируются между устройствами через Firestore"
+                          >
+                            <Cloud className="w-3 h-3 shrink-0 text-amber-400/80" />
+                            <span>Локально · Облако в PRO</span>
+                          </span>
+                        )}
                       </h2>
                       <p className="mt-0.5 text-xs text-slate-400">
                         Цветовая индикация событий: успешные обновления (мягкий зелёный), предупреждения API/сети (мягкий оранжевый) и критические сбои (мягкий красный).
                       </p>
                     </div>
 
-                    {syncLogStats.total > 0 && onClearExchangeSyncErrorLogs && (
-                      <button
-                        type="button"
-                        onClick={onClearExchangeSyncErrorLogs}
-                        className="min-h-[32px] px-2.5 rounded-lg border border-rose-500/25 bg-rose-500/10 hover:bg-rose-500/20 text-xs font-medium text-rose-300 inline-flex items-center gap-1.5 transition-colors"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Очистить</span>
-                      </button>
-                    )}
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {onCreateSupportTicket && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic(10);
+                            setSupportReportOpen(true);
+                          }}
+                          className="min-h-[32px] px-2.5 rounded-lg border border-cyan-500/35 bg-cyan-500/12 hover:bg-cyan-500/22 text-xs font-medium text-cyan-200 inline-flex items-center gap-1.5 transition-colors whitespace-nowrap"
+                        >
+                          <Send className="w-3.5 h-3.5 text-cyan-300 shrink-0" />
+                          <span>Отчёт в поддержку</span>
+                          {syncLogStats.issues > 0 && (
+                            <span className="font-mono text-[10px] tabular-nums px-1.5 py-0.5 rounded bg-cyan-400/20 text-cyan-100">
+                              {syncLogStats.issues}
+                            </span>
+                          )}
+                        </button>
+                      )}
+                      {syncLogStats.total > 0 && onClearExchangeSyncErrorLogs && (
+                        <button
+                          type="button"
+                          onClick={onClearExchangeSyncErrorLogs}
+                          className="min-h-[32px] px-2.5 rounded-lg border border-rose-500/25 bg-rose-500/10 hover:bg-rose-500/20 text-xs font-medium text-rose-300 inline-flex items-center gap-1.5 transition-colors"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Очистить</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {/* Настройка авто-очистки логов ошибок старше 30 дней для экономии localStorage */}
@@ -2915,6 +3057,10 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                       <SyncErrorIntensityChart
                         logs={exchangeSyncErrorLogs}
                         exchangeFilter={syncExchangeFilter}
+                        severityFilter={chartSeverityFilter}
+                        onSeverityFilterChange={handleChartSeverityChange}
+                        categoryFilter={syncCategoryFilter}
+                        onCategoryFilterChange={setSyncCategoryFilter}
                         compact
                       />
 
@@ -3056,6 +3202,15 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
                               Биржа: {syncExchangeFilter.toUpperCase()} ×
                             </button>
                           )}
+                          {syncCategoryFilter !== 'all' && (
+                            <button
+                              type="button"
+                              onClick={() => setSyncCategoryFilter('all')}
+                              className="min-h-[28px] px-2.5 rounded-lg border border-amber-400/45 bg-amber-500/15 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25 transition-colors"
+                            >
+                              Тип: {syncCategoryFilter} ×
+                            </button>
+                          )}
                         </div>
                         {syncLogStats.groupedTotal < syncLogStats.total && (
                           <span className="text-[11px] font-mono text-slate-400 tabular-nums">
@@ -3136,6 +3291,17 @@ export const SecurityCenterView: React.FC<SecurityCenterViewProps> = ({
         onClose={() => setEditingExchangeKey(null)}
         onSave={onUpdateExchange}
       />
+
+      {onCreateSupportTicket && (
+        <SyncErrorSupportModal
+          open={supportReportOpen}
+          onClose={() => setSupportReportOpen(false)}
+          logs={exchangeSyncErrorLogs}
+          exchangeFilter={syncExchangeFilter}
+          defaultEmail={userEmail || privateSecurity?.email || ''}
+          onCreateSupportTicket={onCreateSupportTicket}
+        />
+      )}
     </StaggerDeck>
   );
 };

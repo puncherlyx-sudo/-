@@ -41,6 +41,7 @@ import type {
 import { usePlan } from '../contexts/PlanContext';
 import { db } from '../lib/firebase';
 import { computeJournalStats, tradePnlPct, tradeRMultiple } from '../lib/journalStats';
+import { getPnlIntensityStyles } from '../lib/pnlIntensity';
 import type {
   AnalysisRecord,
   CandlePoint,
@@ -183,11 +184,12 @@ const PortfolioValueTooltip: React.FC<{
   const deltaUsd = pt.valueUsdt - startValue;
   const deltaPct = startValue > 0 ? (deltaUsd / startValue) * 100 : 0;
   const isUp = deltaUsd >= 0;
+  const deltaStyle = getPnlIntensityStyles(deltaPct);
   return (
     <div className="rounded-xl border border-white/15 bg-[#0E1420]/95 px-3 py-2 text-xs shadow-lg backdrop-blur-md space-y-1 font-mono tabular-nums">
       <div className="font-sans text-[11px] text-slate-400">{pt.fullDateLabel}</div>
       <div className="text-sm font-bold text-white">{formatUsd(pt.valueUsdt)}</div>
-      <div className={`text-[11px] ${isUp ? 'text-emerald-400' : 'text-rose-400'}`}>
+      <div className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[11px] font-semibold ${deltaStyle.badgeClass}`}>
         {formatSignedUsd(deltaUsd)} ({isUp ? '+' : ''}
         {deltaPct.toFixed(2)}%) за {periodLabel}
       </div>
@@ -619,7 +621,6 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
   }, [assetAmounts, candlesByKey, activeRangeMeta, chartRange, report.allocations, report.totalValue]);
 
   const isPositiveTotal = report.totalPnl >= 0;
-  const isPositiveDaily = dailyPnl.dailyPnlUsdt >= 0;
 
   return (
     <AnimatePresence>
@@ -691,55 +692,64 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                 </div>
               </div>
 
-              <div className="px-4 py-3">
-                <div className="text-[11px] text-slate-400">Дневной PnL (24ч)</div>
-                <div
-                  className={`mt-1 text-base sm:text-lg font-bold font-mono tabular-nums ${
-                    !dailyPnl.hasLive24hData || report.rows.length === 0
-                      ? 'text-slate-400'
-                      : isPositiveDaily
-                        ? 'text-emerald-400'
-                        : 'text-rose-400'
-                  }`}
-                >
-                  {dailyPnl.hasLive24hData && report.rows.length > 0
-                    ? maskValue(formatSignedUsd(dailyPnl.dailyPnlUsdt))
-                    : '—'}
-                </div>
-                <div className="text-[11px] font-mono tabular-nums text-slate-400">
-                  {dailyPnl.hasLive24hData && report.rows.length > 0
-                    ? `${dailyPnl.dailyPnlPct >= 0 ? '+' : ''}${dailyPnl.dailyPnlPct.toFixed(2)}% за 24ч`
-                    : 'Ожидание котировок'}
-                </div>
-              </div>
+              {(() => {
+                const dailyReady = dailyPnl.hasLive24hData && report.rows.length > 0;
+                const dailyStyle = getPnlIntensityStyles(dailyPnl.dailyPnlPct, {
+                  isNeutral: !dailyReady,
+                });
+                const totalStyle = getPnlIntensityStyles(report.totalPnlPct, {
+                  isNeutral: report.rows.length === 0,
+                });
+                return (
+                  <>
+                    <div className={`px-4 py-3 transition-colors duration-300 ${dailyStyle.cardTintClass}`}>
+                      <div className="text-[11px] text-slate-400">Дневной PnL (24ч)</div>
+                      <div
+                        className={`mt-1 text-base sm:text-lg font-bold font-mono tabular-nums transition-colors duration-300 ${
+                          !dailyReady ? 'text-slate-400' : dailyStyle.textClass
+                        }`}
+                      >
+                        {dailyReady ? maskValue(formatSignedUsd(dailyPnl.dailyPnlUsdt)) : '—'}
+                      </div>
+                      <div className="mt-0.5 text-[11px] font-mono tabular-nums">
+                        {dailyReady ? (
+                          <span
+                            className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[11px] font-semibold transition-all duration-300 ${dailyStyle.badgeClass}`}
+                          >
+                            {dailyPnl.dailyPnlPct >= 0 ? '+' : ''}
+                            {dailyPnl.dailyPnlPct.toFixed(2)}% за 24ч
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">Ожидание котировок</span>
+                        )}
+                      </div>
+                    </div>
 
-              <div className="px-4 py-3">
-                <div className="text-[11px] text-slate-400">Общий PnL</div>
-                <div
-                  className={`mt-1 text-base sm:text-lg font-bold font-mono tabular-nums ${
-                    report.rows.length === 0
-                      ? 'text-slate-400'
-                      : isPositiveTotal
-                        ? 'text-emerald-400'
-                        : 'text-rose-400'
-                  }`}
-                >
-                  {report.rows.length > 0 ? maskValue(formatSignedUsd(report.totalPnl)) : '—'}
-                </div>
-                <div
-                  className={`text-[11px] font-mono tabular-nums ${
-                    report.rows.length === 0
-                      ? 'text-slate-500'
-                      : isPositiveTotal
-                        ? 'text-emerald-400/80'
-                        : 'text-rose-400/80'
-                  }`}
-                >
-                  {report.rows.length > 0
-                    ? `${isPositiveTotal ? '+' : ''}${report.totalPnlPct.toFixed(2)}% от входа`
-                    : 'Нет позиций'}
-                </div>
-              </div>
+                    <div className={`px-4 py-3 transition-colors duration-300 ${totalStyle.cardTintClass}`}>
+                      <div className="text-[11px] text-slate-400">Общий PnL</div>
+                      <div
+                        className={`mt-1 text-base sm:text-lg font-bold font-mono tabular-nums transition-colors duration-300 ${
+                          report.rows.length === 0 ? 'text-slate-400' : totalStyle.textClass
+                        }`}
+                      >
+                        {report.rows.length > 0 ? maskValue(formatSignedUsd(report.totalPnl)) : '—'}
+                      </div>
+                      <div className="mt-0.5 text-[11px] font-mono tabular-nums">
+                        {report.rows.length > 0 ? (
+                          <span
+                            className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[11px] font-semibold transition-all duration-300 ${totalStyle.badgeClass}`}
+                          >
+                            {isPositiveTotal ? '+' : ''}
+                            {report.totalPnlPct.toFixed(2)}% от входа
+                          </span>
+                        ) : (
+                          <span className="text-slate-500">Нет позиций</span>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
 
               <div className="px-4 py-3">
                 <div className="text-[11px] text-slate-400">Винрейт дневника</div>
@@ -932,21 +942,22 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                             })}
                           </div>
 
-                          {chartSeries && (
-                            <div className="flex items-center gap-2.5 font-mono tabular-nums text-xs">
-                              <span className="hidden md:inline text-[11px] text-slate-400">
-                                Мин {formatUsd(chartSeries.minVal)} · Макс {formatUsd(chartSeries.maxVal)}
-                              </span>
-                              <span
-                                className={`font-semibold ${
-                                  chartSeries.changeUsdt >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                                }`}
-                              >
-                                {formatSignedUsd(chartSeries.changeUsdt)} ({chartSeries.changePct >= 0 ? '+' : ''}
-                                {chartSeries.changePct.toFixed(2)}%)
-                              </span>
-                            </div>
-                          )}
+                          {chartSeries && (() => {
+                            const rangePnlStyle = getPnlIntensityStyles(chartSeries.changePct);
+                            return (
+                              <div className="flex items-center gap-2.5 font-mono tabular-nums text-xs">
+                                <span className="hidden md:inline text-[11px] text-slate-400">
+                                  Мин {formatUsd(chartSeries.minVal)} · Макс {formatUsd(chartSeries.maxVal)}
+                                </span>
+                                <span
+                                  className={`inline-flex items-center rounded-md border px-2 py-0.5 font-semibold transition-all duration-300 ${rangePnlStyle.badgeClass}`}
+                                >
+                                  {formatSignedUsd(chartSeries.changeUsdt)} ({chartSeries.changePct >= 0 ? '+' : ''}
+                                  {chartSeries.changePct.toFixed(2)}%)
+                                </span>
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
 
@@ -1023,12 +1034,12 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                               <Line
                                 type="monotone"
                                 dataKey="valueUsdt"
-                                stroke={chartSeries.changeUsdt >= 0 ? '#10b981' : '#fb7185'}
+                                stroke={getPnlIntensityStyles(chartSeries.changePct).chartStrokeHex}
                                 strokeWidth={2.2}
                                 dot={false}
                                 activeDot={{
                                   r: 4,
-                                  fill: chartSeries.changeUsdt >= 0 ? '#10b981' : '#fb7185',
+                                  fill: getPnlIntensityStyles(chartSeries.changePct).chartStrokeHex,
                                   stroke: '#0B0F17',
                                   strokeWidth: 2,
                                 }}
@@ -1446,16 +1457,19 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                       <div className="md:col-span-8 space-y-2.5">
                         <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                           <span className="text-slate-400">Распределение долей</span>
-                          {bestDailyAsset && (
-                            <span className="text-[11px] text-slate-300 font-mono tabular-nums">
-                              Лидер 24ч:{' '}
-                              <strong className={bestDailyAsset.dailyPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                {bestDailyAsset.baseAsset}{' '}
-                                {bestDailyAsset.dailyPnlPct >= 0 ? '+' : ''}
-                                {bestDailyAsset.dailyPnlPct.toFixed(2)}%
-                              </strong>
-                            </span>
-                          )}
+                          {bestDailyAsset && (() => {
+                            const leaderStyle = getPnlIntensityStyles(bestDailyAsset.dailyPnlPct);
+                            return (
+                              <span className="text-[11px] text-slate-300 font-mono tabular-nums inline-flex items-center gap-1.5">
+                                <span>Лидер 24ч:</span>
+                                <strong className={`rounded-md border px-1.5 py-0.5 font-semibold ${leaderStyle.badgeClass}`}>
+                                  {bestDailyAsset.baseAsset}{' '}
+                                  {bestDailyAsset.dailyPnlPct >= 0 ? '+' : ''}
+                                  {bestDailyAsset.dailyPnlPct.toFixed(2)}%
+                                </strong>
+                              </span>
+                            );
+                          })()}
                         </div>
 
                         {/* Proportional bar */}
@@ -1495,6 +1509,10 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                       {sortedAssetBreakdown.map((asset) => {
                         const totalPos = asset.pnlUsdt >= 0;
                         const dailyPos = asset.dailyPnlUsdt >= 0;
+                        const assetDailyStyle = getPnlIntensityStyles(asset.dailyPnlPct, {
+                          isNeutral: !report.hasLive24hData,
+                        });
+                        const assetTotalStyle = getPnlIntensityStyles(asset.pnlPct);
                         return (
                           <div key={asset.symbol} className="py-3.5 space-y-2.5">
                             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1520,7 +1538,7 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                                 </div>
                               </div>
 
-                              <div className="flex items-center gap-4 sm:gap-6 font-mono tabular-nums ml-auto">
+                              <div className="flex items-center gap-3 sm:gap-5 font-mono tabular-nums ml-auto">
                                 <div className="text-right">
                                   <div className="text-[10px] font-sans text-slate-500">Стоимость</div>
                                   <div className="text-sm font-bold text-white">
@@ -1528,47 +1546,39 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                                   </div>
                                 </div>
 
-                                <div className="text-right min-w-[82px]">
+                                <div className="text-right min-w-[88px]">
                                   <div className="text-[10px] font-sans text-slate-500">PnL за 24ч</div>
                                   <div
                                     className={`text-xs font-semibold ${
-                                      !report.hasLive24hData
-                                        ? 'text-slate-500'
-                                        : dailyPos
-                                          ? 'text-emerald-400'
-                                          : 'text-rose-400'
+                                      !report.hasLive24hData ? 'text-slate-500' : assetDailyStyle.textClass
                                     }`}
                                   >
                                     {report.hasLive24hData ? formatSignedUsd(asset.dailyPnlUsdt) : '—'}
                                   </div>
                                   {report.hasLive24hData && (
-                                    <div
-                                      className={`text-[11px] ${
-                                        dailyPos ? 'text-emerald-400/80' : 'text-rose-400/80'
-                                      }`}
-                                    >
-                                      {dailyPos ? '+' : ''}
-                                      {asset.dailyPnlPct.toFixed(2)}%
+                                    <div className="mt-0.5">
+                                      <span
+                                        className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold transition-all duration-300 ${assetDailyStyle.badgeClass}`}
+                                      >
+                                        {dailyPos ? '+' : ''}
+                                        {asset.dailyPnlPct.toFixed(2)}%
+                                      </span>
                                     </div>
                                   )}
                                 </div>
 
-                                <div className="text-right min-w-[86px]">
+                                <div className="text-right min-w-[92px]">
                                   <div className="text-[10px] font-sans text-slate-500">Общий PnL</div>
-                                  <div
-                                    className={`text-xs font-bold ${
-                                      totalPos ? 'text-emerald-400' : 'text-rose-400'
-                                    }`}
-                                  >
+                                  <div className={`text-xs font-bold ${assetTotalStyle.textClass}`}>
                                     {formatSignedUsd(asset.pnlUsdt)}
                                   </div>
-                                  <div
-                                    className={`text-[11px] ${
-                                      totalPos ? 'text-emerald-400/85' : 'text-rose-400/85'
-                                    }`}
-                                  >
-                                    {totalPos ? '+' : ''}
-                                    {asset.pnlPct.toFixed(2)}%
+                                  <div className="mt-0.5">
+                                    <span
+                                      className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold transition-all duration-300 ${assetTotalStyle.badgeClass}`}
+                                    >
+                                      {totalPos ? '+' : ''}
+                                      {asset.pnlPct.toFixed(2)}%
+                                    </span>
                                   </div>
                                 </div>
 
@@ -1592,6 +1602,7 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                               <div className="pl-5 space-y-1">
                                 {asset.lots.map((lot) => {
                                   const lotPos = lot.pnlUsdt >= 0;
+                                  const lotStyle = getPnlIntensityStyles(lot.pnlPct);
                                   return (
                                     <div
                                       key={lot.id}
@@ -1600,7 +1611,9 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                                       <span className="font-mono tabular-nums truncate">
                                         Биржа: {lot.amount} {lot.baseAsset} @ ${formatPrice(lot.avgEntryPrice)}
                                       </span>
-                                      <span className={`shrink-0 font-mono tabular-nums ${lotPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                      <span
+                                        className={`shrink-0 font-mono tabular-nums rounded border px-1.5 py-0.5 text-[10px] font-semibold ${lotStyle.badgeClass}`}
+                                      >
                                         {formatSignedUsd(lot.pnlUsdt)} ({lotPos ? '+' : ''}
                                         {lot.pnlPct.toFixed(1)}%)
                                       </span>
@@ -1723,7 +1736,6 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
                           const refPrice = isOpen ? livePrice : t.exitPrice;
                           const pnlPct = refPrice ? tradePnlPct(t, refPrice) : null;
                           const rMult = refPrice ? tradeRMultiple(t, refPrice) : null;
-                          const isWin = (pnlPct ?? 0) >= 0;
 
                           return (
                             <div
@@ -1770,28 +1782,25 @@ export const PortfolioDetailsModal: React.FC<PortfolioDetailsModalProps> = ({
 
                               <div className="flex items-center gap-3 shrink-0 ml-auto">
                                 <div className="text-right font-mono tabular-nums">
-                                  {pnlPct !== null ? (
-                                    <>
-                                      <div
-                                        className={`text-sm font-bold ${
-                                          isWin ? 'text-emerald-400' : 'text-rose-400'
-                                        }`}
-                                      >
-                                        {pnlPct >= 0 ? '+' : ''}
-                                        {pnlPct.toFixed(2)}%
-                                      </div>
-                                      {rMult !== null && (
+                                  {pnlPct !== null ? (() => {
+                                    const tradeStyle = getPnlIntensityStyles(pnlPct);
+                                    return (
+                                      <>
                                         <div
-                                          className={`text-[11px] ${
-                                            rMult >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'
-                                          }`}
+                                          className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs sm:text-sm font-bold transition-all duration-300 ${tradeStyle.badgeClass}`}
                                         >
-                                          {rMult >= 0 ? '+' : ''}
-                                          {rMult.toFixed(2)}R
+                                          {pnlPct >= 0 ? '+' : ''}
+                                          {pnlPct.toFixed(2)}%
                                         </div>
-                                      )}
-                                    </>
-                                  ) : (
+                                        {rMult !== null && (
+                                          <div className={`mt-0.5 text-[11px] ${tradeStyle.subtleTextClass}`}>
+                                            {rMult >= 0 ? '+' : ''}
+                                            {rMult.toFixed(2)}R
+                                          </div>
+                                        )}
+                                      </>
+                                    );
+                                  })() : (
                                     <span className="text-xs text-slate-500">нет цены</span>
                                   )}
                                 </div>

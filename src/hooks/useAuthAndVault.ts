@@ -1079,6 +1079,25 @@ export function useAuthAndVault() {
     if (!firebaseUser) return;
     const uid = firebaseUser.uid;
     try {
+      // Audit G1: синхронизируем отключение 2FA с сервером (требует активный step-up)
+      try {
+        const res = await authFetch('/api/security/totp/disable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!res.ok) {
+          const errPayload = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
+          if (res.status === 403 || res.status === 401) {
+            throw new Error(errPayload.error || 'Требуется подтверждение 2FA для отключения защиты.');
+          }
+        }
+      } catch (serverErr) {
+        if (serverErr instanceof Error && serverErr.message.includes('2FA')) {
+          throw serverErr;
+        }
+      }
+
       await updateDoc(doc(db, 'users', uid, 'private', 'security'), {
         totpEncryptedSecret: '',
         totpPendingSecret: '',
@@ -1249,6 +1268,13 @@ export function useAuthAndVault() {
         });
       }
       await batch.commit();
+      // Audit I2: параллельно отзываем refresh-токены через серверный эндпоинт (best-effort)
+      void authFetch('/api/security/revoke-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }).catch(() => undefined);
+
       await writeAuditLog(
         uid,
         'REVOKE_OTHER_SESSIONS',

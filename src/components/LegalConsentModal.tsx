@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Bot,
@@ -173,6 +173,14 @@ export const LegalConsentModal: React.FC<LegalConsentModalProps> = ({
   const [acceptedDisclaimer, setAcceptedDisclaimer] = useState(false);
   const [openDoc, setOpenDoc] = useState<LegalDocKind | null>(null);
 
+  useEffect(() => {
+    if (!open) return;
+    setIsAdult(false);
+    setAcceptedTerms(false);
+    setAcceptedAiProcessing(false);
+    setAcceptedDisclaimer(false);
+  }, [open, mode]);
+
   if (!open) return null;
 
   const allChecked = isAdult && acceptedTerms && acceptedAiProcessing && acceptedDisclaimer;
@@ -187,6 +195,7 @@ export const LegalConsentModal: React.FC<LegalConsentModalProps> = ({
       acceptedTerms,
       acceptedAiProcessing,
       acceptedDisclaimer,
+      acceptedAuthDataTransfer: mode === 'auth' ? true : undefined,
     };
     saveLegalConsent(record);
     onAccepted(record);
@@ -208,10 +217,12 @@ export const LegalConsentModal: React.FC<LegalConsentModalProps> = ({
               </div>
               <div>
                 <h2 className="text-base font-semibold text-white">
-                  {mode === 'auth' ? 'Подтверждение перед входом' : 'Добро пожаловать в VERNIER'}
+                  {mode === 'auth' ? 'Подтверждение перед входом и регистрацией' : 'Добро пожаловать в VERNIER'}
                 </h2>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Подтвердите возраст 18+ и правовые условия (Закон Украины / GDPR / Google Play)
+                  {mode === 'auth'
+                    ? 'Подтвердите добровольную передачу email и данных аккаунта, согласие с политикой конфиденциальности и личную ответственность'
+                    : 'Подтвердите возраст 18+ и правовые условия (Закон Украины / GDPR / Google Play)'}
                 </p>
               </div>
             </div>
@@ -280,7 +291,7 @@ export const LegalConsentModal: React.FC<LegalConsentModalProps> = ({
                 className="mt-0.5 h-4 w-4 rounded accent-emerald-500 shrink-0"
               />
               <span className="leading-relaxed">
-                Я даю явное согласие на обработку моих персональных данных и передачу обезличенных запросов аналитическому модулю AI.
+                Я подтверждаю, что самостоятельно и добровольно передаю данные аккаунта и email, даю явное согласие на обработку моих персональных данных и передачу обезличенных запросов аналитическому модулю AI.
               </span>
             </label>
 

@@ -556,7 +556,7 @@ export function runExchangeSyncLogAutoCleanup(
   return result;
 }
 
-function persistLogs(uid: string, logs: ExchangeSyncErrorLogEntry[]): void {
+export function persistExchangeSyncLogs(uid: string, logs: ExchangeSyncErrorLogEntry[]): void {
   if (!uid || typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(
@@ -566,6 +566,10 @@ function persistLogs(uid: string, logs: ExchangeSyncErrorLogEntry[]): void {
   } catch {
     // Ignore storage quota or private browsing errors
   }
+}
+
+function persistLogs(uid: string, logs: ExchangeSyncErrorLogEntry[]): void {
+  persistExchangeSyncLogs(uid, logs);
 }
 
 export function appendExchangeSyncSuccessLog(

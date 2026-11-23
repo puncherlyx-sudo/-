@@ -17,6 +17,7 @@ import type { DailyPnlSummary, PaperPortfolioReport } from '../hooks/usePaperPor
 import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
 import type { ExchangeSyncErrorLogEntry } from '../lib/exchangeSyncErrorLog';
 import type { ExchangeKeyRecord, PortfolioTargetRecord } from '../types/domain';
+import { getPnlIntensityStyles } from '../lib/pnlIntensity';
 import { triggerHaptic } from '../lib/securityDlp';
 
 interface MiniPortfolioWidgetProps {
@@ -81,6 +82,12 @@ export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = React.mem
 
   const isPositive = report.totalPnl >= 0;
   const isDailyPositive = dailyPnl.dailyPnlUsdt >= 0;
+  const totalPnlStyle = getPnlIntensityStyles(report.totalPnlPct, {
+    isNeutral: privacyMode || holdingsCount === 0,
+  });
+  const dailyPnlStyle = getPnlIntensityStyles(dailyPnl.dailyPnlPct, {
+    isNeutral: privacyMode || !dailyPnl.hasLive24hData || holdingsCount === 0,
+  });
   const mask = (text: string) => (privacyMode ? '•••••' : text);
   const hasExchangeApi = connectedExchangesCount > 0 || exchangeKeys.length > 0;
 
@@ -200,7 +207,7 @@ export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = React.mem
       initial={{ opacity: 0, y: -6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
-      className="mb-3 rounded-2xl border border-emerald-500/18 bg-[var(--surface-1)] overflow-visible"
+      className={`mb-3 rounded-2xl border bg-[var(--surface-1)] overflow-visible transition-colors duration-300 ${totalPnlStyle.widgetBorderClass}`}
     >
       {/* Unified single-row balance + API status + utility bar (fits 360px–430px cleanly) */}
       <div className="px-2.5 sm:px-3.5 py-1.5 flex items-center justify-between gap-1.5 sm:gap-2 min-w-0">
@@ -222,11 +229,9 @@ export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = React.mem
             </span>
 
             {holdingsCount > 0 && (
-              <span className="inline-flex items-center gap-2 text-[11px] font-mono tabular-nums shrink-0">
+              <span className="inline-flex items-center gap-1.5 text-[11px] font-mono tabular-nums shrink-0">
                 <span
-                  className={`inline-flex items-center gap-1 font-semibold ${
-                    isPositive ? 'text-emerald-400' : 'text-rose-400'
-                  }`}
+                  className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-semibold transition-all duration-300 ${totalPnlStyle.badgeClass}`}
                 >
                   {isPositive ? (
                     <TrendingUp className="w-3 h-3 shrink-0" />
@@ -236,20 +241,17 @@ export const MiniPortfolioWidget: React.FC<MiniPortfolioWidgetProps> = React.mem
                   <span>
                     {mask(`${isPositive ? '+' : ''}${report.totalPnlPct.toFixed(1)}%`)}
                   </span>
-                  <span className="font-sans text-[10px] font-medium text-slate-400">Всего</span>
+                  <span className="font-sans text-[10px] font-medium opacity-75">Всего</span>
                 </span>
 
                 {dailyPnl.hasLive24hData && (
                   <span
-                    className={`inline-flex items-center gap-1 ${
-                      isDailyPositive ? 'text-emerald-300/90' : 'text-rose-300/90'
-                    }`}
+                    className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-medium transition-all duration-300 ${dailyPnlStyle.badgeClass}`}
                   >
-                    <span className="text-slate-600" aria-hidden="true">·</span>
                     <span>
                       {mask(`${isDailyPositive ? '+' : ''}${dailyPnl.dailyPnlPct.toFixed(1)}%`)}
                     </span>
-                    <span className="font-sans text-[10px] text-slate-500">24ч</span>
+                    <span className="font-sans text-[10px] opacity-75">24ч</span>
                   </span>
                 )}
 

@@ -28,6 +28,11 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
 
   app.disable('x-powered-by');
 
+  const appCheckEnabled = Boolean(
+    (process.env.VITE_RECAPTCHA_SITE_KEY || '').trim() ||
+      process.env.FIREBASE_APP_CHECK_ENABLED === 'true',
+  );
+
   const connectSrc = [
     "'self'",
     'https://generativelanguage.googleapis.com',
@@ -35,7 +40,7 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
     'https://identitytoolkit.googleapis.com',
     'https://securetoken.googleapis.com',
     'https://firebaseinstallations.googleapis.com',
-    'https://content-firebaseappcheck.googleapis.com',
+    ...(appCheckEnabled ? ['https://content-firebaseappcheck.googleapis.com'] : []),
     'https://*.firebaseio.com',
     'https://*.firebaseapp.com',
     'wss://*.firebaseio.com',
@@ -51,7 +56,13 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
 
   const cspDirectives: Record<string, string[]> = {
     'default-src': ["'self'"],
-    'script-src': ["'self'", 'https://apis.google.com', 'https://www.google.com/recaptcha/', 'https://www.gstatic.com/recaptcha/'],
+    'script-src': [
+      "'self'",
+      'https://apis.google.com',
+      ...(appCheckEnabled
+        ? ['https://www.google.com/recaptcha/', 'https://www.gstatic.com/recaptcha/']
+        : []),
+    ],
     'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
     'font-src': ["'self'", 'https://fonts.gstatic.com', 'data:'],
     'img-src': [
@@ -71,7 +82,7 @@ export function applySecurityHeaders(app: express.Express, options: SecurityHead
       'https://*.firebaseapp.com',
       'https://accounts.google.com',
       'https://apis.google.com',
-      'https://www.google.com/recaptcha/',
+      ...(appCheckEnabled ? ['https://www.google.com/recaptcha/'] : []),
       'https://www.tradingview-widget.com',
       'https://s.tradingview.com',
       'https://*.tradingview.com',

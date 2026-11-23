@@ -12,6 +12,11 @@ import {
   SYNC_LOG_AUTO_CLEANUP_DAYS,
   type ExchangeSyncErrorLogEntry,
 } from '../src/lib/exchangeSyncErrorLog.ts';
+import { buildAnomalyPdfReportData } from '../src/utils/anomalyPdfReport.ts';
+import {
+  mergeLocalAndCloudSyncLogs,
+  serializeSyncLogForFirestore,
+} from '../src/lib/exchangeSyncCloudSync.ts';
 
 function makeEntry(overrides: Partial<ExchangeSyncErrorLogEntry>): ExchangeSyncErrorLogEntry {
   const now = overrides.occurredAtMs ?? Date.now();
@@ -178,3 +183,82 @@ test('detectKnownExchangeSyncError recognizes expired API key and exchange error
   );
   assert.equal(successEntry, null);
 });
+
+test('buildAnomalyPdfReportData respects severityFilter and categoryFilter for anomaly search', () => {
+  const nowMs = Date.UTC(2026, 10, 22, 14, 30, 0);
+  const logs: ExchangeSyncErrorLogEntry[] = [
+    makeEntry({ id: 'c_auth_1', occurredAtMs: nowMs - 60_000, severity: 'critical', category: 'auth' }),
+    makeEntry({ id: 'c_auth_2', occurredAtMs: nowMs - 120_000, severity: 'critical', category: 'auth' }),
+    makeEntry({ id: 'w_rate_1', occurredAtMs: nowMs - 180_000, severity: 'warning', category: 'rate_limit' }),
+    makeEntry({ id: 'w_net_1', occurredAtMs: nowMs - 240_000, severity: 'warning', category: 'network' }),
+    makeEntry({ id: 'ok_1', occurredAtMs: nowMs - 30_000, severity: 'success', category: 'success' }),
+  ];
+
+  const onlyCritical = buildAnomalyPdfReportData(logs, {
+    windowHours: 24,
+    nowMs,
+    severityFilter: 'critical',
+    categoryFilter: 'all',
+  });
+  assert.equal(onlyCritical.series.totalErrors, 2);
+  assert.equal(onlyCritical.series.criticalErrors, 2);
+  assert.equal(onlyCritical.series.warningErrors, 0);
+
+  const onlyRateLimit = buildAnomalyPdfReportData(logs, {
+    windowHours: 24,
+    nowMs,
+    severityFilter: 'warning',
+    categoryFilter: 'rate_limit',
+  });
+  assert.equal(onlyRateLimit.series.totalErrors, 1);
+  assert.equal(onlyRateLimit.series.warningErrors, 1);
+  assert.equal(onlyRateLimit.series.criticalErrors, 0);
+  assert.ok(onlyRateLimit.filterScopeLabel.includes('Лимит API'));
+});
+
+test('PRO Firestore cloud sync merges, deduplicates, prunes >30d logs, and redacts secrets on serialization', () => {
+  const nowMs = Date.UTC(2026, 10, 22, 15, 0, 0);
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  const localLogs: ExchangeSyncErrorLogEntry[] = [
+    makeEntry({ id: 'shared_1', occurredAtMs: nowMs - 10_000 }),
+    makeEntry({ id: 'local_only_1', occurredAtMs: nowMs - 5_000, exchange: 'bybit' }),
+    makeEntry({ id: 'local_expired', occurredAtMs: nowMs - 35 * DAY_MS }),
+  ];
+  const cloudLogs: ExchangeSyncErrorLogEntry[] = [
+    makeEntry({ id: 'shared_1', occurredAtMs: nowMs - 10_000 }),
+    makeEntry({ id: 'cloud_only_1', occurredAtMs: nowMs - 20_000, exchange: 'okx' }),
+  ];
+
+  const { merged, localOnlyToPush } = mergeLocalAndCloudSyncLogs(localLogs, cloudLogs, {
+    autoCleanup30d: true,
+    nowMs,
+  });
+
+  assert.deepEqual(
+    merged.map((e) => e.id),
+    ['local_only_1', 'shared_1', 'cloud_only_1']
+  );
+  assert.deepEqual(
+    localOnlyToPush.map((e) => e.id),
+    ['local_only_1']
+  );
+
+  const serialized = serializeSyncLogForFirestore(
+    'uid_pro_1',
+    makeEntry({
+      id: 'sec_log_1',
+      occurredAtMs: nowMs,
+      technicalDetails: {
+        httpStatus: 401,
+        endpoint: 'GET https://api.binance.com/api/v3/account?signature=0123456789abcdef0123456789abcdef',
+        rawApiResponse: '{"apiKey":"SENSITIVE_KEY_VALUE_1234567890","code":-2015}',
+      },
+    })
+  );
+  assert.equal(serialized.userId, 'uid_pro_1');
+  assert.equal(serialized.id, 'sec_log_1');
+  assert.ok(!serialized.endpoint.includes('0123456789abcdef'));
+  assert.ok(!serialized.rawApiResponse.includes('SENSITIVE_KEY_VALUE'));
+});
+

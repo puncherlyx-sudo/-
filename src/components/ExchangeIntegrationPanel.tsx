@@ -24,6 +24,7 @@ import type { ExchangeSyncCacheMap } from '../lib/exchangeSyncCache';
 import { triggerHaptic } from '../lib/securityDlp';
 import { ApiFieldTooltip } from './ApiFieldTooltip';
 import { ExchangeApiGuide } from './ExchangeApiGuide';
+import { LegalDocumentModal, type LegalDocKind } from './LegalConsentModal';
 import { NonCustodialRiskNotice } from './TradeRiskConfirmModal';
 import type {
   ExchangeAssetBalance,
@@ -127,6 +128,7 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
   const [passphrase, setPassphrase] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [acceptedApiResponsibility, setAcceptedApiResponsibility] = useState(false);
+  const [openLegalDoc, setOpenLegalDoc] = useState<LegalDocKind | null>(null);
   const [pasteNotice, setPasteNotice] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
@@ -199,7 +201,9 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
       return;
     }
     if (!acceptedApiResponsibility) {
-      setFormError('Подтвердите отказ от права вывода средств и вашу личную финансовую ответственность перед подключением ключа.');
+      setFormError(
+        'Подтвердите добровольную передачу API-ключей, согласие с Политикой конфиденциальности, отключение Withdrawals и личную финансовую ответственность.'
+      );
       return;
     }
 
@@ -567,7 +571,40 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
                 className="mt-0.5 h-4 w-4 rounded accent-emerald-500 shrink-0"
               />
               <span>
-                Подтверждаю, что право вывода средств (Withdrawals) на бирже отключено, VERNIER не хранит и не управляет моими деньгами, а все операции через API выполняются только по моему согласию под мою личную финансовую ответственность.
+                Я подтверждаю, что самостоятельно и добровольно передаю API-ключи биржи, принимаю{' '}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setOpenLegalDoc('privacy');
+                  }}
+                  className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                >
+                  Политику конфиденциальности
+                </button>{' '}
+                и{' '}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setOpenLegalDoc('terms');
+                  }}
+                  className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                >
+                  Условия использования
+                </button>
+                , право вывода средств (Withdrawals) отключено, VERNIER не хранит и не управляет моими деньгами, а всю ответственность за операции я беру на себя (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setOpenLegalDoc('disclaimer');
+                  }}
+                  className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2"
+                >
+                  Отказ от ответственности
+                </button>
+                ).
               </span>
             </label>
 
@@ -971,6 +1008,7 @@ export const ExchangeIntegrationPanel: React.FC<ExchangeIntegrationPanelProps> =
           </div>
         )}
       </div>
+      <LegalDocumentModal doc={openLegalDoc} onClose={() => setOpenLegalDoc(null)} />
     </div>
   );
 };

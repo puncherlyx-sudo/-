@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import type { SupportTicketCategory, SupportTicketRecord } from '../types/domain';
+import { LegalDocumentModal, type LegalDocKind } from './LegalConsentModal';
 import { NATIVE_SPRING } from './MotionPrimitives';
 
 interface SupportContactModalProps {
@@ -65,6 +66,8 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
   const [contactEmail, setContactEmail] = useState(defaultEmail);
   const [subject, setSubject] = useState('');
   const [message, setMessage] = useState('');
+  const [acceptedDataConsent, setAcceptedDataConsent] = useState(false);
+  const [openLegalDoc, setOpenLegalDoc] = useState<LegalDocKind | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submittedTicketId, setSubmittedTicketId] = useState<string | null>(null);
@@ -73,6 +76,7 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
     if (!open) return;
     setError(null);
     setSubmittedTicketId(null);
+    setAcceptedDataConsent(false);
     if (defaultEmail && !contactEmail) {
       setContactEmail(defaultEmail);
     }
@@ -108,6 +112,10 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
       setError('Опишите проблему подробнее (минимум 10 символов).');
       return;
     }
+    if (!acceptedDataConsent) {
+      setError('Подтвердите добровольную передачу email и согласие с Политикой конфиденциальности.');
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -120,6 +128,7 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
       setSubmittedTicketId(ticketId);
       setSubject('');
       setMessage('');
+      setAcceptedDataConsent(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось отправить обращение.');
     } finally {
@@ -128,7 +137,8 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
   };
 
   return (
-    <AnimatePresence>
+    <>
+      <AnimatePresence>
       {open && (
         <div
           className="fixed inset-0 z-50 flex items-end sm:items-center justify-center sm:p-4"
@@ -282,6 +292,41 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
                 />
               </div>
 
+              {/* Mandatory Email & Privacy Consent */}
+              <label className="flex items-start gap-2.5 rounded-xl border border-white/10 bg-[#0B0F17] p-3 cursor-pointer text-[11px] text-slate-300 leading-relaxed hover:border-emerald-500/35 transition-colors">
+                <input
+                  type="checkbox"
+                  checked={acceptedDataConsent}
+                  onChange={(e) => setAcceptedDataConsent(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 rounded accent-emerald-500 shrink-0"
+                />
+                <span>
+                  Я подтверждаю, что самостоятельно и добровольно передаю указанный email и текст обращения, принимаю{' '}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setOpenLegalDoc('privacy');
+                    }}
+                    className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                  >
+                    Политику конфиденциальности
+                  </button>{' '}
+                  и{' '}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setOpenLegalDoc('terms');
+                    }}
+                    className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+                  >
+                    Условия использования
+                  </button>
+                  , и осознаю ответственность за передаваемые данные.
+                </span>
+              </label>
+
               {error && (
                 <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
                   {error}
@@ -311,8 +356,8 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting}
-                  className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-semibold text-white inline-flex items-center gap-2 transition-colors"
+                  disabled={submitting || !acceptedDataConsent}
+                  className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-45 disabled:cursor-not-allowed text-xs font-semibold text-white inline-flex items-center gap-2 transition-colors"
                 >
                   <Send className="w-3.5 h-3.5" />
                   <span>{submitting ? 'Отправка...' : 'Отправить обращение'}</span>
@@ -355,6 +400,8 @@ export const SupportContactModal: React.FC<SupportContactModalProps> = ({
           </motion.div>
         </div>
       )}
-    </AnimatePresence>
+      </AnimatePresence>
+      <LegalDocumentModal doc={openLegalDoc} onClose={() => setOpenLegalDoc(null)} />
+    </>
   );
 };

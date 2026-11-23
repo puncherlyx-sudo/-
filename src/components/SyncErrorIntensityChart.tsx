@@ -9,21 +9,58 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { Activity, AlertTriangle, Check, CheckCircle2, FileDown } from 'lucide-react';
+import { Activity, AlertTriangle, Check, CheckCircle2, FileDown, Filter, RotateCcw } from 'lucide-react';
 import {
   buildHourlyErrorIntensitySeries,
+  type ExchangeSyncErrorCategory,
   type ExchangeSyncErrorLogEntry,
   type HourlyErrorIntensityPoint,
 } from '../lib/exchangeSyncErrorLog';
 import type { ExchangeId } from '../types/domain';
-import { downloadAnomalyPdfReport } from '../utils/anomalyPdfReport';
 import { triggerHaptic } from '../lib/securityDlp';
+
+export type ChartSeverityFilter = 'all' | 'critical' | 'warning';
+export type ChartCategoryFilter = 'all' | Exclude<ExchangeSyncErrorCategory, 'success'>;
 
 interface SyncErrorIntensityChartProps {
   logs: ExchangeSyncErrorLogEntry[];
   exchangeFilter?: 'all' | ExchangeId;
+  severityFilter?: ChartSeverityFilter;
+  onSeverityFilterChange?: (next: ChartSeverityFilter) => void;
+  categoryFilter?: ChartCategoryFilter;
+  onCategoryFilterChange?: (next: ChartCategoryFilter) => void;
   compact?: boolean;
 }
+
+const SEVERITY_OPTIONS: Array<{
+  id: ChartSeverityFilter;
+  label: string;
+  activeClass: string;
+}> = [
+  { id: 'all', label: 'Все уровни', activeClass: 'bg-white/15 text-white border-white/25' },
+  {
+    id: 'critical',
+    label: 'Критические',
+    activeClass: 'bg-rose-500/25 text-rose-200 border-rose-400/50',
+  },
+  {
+    id: 'warning',
+    label: 'Предупреждения',
+    activeClass: 'bg-amber-500/25 text-amber-200 border-amber-400/50',
+  },
+];
+
+const CATEGORY_OPTIONS: Array<{
+  id: ChartCategoryFilter;
+  label: string;
+}> = [
+  { id: 'all', label: 'Все типы' },
+  { id: 'auth', label: 'Ключ / права' },
+  { id: 'rate_limit', label: 'Лимит API' },
+  { id: 'network', label: 'Сеть' },
+  { id: 'exchange_api', label: 'API биржи' },
+  { id: 'unknown', label: 'Прочие' },
+];
 
 interface IntensityTooltipProps {
   active?: boolean;
@@ -50,7 +87,7 @@ const IntensityTooltip: React.FC<IntensityTooltipProps> = ({
         )}
       </div>
       <div className="flex items-center justify-between gap-4">
-        <span className="font-sans text-rose-300">Всего ошибок / час:</span>
+        <span className="font-sans text-rose-300">Ошибок / час:</span>
         <span className="text-white font-bold">{point.errors}</span>
       </div>
       <div className="flex items-center justify-between gap-4">
@@ -91,16 +128,71 @@ const AnomalyMarkerDot: React.FC<AnomalyDotProps> = ({ cx, cy, payload }) => {
 };
 
 export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = React.memo(
-  ({ logs, exchangeFilter = 'all', compact = false }) => {
+  ({
+    logs,
+    exchangeFilter = 'all',
+    severityFilter: controlledSeverity,
+    onSeverityFilterChange,
+    categoryFilter: controlledCategory,
+    onCategoryFilterChange,
+    compact = false,
+  }) => {
     const [windowHours, setWindowHours] = useState<24 | 72>(24);
-    const [pdfStatus, setPdfStatus] = useState<'idle' | 'done' | 'error'>('idle');
+    const [internalSeverity, setInternalSeverity] = useState<ChartSeverityFilter>('all');
+    const [internalCategory, setInternalCategory] = useState<ChartCategoryFilter>('all');
+    const [pdfStatus, setPdfStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
+
+    const severityFilter = controlledSeverity ?? internalSeverity;
+    const categoryFilter = controlledCategory ?? internalCategory;
+
+    const handleSeverityChange = (next: ChartSeverityFilter) => {
+      triggerHaptic(6);
+      if (onSeverityFilterChange) onSeverityFilterChange(next);
+      else setInternalSeverity(next);
+    };
+
+    const handleCategoryChange = (next: ChartCategoryFilter) => {
+      triggerHaptic(6);
+      if (onCategoryFilterChange) onCategoryFilterChange(next);
+      else setInternalCategory(next);
+    };
+
+    const hasActiveFilters = severityFilter !== 'all' || categoryFilter !== 'all';
+
+    // Подсчёт количества ошибок по уровням и категориям для наглядных бейджей
+    const filterCounts = useMemo(() => {
+      const counts = {
+        all: 0,
+        critical: 0,
+        warning: 0,
+        auth: 0,
+        rate_limit: 0,
+        network: 0,
+        exchange_api: 0,
+        unknown: 0,
+      };
+      for (const entry of logs) {
+        if (entry.severity === 'success') continue;
+        if (exchangeFilter !== 'all' && entry.exchange !== exchangeFilter) continue;
+        counts.all += 1;
+        if (entry.severity === 'critical') counts.critical += 1;
+        else if (entry.severity === 'warning') counts.warning += 1;
+        if (entry.category !== 'success' && entry.category in counts) {
+          counts[entry.category as keyof typeof counts] += 1;
+        }
+      }
+      return counts;
+    }, [logs, exchangeFilter]);
 
     const scopedLogs = useMemo(
       () =>
-        exchangeFilter === 'all'
-          ? logs
-          : logs.filter((entry) => entry.exchange === exchangeFilter),
-      [logs, exchangeFilter]
+        logs.filter((entry) => {
+          if (exchangeFilter !== 'all' && entry.exchange !== exchangeFilter) return false;
+          if (severityFilter !== 'all' && entry.severity !== severityFilter) return false;
+          if (categoryFilter !== 'all' && entry.category !== categoryFilter) return false;
+          return true;
+        }),
+      [logs, exchangeFilter, severityFilter, categoryFilter]
     );
 
     const series = useMemo(
@@ -108,10 +200,18 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
       [scopedLogs, windowHours]
     );
 
-    const handleDownloadPdf = () => {
+    const handleDownloadPdf = async () => {
       triggerHaptic(10);
+      setPdfStatus('busy');
       try {
-        downloadAnomalyPdfReport(logs, { windowHours, exchangeFilter });
+        // Ленивая подгрузка генератора PDF только по клику (уменьшает стартовый бандл)
+        const { downloadAnomalyPdfReport } = await import('../utils/anomalyPdfReport');
+        downloadAnomalyPdfReport(logs, {
+          windowHours,
+          exchangeFilter,
+          severityFilter,
+          categoryFilter,
+        });
         setPdfStatus('done');
         window.setTimeout(() => setPdfStatus('idle'), 2200);
       } catch {
@@ -150,7 +250,7 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
               </h3>
             </div>
             <p className="mt-0.5 text-[11px] text-slate-400">
-              Линейный тренд сбоев API бирж по часам с выделением периодов аномальной активности.
+              Линейный тренд сбоев API бирж по часам с фильтрацией по критичности и типу ошибки.
             </p>
           </div>
 
@@ -193,8 +293,9 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
 
             <button
               type="button"
-              onClick={handleDownloadPdf}
-              className={`min-h-[28px] px-2.5 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
+              disabled={pdfStatus === 'busy'}
+              onClick={() => void handleDownloadPdf()}
+              className={`min-h-[28px] px-2.5 rounded-lg border text-[11px] font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap disabled:opacity-60 ${
                 pdfStatus === 'done'
                   ? 'border-emerald-400/50 bg-emerald-500/25 text-emerald-100'
                   : pdfStatus === 'error'
@@ -216,10 +317,82 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
               ) : (
                 <>
                   <FileDown className="w-3.5 h-3.5 shrink-0" />
-                  <span>Скачать PDF-отчет</span>
+                  <span>{pdfStatus === 'busy' ? 'Формирование…' : 'Скачать PDF-отчет'}</span>
                 </>
               )}
             </button>
+          </div>
+        </div>
+
+        {/* Фильтры по критичности и типу ошибки для быстрого поиска аномалий */}
+        <div className="rounded-xl border border-white/8 bg-[#070B12]/70 p-2.5 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Фильтр критичности ошибок">
+              <span className="inline-flex items-center gap-1 text-[10px] font-medium text-slate-400 mr-0.5">
+                <Filter className="w-3 h-3 text-emerald-400" />
+                Критичность:
+              </span>
+              {SEVERITY_OPTIONS.map((opt) => {
+                const active = severityFilter === opt.id;
+                const cnt =
+                  opt.id === 'all'
+                    ? filterCounts.all
+                    : opt.id === 'critical'
+                      ? filterCounts.critical
+                      : filterCounts.warning;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => handleSeverityChange(opt.id)}
+                    className={`min-h-[26px] px-2 rounded-md border text-[10px] font-medium transition-colors font-mono tabular-nums ${
+                      active
+                        ? opt.activeClass
+                        : 'border-white/8 bg-[#111827] text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {opt.label} ({cnt})
+                  </button>
+                );
+              })}
+            </div>
+
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={() => {
+                  handleSeverityChange('all');
+                  handleCategoryChange('all');
+                }}
+                className="min-h-[24px] px-2 rounded-md border border-white/10 bg-white/5 hover:bg-white/10 text-[10px] text-slate-300 inline-flex items-center gap-1 transition-colors"
+              >
+                <RotateCcw className="w-2.5 h-2.5" />
+                <span>Сбросить</span>
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Фильтр типа ошибок">
+            <span className="text-[10px] font-medium text-slate-400 mr-0.5">Тип ошибки:</span>
+            {CATEGORY_OPTIONS.map((opt) => {
+              const active = categoryFilter === opt.id;
+              const cnt = opt.id === 'all' ? filterCounts.all : filterCounts[opt.id];
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => handleCategoryChange(opt.id)}
+                  className={`min-h-[26px] px-2 rounded-md border text-[10px] font-medium transition-colors font-mono tabular-nums ${
+                    active
+                      ? 'border-cyan-400/50 bg-cyan-500/20 text-cyan-200'
+                      : 'border-white/8 bg-[#111827] text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {opt.label}
+                  {cnt > 0 ? ` (${cnt})` : ''}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -288,24 +461,26 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
                 <Line
                   type="monotone"
                   dataKey="errors"
-                  name="Все ошибки / час"
-                  stroke="#F43F5E"
+                  name="Ошибки / час"
+                  stroke={severityFilter === 'warning' ? '#F59E0B' : '#F43F5E'}
                   strokeWidth={2.2}
                   dot={<AnomalyMarkerDot />}
                   activeDot={{ r: 5, fill: '#F43F5E', stroke: '#FFE4E6', strokeWidth: 1.5 }}
                   isAnimationActive={false}
                 />
-                <Line
-                  type="monotone"
-                  dataKey="critical"
-                  name="Критические / час"
-                  stroke="#FB923C"
-                  strokeWidth={1.5}
-                  strokeDasharray="3 3"
-                  dot={false}
-                  activeDot={{ r: 4, fill: '#FB923C', stroke: '#070B12', strokeWidth: 1 }}
-                  isAnimationActive={false}
-                />
+                {severityFilter === 'all' && (
+                  <Line
+                    type="monotone"
+                    dataKey="critical"
+                    name="Критические / час"
+                    stroke="#FB923C"
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    dot={false}
+                    activeDot={{ r: 4, fill: '#FB923C', stroke: '#070B12', strokeWidth: 1 }}
+                    isAnimationActive={false}
+                  />
+                )}
               </LineChart>
             </ResponsiveContainer>
           </div>
@@ -313,13 +488,24 @@ export const SyncErrorIntensityChart: React.FC<SyncErrorIntensityChartProps> = R
           <div className="mt-2 px-1 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400">
             <div className="flex flex-wrap items-center gap-3">
               <span className="inline-flex items-center gap-1.5">
-                <span className="w-3 h-0.5 rounded bg-rose-500" aria-hidden="true" />
-                <span>Все ошибки / ч</span>
+                <span
+                  className={`w-3 h-0.5 rounded ${severityFilter === 'warning' ? 'bg-amber-400' : 'bg-rose-500'}`}
+                  aria-hidden="true"
+                />
+                <span>
+                  {severityFilter === 'critical'
+                    ? 'Критические / ч'
+                    : severityFilter === 'warning'
+                      ? 'Предупреждения / ч'
+                      : 'Все ошибки / ч'}
+                </span>
               </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="w-3 h-0.5 rounded border-t border-dashed border-orange-400" aria-hidden="true" />
-                <span>Критические / ч</span>
-              </span>
+              {severityFilter === 'all' && (
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-3 h-0.5 rounded border-t border-dashed border-orange-400" aria-hidden="true" />
+                  <span>Критические / ч</span>
+                </span>
+              )}
               <span className="inline-flex items-center gap-1.5">
                 <span className="w-3 h-0.5 rounded border-t border-dashed border-amber-400" aria-hidden="true" />
                 <span>Порог аномалии</span>

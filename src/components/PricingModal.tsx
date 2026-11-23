@@ -52,6 +52,8 @@ interface PricingModalProps {
   initialMaxMultiplier?: MaxMultiplier;
   /** Позволяет мгновенно переключить тестовый тариф для проверки функций до релиза Google Play Billing. */
   onActivateDemoTier?: (tier: PlanTier, maxMultiplier?: MaxMultiplier) => void;
+  /** Открывает чат поддержки / справку для запроса доступа к подписке. */
+  onOpenSupport?: () => void;
 }
 
 const FREE_FEATURES = [
@@ -105,12 +107,13 @@ export const PricingModal: React.FC<PricingModalProps> = ({
   initialTier = 'pro',
   initialMaxMultiplier = 10,
   onActivateDemoTier,
+  onOpenSupport,
 }) => {
   const [data, setData] = useState<PlansResponse | null>(null);
   const [selectedTier, setSelectedTier] = useState<CheckoutTier>(initialTier);
   const [maxMultiplier, setMaxMultiplier] = useState<MaxMultiplier>(initialMaxMultiplier);
   const [period, setPeriod] = useState<Period>('year');
-  const [busyAction, setBusyAction] = useState<'pay' | 'restore' | null>(null);
+  const [busyAction, setBusyAction] = useState<'restore' | null>(null);
   const [statusNotice, setStatusNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | null>(null);
 
   useEffect(() => {
@@ -174,69 +177,24 @@ export const PricingModal: React.FC<PricingModalProps> = ({
 
   const selectedQuota = isMaxSelected ? maxQuota : PRO_MONTHLY_QUOTA;
 
-  const handleCheckout = async () => {
+  const handleCheckout = () => {
     triggerHaptic(12);
-    setBusyAction('pay');
     setStatusNotice(null);
 
-    try {
-      const res = await authFetch('/api/billing/checkout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          period,
-          tier: selectedTier,
-          maxMultiplier,
-        }),
-      });
-      const parsed = await parseJsonResponse<{ invoiceUrl?: string; error?: string }>(res);
-
-      if (parsed.ok && typeof parsed.data?.invoiceUrl === 'string') {
-        const invoiceUrl = parsed.data.invoiceUrl.trim();
-        if (/^https:\/\/([a-z0-9-]+\.)?nowpayments\.io\//i.test(invoiceUrl)) {
-          window.location.assign(invoiceUrl);
-          return;
-        }
-        setStatusNotice({
-          tone: 'err',
-          text: 'Платёжный шлюз вернул недопустимый адрес счёта. Попробуйте ещё раз позже.',
-        });
-        return;
-      }
-
-      if (res.status === 401) {
-        setStatusNotice({
-          tone: 'info',
-          text: 'Войдите в аккаунт Google, чтобы оформить подписку и привязать тариф к вашему профилю.',
-        });
-        return;
-      }
-
-      // В DEV-превью допускаем локальный тест тарифа только когда биллинг не сконфигурирован
-      if (import.meta.env.DEV && !data?.enabled && onActivateDemoTier) {
-        onActivateDemoTier(selectedTier, maxMultiplier);
-        setStatusNotice({
-          tone: 'ok',
-          text: `Локальный DEV-тест: включён тариф ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} (${selectedQuota.toLocaleString('ru-RU')} кр./мес). В production активация происходит только после подтверждённой оплаты.`,
-        });
-        return;
-      }
-
+    // В DEV-превью допускаем локальный тест тарифа для проверки функций до релиза Google Play Billing
+    if (import.meta.env.DEV && onActivateDemoTier) {
+      onActivateDemoTier(selectedTier, maxMultiplier);
       setStatusNotice({
-        tone: 'err',
-        text:
-          parsed.data?.error ||
-          parsed.errorMessage ||
-          'Платёжный шлюз временно недоступен. Попробуйте повторить попытку позже.',
+        tone: 'ok',
+        text: `Локальный DEV-тест: включён тариф ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} (${selectedQuota.toLocaleString('ru-RU')} кр./мес). В production активация выполняется через Google Play Billing.`,
       });
-    } catch {
-      setStatusNotice({
-        tone: 'err',
-        text: 'Не удалось связаться с сервером оплаты. Проверьте подключение к сети.',
-      });
-    } finally {
-      setBusyAction(null);
+      return;
     }
+
+    setStatusNotice({
+      tone: 'info',
+      text: `Оформление подписки ${isMaxSelected ? `MAX ×${maxMultiplier}` : 'PRO'} ($${activePrice} / ${period === 'year' ? 'год' : 'мес'}) выполняется через Google Play Billing после публикации в Google Play. Если у вас уже есть активная подписка — нажмите «Восстановить покупки» или свяжитесь с поддержкой.`,
+    });
   };
 
   const handleRestorePurchases = async () => {
@@ -631,9 +589,19 @@ export const PricingModal: React.FC<PricingModalProps> = ({
           Бэктест, Сентимент, Графики, Дневник и Алерты — 0 кр.
         </div>
 
+        {/* H1: Прозрачное уведомление о пропорциональном пересчёте остатка дней при смене тарифа */}
+        {proUntil && proUntil > Date.now() && currentPlan !== 'free' && (
+          <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/[0.07] px-3.5 py-2.5 text-[11px] leading-relaxed text-cyan-100">
+            <strong className="text-cyan-200">Сохранение оплаченных дней:</strong> при продлении текущего тарифа
+            новый период добавляется к дате окончания ({formatDate(proUntil)}). При переходе между тарифами
+            (PRO ↔ MAX ×10 ↔ MAX ×20) оставшиеся оплаченные дни не сгорают — сервер автоматически
+            пересчитывает их стоимость в эквивалентные дни нового тарифа.
+          </div>
+        )}
+
         {statusNotice && (
           <div
-            className={`rounded-xl border px-3.5 py-2.5 text-xs ${
+            className={`rounded-xl border px-3.5 py-2.5 text-xs space-y-2 ${
               statusNotice.tone === 'ok'
                 ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-200'
                 : statusNotice.tone === 'err'
@@ -641,7 +609,16 @@ export const PricingModal: React.FC<PricingModalProps> = ({
                   : 'border-cyan-500/35 bg-cyan-500/10 text-cyan-200'
             }`}
           >
-            {statusNotice.text}
+            <div>{statusNotice.text}</div>
+            {statusNotice.tone === 'info' && onOpenSupport && (
+              <button
+                type="button"
+                onClick={onOpenSupport}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-400/35 bg-cyan-500/15 hover:bg-cyan-500/25 px-3 py-1.5 text-[11px] font-semibold text-cyan-100 transition-colors"
+              >
+                Связаться с поддержкой
+              </button>
+            )}
           </div>
         )}
 
@@ -649,22 +626,16 @@ export const PricingModal: React.FC<PricingModalProps> = ({
         <button
           type="button"
           disabled={busyAction !== null}
-          onClick={() => void handleCheckout()}
+          onClick={handleCheckout}
           className={`cta-shimmer min-h-[50px] w-full rounded-xl disabled:opacity-50 text-slate-950 text-sm font-bold transition-all flex items-center justify-center gap-2 shadow-lg ${
             isMaxSelected
               ? 'bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 hover:brightness-105'
               : 'bg-gradient-to-r from-amber-400 via-emerald-400 to-teal-400 hover:brightness-105'
           }`}
         >
-          {busyAction === 'pay' ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
-          ) : (
-            <CreditCard className="w-4 h-4" />
-          )}
+          <CreditCard className="w-4 h-4" />
           <span>
-            {busyAction === 'pay'
-              ? 'Создание защищённого счёта…'
-              : `Оформить ${isMaxSelected ? `MAX ×${maxMultiplier} (${selectedQuota.toLocaleString('ru-RU')} кр./мес)` : `PRO (${selectedQuota.toLocaleString('ru-RU')} кр./мес)`} — $${activePrice}`}
+            {`Оформить ${isMaxSelected ? `MAX ×${maxMultiplier} (${selectedQuota.toLocaleString('ru-RU')} кр./мес)` : `PRO (${selectedQuota.toLocaleString('ru-RU')} кр./мес)`} — $${activePrice}`}
           </span>
         </button>
 
@@ -672,7 +643,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({
         <div className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-400 border-t border-white/8 pt-3">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
           <p>
-            Активация тарифа выполняется строго сервером после криптографического подтверждения оплаты (IPN / защищённый чек). Средства клиентов в терминале не хранятся — вы можете проверить актуальный статус подписки в любой момент кнопкой «Восстановить покупки».
+            Активация тарифа выполняется строго сервером после верификации подписки (Google Play Billing). Средства клиентов в терминале не хранятся — вы можете проверить актуальный статус подписки в любой момент кнопкой «Восстановить покупки».
           </p>
         </div>
       </div>

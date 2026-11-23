@@ -363,6 +363,41 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    // Validation Blueprint: SyncErrorLogRecord (PRO/MAX Cross-Device Sync Error Logs)
+    function isValidSyncErrorLog(data, userId, logId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'keyId', 'exchange', 'label', 'testnet',
+          'severity', 'category', 'errorMessage', 'occurredAt', 'occurredAtMs',
+          'source', 'balanceUsdt', 'assetsCount', 'httpStatus', 'endpoint',
+          'rawApiResponse', 'stackTrace', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'keyId', 'exchange', 'label', 'testnet',
+          'severity', 'category', 'errorMessage', 'occurredAt', 'occurredAtMs',
+          'source', 'balanceUsdt', 'assetsCount', 'httpStatus', 'endpoint',
+          'rawApiResponse', 'stackTrace', 'createdAt'
+        ])
+        && data.id is string && data.id == logId && isShortId(data.id)
+        && data.userId is string && data.userId == userId && isValidId(data.userId)
+        && data.keyId is string && data.keyId.size() <= 80
+        && data.exchange in ['binance', 'bybit', 'okx']
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 64
+        && data.testnet is bool
+        && data.severity in ['success', 'warning', 'critical']
+        && data.category in ['success', 'rate_limit', 'auth', 'network', 'exchange_api', 'unknown']
+        && data.errorMessage is string && data.errorMessage.size() >= 1 && data.errorMessage.size() <= 300
+        && data.occurredAt is string && data.occurredAt.size() >= 1 && data.occurredAt.size() <= 64
+        && data.occurredAtMs is int && data.occurredAtMs > 0
+        && data.source in ['background', 'manual']
+        && (data.balanceUsdt is int || data.balanceUsdt is float) && data.balanceUsdt >= 0 && data.balanceUsdt <= 1000000000
+        && data.assetsCount is int && data.assetsCount >= 0 && data.assetsCount <= 10000
+        && data.httpStatus is int && (data.httpStatus == 0 || (data.httpStatus >= 100 && data.httpStatus <= 599))
+        && data.endpoint is string && data.endpoint.size() <= 240
+        && data.rawApiResponse is string && data.rawApiResponse.size() <= 1600
+        && data.stackTrace is string && data.stackTrace.size() <= 1600
+        && data.createdAt is timestamp;
+    }
+
     // Master Gate: /users/{userId}
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwnerRead(userId);
@@ -734,14 +769,50 @@ service cloud.firestore {
 
         allow delete: if isValidId(userId) && isShortId(targetId) && isVerifiedOwner(userId);
       }
+
+      // Subcollection: Cross-Device Exchange Sync Error Logs (PRO & MAX Subscribers Only)
+      match /syncErrorLogs/{logId} {
+        allow get: if isValidId(userId) && isShortId(logId) && isOwnerRead(userId) && isActiveProUser(userId);
+        allow list: if isOwnerRead(userId) && isActiveProUser(userId) && resource.data.userId == request.auth.uid;
+
+        allow create: if isValidId(userId)
+          && isShortId(logId)
+          && isVerifiedOwner(userId)
+          && isActiveProUser(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidSyncErrorLog(incoming(), userId, logId)
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+        allow delete: if isValidId(userId) && isShortId(logId) && isVerifiedOwner(userId) && isActiveProUser(userId);
+      }
+
+      // Subcollection: Server-Authored Security Audit Log (2FA / Session Revocation — Admin SDK writes only)
+      match /securityLog/{logId} {
+        allow get: if isValidId(userId) && isShortId(logId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.userId == request.auth.uid;
+        allow write: if false;
+      }
     }
 
-    // Server-Only Root Collections (Admin SDK only — billing IPN ledger & support inbox)
+    // Server-Only Root Collections (Admin SDK only — billing IPN ledger, support inbox, budgets & alerts)
     match /payments/{orderId} {
       allow read, write: if false;
     }
 
     match /supportInbox/{ticketId} {
+      allow read, write: if false;
+    }
+
+    match /usage/{docId} {
+      allow read, write: if false;
+    }
+
+    match /adminAlerts/{alertId} {
+      allow read, write: if false;
+    }
+
+    match /supportRateLimits/{keyId} {
       allow read, write: if false;
     }
   }

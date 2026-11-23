@@ -14,7 +14,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { AnimatePresence, LayoutGroup, MotionConfig, motion, useScroll, useSpring } from 'motion/react';
+import { AnimatePresence, LayoutGroup, MotionConfig, motion, useReducedMotion, useScroll, useSpring } from 'motion/react';
 import { BottomSheet, BottomSheetItem } from './components/BottomSheet';
 import { InterfaceTour, TOUR_STORAGE_KEY } from './components/InterfaceTour';
 import { LegalConsentModal, LegalDocumentModal, type LegalDocKind } from './components/LegalConsentModal';
@@ -22,7 +22,13 @@ import { LockScreenOverlay } from './components/LockScreenOverlay';
 import type { ScreenerSection } from './components/MarketScreenerView';
 import type { StrategiesSection } from './components/StrategiesView';
 import { MiniPortfolioWidget } from './components/MiniPortfolioWidget';
-import { NATIVE_PILL_SPRING, tabSlideBlurVariants } from './components/MotionPrimitives';
+import {
+  NATIVE_PILL_SPRING,
+  tabFadeOnlyVariants,
+  tabParallaxContentVariants,
+  tabParallaxDepthSheenVariants,
+  tabSlideBlurVariants,
+} from './components/MotionPrimitives';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PinLockOverlay } from './components/PinLockOverlay';
 import { PWAInstallButton } from './components/PWAInstallButton';
@@ -98,12 +104,19 @@ import {
   classifyExchangeSyncSeverity,
   clearExchangeSyncErrorLogs,
   extractExchangeSyncTechnicalDetails,
+  persistExchangeSyncLogs,
   readExchangeSyncAutoCleanupEnabled,
   readExchangeSyncErrorLogs,
   runExchangeSyncLogAutoCleanup,
   writeExchangeSyncAutoCleanupEnabled,
   type ExchangeSyncErrorLogEntry,
 } from './lib/exchangeSyncErrorLog';
+import {
+  clearCloudExchangeSyncLogs,
+  mergeLocalAndCloudSyncLogs,
+  pullCloudExchangeSyncLogs,
+  pushExchangeSyncLogToCloud,
+} from './lib/exchangeSyncCloudSync';
 import type { ActiveStrategySignalOverlay } from './lib/strategyEngine';
 import {
   cleanupOldCache,
@@ -211,7 +224,10 @@ function getInitialWidgetFromUrl(): {
 const TAB_ORDER: AppTab[] = ['market', 'screener', 'strategies', 'news', 'security'];
 
 export default function App() {
+  const prefersReducedMotion = useReducedMotion();
   const [activeTab, setActiveTab] = useState<AppTab>(getInitialTabFromUrl);
+  const activeTabRef = useRef<AppTab>(activeTab);
+  activeTabRef.current = activeTab;
   const [tabDirection, setTabDirection] = useState<number>(1);
   const [standaloneWidget, setStandaloneWidget] = useState<{
     kind: AndroidWidgetKind;
@@ -322,17 +338,7 @@ export default function App() {
     setDemoPlanOverrideState(override);
   }, []);
 
-  const initialPaymentStatusRef = useRef<string | null>(
-    typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('payment') : null
-  );
-  const [paymentNotice, setPaymentNotice] = useState<string | null>(() => {
-    const status = initialPaymentStatusRef.current;
-    if (status === 'success') {
-      return 'Оплата принята. Синхронизируем статус подписки с сервером…';
-    }
-    if (status === 'cancel') return 'Оплата отменена. Деньги не списаны.';
-    return null;
-  });
+  const [paymentNotice, setPaymentNotice] = useState<string | null>(null);
   const [pendingLoginPushUid, setPendingLoginPushUid] = useState<string | null>(null);
   const [targetReachedNotice, setTargetReachedNotice] = useState<string | null>(null);
   const [localPortfolioTargets, setLocalPortfolioTargets] = useState<PortfolioTargetRecord[]>(() => {
@@ -413,19 +419,17 @@ export default function App() {
   }, []);
 
   const handleSwitchTab = useCallback((tab: AppTab) => {
-    let isSameTab = false;
-    setActiveTab((prev) => {
-      if (prev === tab) {
-        isSameTab = true;
-        return prev;
-      }
+    const prev = activeTabRef.current;
+    const isSameTab = prev === tab;
+    if (!isSameTab) {
       const prevIdx = TAB_ORDER.indexOf(prev);
       const nextIdx = TAB_ORDER.indexOf(tab);
-      if (prevIdx !== -1 && nextIdx !== -1 && nextIdx !== prevIdx) {
+      if (prevIdx !== -1 && nextIdx !== -1) {
         setTabDirection(nextIdx > prevIdx ? 1 : -1);
       }
-      return tab;
-    });
+      activeTabRef.current = tab;
+      setActiveTab(tab);
+    }
     if (typeof window !== 'undefined') {
       // Smooth scroll to top when re-tapping active tab; snap when switching tabs
       window.scrollTo({ top: 0, behavior: isSameTab ? 'smooth' : 'auto' });
@@ -517,45 +521,6 @@ export default function App() {
 
   const isSignedIn = Boolean(authReady && firebaseUser);
 
-  // При возврате с платёжного шлюза (/?payment=success) очищаем URL и запрашиваем актуальные права у сервера
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.has('payment')) {
-      params.delete('payment');
-      const cleanQuery = params.toString();
-      const nextUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash}`;
-      window.history.replaceState({}, '', nextUrl);
-    }
-
-    if (initialPaymentStatusRef.current !== 'success' || !isSignedIn) return;
-    initialPaymentStatusRef.current = null;
-    let cancelled = false;
-    void authFetch('/api/entitlements/me', { method: 'GET', cache: 'no-store' })
-      .then((res) =>
-        parseJsonResponse<{ plan?: PlanTier; proUntil?: number | null; creditsRemaining?: number }>(res)
-      )
-      .then((parsed) => {
-        if (cancelled) return;
-        if (parsed.ok && parsed.data && parsed.data.plan && parsed.data.plan !== 'free') {
-          setPaymentNotice(
-            `Подписка ${parsed.data.plan.toUpperCase()} активирована! Доступно ${parsed.data.creditsRemaining ?? 0} AI-кредитов.`
-          );
-        } else {
-          setPaymentNotice(
-            'Оплата получена. Тариф обновится автоматически сразу после подтверждения платежа (обычно до 1 минуты).'
-          );
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setPaymentNotice('Оплата получена. Тариф обновится автоматически в течение минуты.');
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isSignedIn]);
-
   const paperPortfolio = usePaperPortfolio();
   const portfolioSourceRef = useRef(paperPortfolio.portfolioSource);
   portfolioSourceRef.current = paperPortfolio.portfolioSource;
@@ -563,18 +528,80 @@ export default function App() {
 
   const bgSyncedKeyIdsRef = useRef<Set<string>>(new Set());
   const bgSyncUidRef = useRef<string | null>(null);
+  const cloudSyncBootKeyRef = useRef<string | null>(null);
   const [exchangeSyncErrorLogs, setExchangeSyncErrorLogs] = useState<ExchangeSyncErrorLogEntry[]>([]);
   const [syncLogAutoCleanup30d, setSyncLogAutoCleanup30d] = useState<boolean>(true);
+  const [syncLogCloudStatus, setSyncLogCloudStatus] = useState<'idle' | 'syncing' | 'synced' | 'locked'>('locked');
+
+  const isRealProForCloudSync = Boolean(firebaseUser?.uid && isProSubscriptionActive(profile));
+  const isRealProForCloudSyncRef = useRef(isRealProForCloudSync);
+  isRealProForCloudSyncRef.current = isRealProForCloudSync;
+
+  const pushLatestSyncLogIfPro = useCallback(
+    (uid: string, nextLogs: ExchangeSyncErrorLogEntry[]) => {
+      if (!isRealProForCloudSyncRef.current || nextLogs.length === 0) return;
+      const latest = nextLogs[0];
+      if (!latest) return;
+      void pushExchangeSyncLogToCloud(uid, latest);
+    },
+    []
+  );
 
   useEffect(() => {
     const uid = firebaseUser?.uid ?? null;
     if (bgSyncUidRef.current !== uid) {
       bgSyncUidRef.current = uid;
       bgSyncedKeyIdsRef.current.clear();
+      cloudSyncBootKeyRef.current = null;
     }
     setSyncLogAutoCleanup30d(readExchangeSyncAutoCleanupEnabled(uid));
     setExchangeSyncErrorLogs(uid ? readExchangeSyncErrorLogs(uid) : []);
   }, [firebaseUser?.uid]);
+
+  // Фоновая синхронизация локальных логов ошибок с Firestore для активных PRO/MAX пользователей
+  useEffect(() => {
+    const uid = firebaseUser?.uid ?? null;
+    if (!authReady || !uid || !isRealProForCloudSync) {
+      setSyncLogCloudStatus('locked');
+      return;
+    }
+    const bootKey = `${uid}:pro`;
+    if (cloudSyncBootKeyRef.current === bootKey) return;
+    cloudSyncBootKeyRef.current = bootKey;
+
+    let cancelled = false;
+    setSyncLogCloudStatus('syncing');
+
+    void pullCloudExchangeSyncLogs(uid)
+      .then(({ logs: cloudLogs, ok }) => {
+        if (cancelled || bgSyncUidRef.current !== uid) return;
+        if (!ok) {
+          setSyncLogCloudStatus('idle');
+          return;
+        }
+        const localLogs = readExchangeSyncErrorLogs(uid);
+        const autoClean = readExchangeSyncAutoCleanupEnabled(uid);
+        const { merged, localOnlyToPush } = mergeLocalAndCloudSyncLogs(localLogs, cloudLogs, {
+          autoCleanup30d: autoClean,
+        });
+        persistExchangeSyncLogs(uid, merged);
+        setExchangeSyncErrorLogs(merged);
+        setSyncLogCloudStatus('synced');
+
+        if (localOnlyToPush.length > 0) {
+          void Promise.allSettled(
+            localOnlyToPush.map((entry) => pushExchangeSyncLogToCloud(uid, entry))
+          );
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSyncLogCloudStatus('idle');
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, firebaseUser?.uid, isRealProForCloudSync]);
 
   const handleClearExchangeSyncErrorLogs = useCallback(() => {
     const uid = firebaseUser?.uid;
@@ -583,6 +610,9 @@ export default function App() {
       return;
     }
     setExchangeSyncErrorLogs(clearExchangeSyncErrorLogs(uid));
+    if (isRealProForCloudSyncRef.current) {
+      void clearCloudExchangeSyncLogs(uid);
+    }
   }, [firebaseUser?.uid]);
 
   const handleToggleSyncLogAutoCleanup30d = useCallback(
@@ -694,6 +724,7 @@ export default function App() {
             assetsCount: sync.assets.length,
             source: 'background',
           });
+          pushLatestSyncLogIfPro(activeUid, nextLogs);
           if (!isMountedRef.current || bgSyncUidRef.current !== activeUid) return;
           setExchangeSyncErrorLogs(nextLogs);
           const src = portfolioSourceRef.current;
@@ -719,6 +750,7 @@ export default function App() {
             source: 'background',
             technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/sync'),
           });
+          pushLatestSyncLogIfPro(activeUid, nextLogs);
           if (isMountedRef.current && bgSyncUidRef.current === activeUid) {
             setExchangeSyncErrorLogs(nextLogs);
           }
@@ -732,7 +764,7 @@ export default function App() {
         }
       })
     );
-  }, [authReady, firebaseUser, exchangeKeys, syncExchangeKey, syncPortfolioFromExchange, dispatchCriticalSyncPushIfNeeded]);
+  }, [authReady, firebaseUser, exchangeKeys, syncExchangeKey, syncPortfolioFromExchange, dispatchCriticalSyncPushIfNeeded, pushLatestSyncLogIfPro]);
 
   const isBackgroundSyncingActiveExchange = useMemo(() => {
     if (paperPortfolio.portfolioSource.mode !== 'exchange' || !paperPortfolio.portfolioSource.exchange) {
@@ -1198,7 +1230,7 @@ export default function App() {
   };
 
   const handleLoginWithPush = async () => {
-    if (!legalConsent) {
+    if (!legalConsent || !legalConsent.acceptedAuthDataTransfer) {
       setLegalConsentMode('auth');
       setPendingLoginAfterConsent(true);
       setLegalConsentOpen(true);
@@ -1391,17 +1423,17 @@ export default function App() {
       async () => {
         const res = await connectExchangeKey(params);
         if (firebaseUser?.uid) {
-          setExchangeSyncErrorLogs(
-            appendExchangeSyncSuccessLog(firebaseUser.uid, {
-              keyId: res.key.id,
-              exchange: res.key.exchange,
-              label: res.key.label,
-              testnet: res.key.testnet,
-              totalBalanceUsdt: res.sync.totalBalanceUsdt,
-              assetsCount: res.sync.assets.length,
-              source: 'manual',
-            })
-          );
+          const nextLogs = appendExchangeSyncSuccessLog(firebaseUser.uid, {
+            keyId: res.key.id,
+            exchange: res.key.exchange,
+            label: res.key.label,
+            testnet: res.key.testnet,
+            totalBalanceUsdt: res.sync.totalBalanceUsdt,
+            assetsCount: res.sync.assets.length,
+            source: 'manual',
+          });
+          setExchangeSyncErrorLogs(nextLogs);
+          pushLatestSyncLogIfPro(firebaseUser.uid, nextLogs);
         }
         if (res.sync.assets.length > 0) {
           paperPortfolio.syncFromExchange(
@@ -1424,17 +1456,17 @@ export default function App() {
     try {
       const sync = await syncExchangeKey(key);
       if (uid) {
-        setExchangeSyncErrorLogs(
-          appendExchangeSyncSuccessLog(uid, {
-            keyId: key.id,
-            exchange: key.exchange,
-            label: key.label,
-            testnet: key.testnet,
-            totalBalanceUsdt: sync.totalBalanceUsdt,
-            assetsCount: sync.assets.length,
-            source: 'manual',
-          })
-        );
+        const nextLogs = appendExchangeSyncSuccessLog(uid, {
+          keyId: key.id,
+          exchange: key.exchange,
+          label: key.label,
+          testnet: key.testnet,
+          totalBalanceUsdt: sync.totalBalanceUsdt,
+          assetsCount: sync.assets.length,
+          source: 'manual',
+        });
+        setExchangeSyncErrorLogs(nextLogs);
+        pushLatestSyncLogIfPro(uid, nextLogs);
       }
       if (applyToPortfolio) {
         paperPortfolio.syncFromExchange(key.exchange, key.label, sync.assets, sync.syncedAt);
@@ -1446,17 +1478,17 @@ export default function App() {
           err instanceof Error && err.message.trim()
             ? err.message.trim()
             : 'Ошибка ручной синхронизации биржи.';
-        setExchangeSyncErrorLogs(
-          appendExchangeSyncErrorLog(uid, {
-            keyId: key.id,
-            exchange: key.exchange,
-            label: key.label,
-            testnet: key.testnet,
-            errorMessage,
-            source: 'manual',
-            technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/sync'),
-          })
-        );
+        const nextLogs = appendExchangeSyncErrorLog(uid, {
+          keyId: key.id,
+          exchange: key.exchange,
+          label: key.label,
+          testnet: key.testnet,
+          errorMessage,
+          source: 'manual',
+          technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/sync'),
+        });
+        setExchangeSyncErrorLogs(nextLogs);
+        pushLatestSyncLogIfPro(uid, nextLogs);
         dispatchCriticalSyncPushIfNeeded({
           keyId: key.id,
           exchange: key.exchange,
@@ -1488,17 +1520,17 @@ export default function App() {
         try {
           const res = await updateExchangeKey(existingKey, params);
           if (uid) {
-            setExchangeSyncErrorLogs(
-              appendExchangeSyncSuccessLog(uid, {
-                keyId: res.key.id,
-                exchange: res.key.exchange,
-                label: res.key.label,
-                testnet: res.key.testnet,
-                totalBalanceUsdt: res.sync.totalBalanceUsdt,
-                assetsCount: res.sync.assets.length,
-                source: 'manual',
-              })
-            );
+            const nextLogs = appendExchangeSyncSuccessLog(uid, {
+              keyId: res.key.id,
+              exchange: res.key.exchange,
+              label: res.key.label,
+              testnet: res.key.testnet,
+              totalBalanceUsdt: res.sync.totalBalanceUsdt,
+              assetsCount: res.sync.assets.length,
+              source: 'manual',
+            });
+            setExchangeSyncErrorLogs(nextLogs);
+            pushLatestSyncLogIfPro(uid, nextLogs);
           }
           const src = portfolioSourceRef.current;
           if (
@@ -1519,17 +1551,17 @@ export default function App() {
               err instanceof Error && err.message.trim()
                 ? err.message.trim()
                 : 'Не удалось обновить API-ключ биржи.';
-            setExchangeSyncErrorLogs(
-              appendExchangeSyncErrorLog(uid, {
-                keyId: existingKey.id,
-                exchange: existingKey.exchange,
-                label: params.label.trim() || existingKey.label,
-                testnet: params.testnet,
-                errorMessage,
-                source: 'manual',
-                technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/connect'),
-              })
-            );
+            const nextLogs = appendExchangeSyncErrorLog(uid, {
+              keyId: existingKey.id,
+              exchange: existingKey.exchange,
+              label: params.label.trim() || existingKey.label,
+              testnet: params.testnet,
+              errorMessage,
+              source: 'manual',
+              technicalDetails: extractExchangeSyncTechnicalDetails(err, 'POST /api/exchanges/connect'),
+            });
+            setExchangeSyncErrorLogs(nextLogs);
+            pushLatestSyncLogIfPro(uid, nextLogs);
             dispatchCriticalSyncPushIfNeeded({
               keyId: existingKey.id,
               exchange: existingKey.exchange,
@@ -1692,6 +1724,7 @@ export default function App() {
     { id: 'news', label: 'Новости', mobileLabel: 'Новости', icon: <Newspaper className="w-5 h-5" /> },
     { id: 'security', label: 'Безопасность', mobileLabel: 'Защита', icon: <ShieldCheck className="w-5 h-5" /> },
   ];
+  const activeTabLabel = navItems.find((item) => item.id === activeTab)?.label;
 
   if (standaloneWidget) {
     return (
@@ -2055,19 +2088,32 @@ export default function App() {
           </div>
         )}
 
-        {/* Скрываем и полностью размонтируем неактивные вкладки (mode="wait" + React.lazy), чтобы снизить расход RAM на мобильных устройствах */}
-        <div className="relative w-full">
+        {/* Плавное исчезновение и появление контента с параллаксом по оси X и размытием (mode="wait" + React.lazy) */}
+        <div className="relative w-full overflow-x-clip">
           <AnimatePresence mode="wait" initial={false} custom={tabDirection}>
             <motion.div
               key={activeTab}
               custom={tabDirection}
-              variants={tabSlideBlurVariants}
+              variants={prefersReducedMotion ? tabFadeOnlyVariants : tabSlideBlurVariants}
               initial="initial"
               animate="animate"
               exit="exit"
-              className="w-full will-change-transform"
+              className="relative w-full will-change-[transform,opacity,filter]"
             >
-            <Suspense fallback={<ViewFallback />}>
+            {!prefersReducedMotion && (
+              <motion.div
+                aria-hidden="true"
+                custom={tabDirection}
+                variants={tabParallaxDepthSheenVariants}
+                className="pointer-events-none absolute inset-x-0 -top-2 h-28 rounded-3xl bg-gradient-to-r from-emerald-500/[0.07] via-cyan-400/[0.06] to-transparent blur-2xl"
+              />
+            )}
+            <motion.div
+              custom={tabDirection}
+              variants={prefersReducedMotion ? undefined : tabParallaxContentVariants}
+              className="relative z-10 w-full will-change-transform"
+            >
+            <Suspense fallback={<ViewFallback tabLabel={activeTabLabel} />}>
             {activeTab === 'market' && (
               <MarketTerminalView
                 profile={effectiveProfile}
@@ -2216,8 +2262,11 @@ export default function App() {
                 backgroundSyncingKeyIds={backgroundSyncingKeyIds}
                 exchangeSyncErrorLogs={exchangeSyncErrorLogs}
                 onClearExchangeSyncErrorLogs={handleClearExchangeSyncErrorLogs}
+                userEmail={firebaseUser?.email || privateSecurity?.email || ''}
+                onCreateSupportTicket={createSupportTicket}
                 syncLogAutoCleanup30d={syncLogAutoCleanup30d}
                 onToggleSyncLogAutoCleanup30d={handleToggleSyncLogAutoCleanup30d}
+                syncLogCloudStatus={syncLogCloudStatus}
                 portfolioSource={paperPortfolio.portfolioSource}
                 onConnectExchange={handleConnectExchangeWithSync}
                 onSyncExchange={handleSyncExchangeToPortfolio}
@@ -2251,6 +2300,7 @@ export default function App() {
               />
             )}
             </Suspense>
+            </motion.div>
             </motion.div>
           </AnimatePresence>
         </div>
@@ -2322,6 +2372,10 @@ export default function App() {
                   }
                 : undefined
             }
+            onOpenSupport={() => {
+              setPricingOpen(false);
+              setAssistantSheetOpen(true);
+            }}
           />
         </Suspense>
       )}

@@ -27,7 +27,7 @@ export const IMMUTABLE_CREDIT_COSTS: Readonly<Record<BillableAction, number>> = 
   ai_assistant: 1,
   sentiment_pro: 0,
   pnl_backtest: 0,
-  strategy_scan: 1,
+  strategy_scan: 0,
 });
 
 export const IMMUTABLE_WEEKLY_QUOTAS = Object.freeze({

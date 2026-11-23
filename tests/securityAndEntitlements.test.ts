@@ -21,7 +21,6 @@ import {
   matchBackupCodeHash,
   verifyTotpCodeWithStep,
 } from '../server/security.ts';
-import { verifyIpnSignature } from '../server/billing.ts';
 
 test('A2: Free user with expired ISO nextResetAt resets to 25 credits and ISO +7 days', () => {
   const now = Date.now();
@@ -164,42 +163,4 @@ test('C3: 10-char HMAC-SHA256 backup codes and TOTP step verification work clean
   const verified = verifyTotpCodeWithStep(totpSecret, codeNow, 1, now);
   assert.equal(verified.valid, true);
   assert.equal(typeof verified.matchedStep, 'number');
-});
-
-test('A4: NOWPayments IPN HMAC-SHA512 signature verification accepts valid and rejects tampered payloads', () => {
-  const previousSecret = process.env.NOWPAYMENTS_IPN_SECRET;
-  const testSecret = 'unit_test_ipn_secret_key_2026';
-  process.env.NOWPAYMENTS_IPN_SECRET = testSecret;
-
-  try {
-    const payload = {
-      payment_status: 'finished',
-      order_id: 'v2_uid123_pro_month_10_1700000000000',
-      price_amount: 29,
-      pay_currency: 'usdttrc20',
-    };
-    const canonical = JSON.stringify(
-      Object.keys(payload)
-        .sort()
-        .reduce<Record<string, unknown>>((acc, key) => {
-          acc[key] = payload[key as keyof typeof payload];
-          return acc;
-        }, {})
-    );
-    const validSig = crypto.createHmac('sha512', testSecret).update(canonical).digest('hex');
-
-    assert.equal(verifyIpnSignature(payload, validSig), true);
-    assert.equal(
-      verifyIpnSignature({ ...payload, price_amount: 0.01 }, validSig),
-      false,
-      'Tampered payload must be rejected'
-    );
-    assert.equal(verifyIpnSignature(payload, undefined), false);
-  } finally {
-    if (previousSecret === undefined) {
-      delete process.env.NOWPAYMENTS_IPN_SECRET;
-    } else {
-      process.env.NOWPAYMENTS_IPN_SECRET = previousSecret;
-    }
-  }
 });

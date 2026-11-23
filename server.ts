@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import compression from 'compression';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import http from 'http';
@@ -8,19 +9,31 @@ import QRCode from 'qrcode';
 import { createServer as createViteServer } from 'vite';
 import { serverLogger } from './server/logger.ts';
 import { applySecurityHeaders } from './server/middleware/securityHeaders.ts';
-import { isAllowedPushEndpoint, requireAuth, verifyFirebaseIdToken } from './server/auth.ts';
 import {
-  createCheckout,
+  isAllowedPushEndpoint,
+  requireAuth,
+  requireFreshAuth,
+  revokeUserRefreshTokens,
+  verifyFirebaseIdToken,
+} from './server/auth.ts';
+import {
+  authorize2faMutation,
+  clearMemoryTotpRecord,
+  getMemoryLastTotpStep,
+  getMemoryTotpRecord,
+  recordServerSecurityEvent,
+  requireStepUpForUser,
+  resolveUser2faState,
+  setMemoryLastTotpStep,
+  setMemoryStepUpUntil,
+  setMemoryTotpRecord,
+  STEP_UP_TTL_MS,
+} from './server/securityGuard.ts';
+import {
   getMaxMultiplierPlans,
   getPlanPrices,
   getTieredPlanPrices,
-  isBillingConfigured,
-  processIpn,
   startProExpiryMonitor,
-  verifyIpnSignature,
-  type BillingPeriod,
-  type MaxMultiplier,
-  type SubscriptionTier,
 } from './server/billing.ts';
 import {
   consumeUserCredits,
@@ -97,10 +110,48 @@ async function startServer() {
   const PORT = 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
+  // Audit G4: Диагностика критических переменных окружения при старте в production
+  if (isProd) {
+    const missingWarnings: string[] = [];
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      missingWarnings.push('FIREBASE_SERVICE_ACCOUNT_JSON (серверная проверка 2FA/квот/биллинга будет fail-closed 503)');
+    }
+    if (!process.env.BACKUP_CODE_PEPPER) {
+      missingWarnings.push('BACKUP_CODE_PEPPER (рекомендуется отдельный секретный перец для резервных кодов 2FA)');
+    }
+    if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === 'MY_GEMINI_API_KEY') {
+      missingWarnings.push('GEMINI_API_KEY (AI-анализ и чат недоступны)');
+    }
+    if (missingWarnings.length > 0) {
+      serverLogger.warn('boot', `Production security/config checklist: отсутствуют ${missingWarnings.join('; ')}`);
+    }
+  }
+
   app.set('trust proxy', 1);
 
   // Централизованные строгие HTTP-заголовки безопасности (CSP без unsafe-eval, HSTS, nosniff, DENY, Permissions-Policy)
   applySecurityHeaders(app, { isProd });
+
+  // Audit I3: Сжатие HTTP-ответов (gzip/deflate)
+  app.use(compression());
+
+  // Audit I3: Стандартный /.well-known/security.txt (RFC 9116)
+  app.get('/.well-known/security.txt', (_req, res) => {
+    const contact = process.env.SECURITY_CONTACT_EMAIL || 'security@vernier-terminal.app';
+    const expires = new Date(Date.now() + 365 * 86_400_000).toISOString();
+    res.set({
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'public, max-age=86400',
+    });
+    res.send(
+      [
+        `Contact: mailto:${contact}`,
+        `Expires: ${expires}`,
+        'Preferred-Languages: ru, en',
+        'Policy: /?tab=security',
+      ].join('\n') + '\n'
+    );
+  });
 
   app.use(express.json({ limit: '256kb' }));
 
@@ -210,6 +261,7 @@ async function startServer() {
     const header = req.headers.authorization;
     const match = typeof header === 'string' ? /^Bearer\s+(\S+)$/i.exec(header) : null;
     if (match) {
+      req.rawBearerToken = match[1];
       try {
         req.user = await verifyFirebaseIdToken(match[1]);
       } catch {
@@ -219,15 +271,10 @@ async function startServer() {
     next();
   });
 
-  // Проверка Origin / CSRF на всех мутирующих /api/* маршрутах (кроме подписанного HMAC-SHA512 IPN webhook)
+  // Проверка Origin / CSRF на всех мутирующих /api/* маршрутах
   app.use('/api', (req, res, next) => {
     const method = req.method.toUpperCase();
     if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
-      next();
-      return;
-    }
-    if (req.path === '/billing/ipn') {
-      // Внешний webhook NOWPayments защищён криптографической подписью HMAC-SHA512 (x-nowpayments-sig)
       next();
       return;
     }
@@ -370,7 +417,11 @@ async function startServer() {
   app.use('/api', generalApiLimiter);
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, timestamp: new Date().toISOString() });
+    res.json({
+      ok: true,
+      securityMode: isProd ? 'production-strict' : 'dev',
+      timestamp: new Date().toISOString(),
+    });
   });
 
   // Авторитетные серверные эндпоинты учёта тарифов и квот (клиент больше не может изменять creditsRemaining в Firestore)
@@ -659,7 +710,10 @@ async function startServer() {
       const allowedNews = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
       const symbol = allowedNews.has(requested) ? requested : 'ALL';
       const forceRefresh = req.query.refresh === '1' && allowForcedRefresh(`news:${symbol}`);
-      const news = await fetchGroundedCryptoNews(symbol, forceRefresh);
+      const budgetContext = req.user?.uid
+        ? { uid: req.user.uid, tier: await resolveAuthoritativePlan(req.user.uid) }
+        : undefined;
+      const news = await fetchGroundedCryptoNews(symbol, forceRefresh, budgetContext);
       const topHigh = news.items.find((n) => n.impact === 'HIGH');
       if (topHigh) {
         void notifyHighImpactNews(topHigh);
@@ -692,7 +746,11 @@ async function startServer() {
         res.json({ translations: {} });
         return;
       }
-      const translations = await translateNewsBatchToRussian(list);
+      const userTier = await resolveAuthoritativePlan(req.user!.uid);
+      const translations = await translateNewsBatchToRussian(list, {
+        uid: req.user!.uid,
+        tier: userTier,
+      });
       res.json({ translations });
     } catch {
       res.json({ translations: {} });
@@ -704,7 +762,10 @@ async function startServer() {
     try {
       res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       const forceRefresh = req.query.refresh === '1' && allowForcedRefresh('economic-calendar');
-      const calendar = await fetchEconomicCalendar(forceRefresh);
+      const budgetContext = req.user?.uid
+        ? { uid: req.user.uid, tier: await resolveAuthoritativePlan(req.user.uid) }
+        : undefined;
+      const calendar = await fetchEconomicCalendar(forceRefresh, budgetContext);
       res.json(calendar);
     } catch (err) {
       if (err instanceof AiServiceError) {
@@ -765,6 +826,7 @@ async function startServer() {
           leverage,
           isPro,
           planTier: dbPlan,
+          budgetContext: { uid: req.user!.uid, tier: dbPlan },
         });
 
         res.json({
@@ -808,13 +870,11 @@ async function startServer() {
     }
   };
 
-  const resolveOptionalUserTier = async (req: express.Request): Promise<'free' | 'pro' | 'max'> => {
-    const uid = await resolveOptionalUid(req);
-    return resolveAuthoritativePlan(uid);
-  };
-
-  // Серверный кэш результатов бэктеста PnL (TTL 45 сек) для предотвращения повторных нагрузок и таймаутов
+  // Серверный кэш результатов бэктеста PnL (45с для авторизованных, 3 мин для анонимных — Audit H3)
   const pnlBacktestCache = new Map<string, { report: unknown; expiresAt: number }>();
+  const anonScannerCache = new Map<string, { payload: unknown; expiresAt: number }>();
+  const anonSentimentPreviewCache = new Map<string, { payload: unknown; expiresAt: number }>();
+  const FREE_STRATEGY_KEYS = new Set(STRATEGY_CATALOG.filter((s) => s.tier === 'free').map((s) => s.key));
 
   // Quantitative Strategy PnL Portfolio Backtest (based on live/cached exchange candles)
   app.post('/api/strategies/pnl', expensiveLimiter, async (req, res) => {
@@ -829,21 +889,35 @@ async function startServer() {
         res.status(400).json({ error: 'Передайте хотя бы одну стратегию для расчета PnL.' });
         return;
       }
+      const uid = await resolveOptionalUid(req);
+      const tier = await resolveAuthoritativePlan(uid);
       let requestedInterval: '1h' | '4h' | '1d' =
         body.interval === '1d' ? '1d' : body.interval === '4h' ? '4h' : '1h';
-      if (requestedInterval === '1d') {
-        const tier = await resolveOptionalUserTier(req);
-        if (tier !== 'max') {
-          requestedInterval = '4h';
-        }
+      if (requestedInterval === '1d' && tier !== 'max') {
+        requestedInterval = '4h';
       }
-      const strategiesSlice = body.strategies.slice(0, 40);
+      if (!uid) {
+        requestedInterval = '1h';
+      }
+
+      // Audit H3: для неавторизованных ограничиваем бэктест 3 бесплатными стратегиями и кэшируем на 3 мин
+      const strategiesSlice = uid
+        ? body.strategies.slice(0, 40)
+        : body.strategies
+            .filter((st) => FREE_STRATEGY_KEYS.has(String(st.strategyKey || '')))
+            .slice(0, 3);
+      if (strategiesSlice.length === 0) {
+        res.status(400).json({ error: 'Для гостей доступен расчёт базовых бесплатных стратегий.' });
+        return;
+      }
+
       const depositUsdt = Number(body.depositUsdt || 2500);
       const scope = body.scope === 'all' ? 'all' : 'active';
       const cacheKey = crypto
         .createHash('sha1')
         .update(
           JSON.stringify({
+            anon: !uid,
             interval: requestedInterval,
             depositUsdt,
             scope,
@@ -875,7 +949,7 @@ async function startServer() {
         const firstKey = pnlBacktestCache.keys().next().value;
         if (firstKey) pnlBacktestCache.delete(firstKey);
       }
-      pnlBacktestCache.set(cacheKey, { report, expiresAt: Date.now() + 45_000 });
+      pnlBacktestCache.set(cacheKey, { report, expiresAt: Date.now() + (uid ? 45_000 : 180_000) });
       res.json(report);
     } catch (err) {
       serverLogger.error('strategies:pnl', err);
@@ -896,16 +970,27 @@ async function startServer() {
           pairs?: string[];
         }>;
       };
-      const tier = await resolveOptionalUserTier(req);
+      const uid = await resolveOptionalUid(req);
+      const tier = await resolveAuthoritativePlan(uid);
 
       const maxPairs = tier === 'max' ? SUPPORTED_SYMBOLS.length : tier === 'pro' ? 16 : 3;
       const timeframe: '1h' | '4h' = tier === 'max' && body.timeframe === '4h' ? '4h' : '1h';
       const minConfidence = Math.min(95, Math.max(55, Number(body.minConfidence || 70)));
       const marketFilter = body.marketFilter === 'spot' || body.marketFilter === 'futures' ? body.marketFilter : 'all';
 
+      // Audit H3: для анонимных пользователей отдаём 3-минутный кэш публичного Free-скана
+      const anonScanKey = !uid ? `anon:${marketFilter}:${minConfidence}` : '';
+      if (anonScanKey) {
+        const cachedScan = anonScannerCache.get(anonScanKey);
+        if (cachedScan && cachedScan.expiresAt > Date.now()) {
+          res.json(cachedScan.payload);
+          return;
+        }
+      }
+
       const customCfgMap = new Map<string, { minConfidence?: number; pairs?: string[] }>();
       const hasExplicitActiveFilter =
-        Array.isArray(body.activeStrategyConfigs) && body.activeStrategyConfigs.length > 0;
+        Boolean(uid) && Array.isArray(body.activeStrategyConfigs) && body.activeStrategyConfigs.length > 0;
       if (hasExplicitActiveFilter && body.activeStrategyConfigs) {
         for (const item of body.activeStrategyConfigs.slice(0, 32)) {
           if (typeof item?.strategyKey === 'string' && item.strategyKey.length > 0) {
@@ -958,7 +1043,7 @@ async function startServer() {
         minConfidence,
       });
 
-      res.json({
+      const responsePayload = {
         tier,
         scannedPairsCount: scanSymbols.length,
         totalPairsAvailable: SUPPORTED_SYMBOLS.length,
@@ -966,7 +1051,17 @@ async function startServer() {
         opportunities,
         strategyTelemetry,
         updatedAt: new Date().toISOString(),
-      });
+      };
+
+      if (anonScanKey) {
+        if (anonScannerCache.size >= 24) {
+          const oldest = anonScannerCache.keys().next().value;
+          if (oldest) anonScannerCache.delete(oldest);
+        }
+        anonScannerCache.set(anonScanKey, { payload: responsePayload, expiresAt: Date.now() + 180_000 });
+      }
+
+      res.json(responsePayload);
     } catch (err) {
       serverLogger.error('strategies:scanner', err);
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка сканера торговых сетапов' });
@@ -983,6 +1078,14 @@ async function startServer() {
       const rawAsset = String(body.asset || 'ALL').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'ALL';
       const allowedAssets = new Set(['ALL', ...SUPPORTED_SYMBOLS.map((s) => s.replace('USDT', ''))]);
       const asset = allowedAssets.has(rawAsset) ? rawAsset : 'ALL';
+
+      if (tier === 'free') {
+        const cachedFree = anonSentimentPreviewCache.get(asset);
+        if (cachedFree && cachedFree.expiresAt > Date.now()) {
+          res.json(cachedFree.payload);
+          return;
+        }
+      }
 
       const requestedInterval: '1h' | '4h' | '1d' =
         tier === 'max' && body.interval === '1d'
@@ -1015,7 +1118,7 @@ async function startServer() {
 
       // Locked preview for Free users (never expose full PRO/MAX catalysts or forecasts)
       if (tier === 'free') {
-        res.json({
+        const lockedPayload = {
           locked: true,
           tier,
           asset,
@@ -1056,11 +1159,17 @@ async function startServer() {
             freeStrategies: [],
           },
           updatedAt: new Date().toISOString(),
-        });
+        };
+        if (anonSentimentPreviewCache.size >= 32) {
+          const oldest = anonSentimentPreviewCache.keys().next().value;
+          if (oldest) anonSentimentPreviewCache.delete(oldest);
+        }
+        anonSentimentPreviewCache.set(asset, { payload: lockedPayload, expiresAt: Date.now() + 120_000 });
+        res.json(lockedPayload);
         return;
       }
 
-      const newsPromise = fetchGroundedCryptoNews(asset, false).catch(() => ({
+      const newsPromise = fetchGroundedCryptoNews(asset, false, { uid, tier }).catch(() => ({
         items: [],
         notice: '',
         source: 'rss' as const,
@@ -1240,28 +1349,61 @@ async function startServer() {
     }
   });
 
-  // Защита от повторного использования (replay) одного TOTP-кода + серверный step-up (+10 мин)
-  const MAX_SECURITY_CACHE_SIZE = 5_000;
-  const lastTotpStepByUid = new Map<string, number>();
-  const stepUpUntilByUid = new Map<string, number>();
-  const serverBackupHashesByUid = new Map<string, Set<string>>();
-  const STEP_UP_TTL_MS = 10 * 60_000;
-
-  function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V): void {
-    if (!map.has(key) && map.size >= MAX_SECURITY_CACHE_SIZE) {
-      const oldest = map.keys().next().value;
-      if (oldest !== undefined) map.delete(oldest);
-    }
-    map.set(key, value);
-  }
-
-  // 2FA Step 1: Generate TOTP secret + QR code + encrypted pending secret (purpose: 'totp')
-  app.post('/api/security/totp/setup', requireAuth, strictAuthLimiter, async (req, res) => {
+  // Audit G3: Серверный статус 2FA (включая обнаружение legacy-конфигураций, требующих миграции)
+  app.get('/api/security/2fa-status', requireAuth, async (req, res) => {
     try {
       const uid = req.user!.uid;
-      const email = req.user!.email || (typeof (req.body as { email?: unknown })?.email === 'string'
-        ? String((req.body as { email: string }).email).slice(0, 254)
-        : '');
+      const state = await resolveUser2faState(uid);
+      const nowMs = Date.now();
+      res.json({
+        enabled: state.enabled,
+        hasServerSecret: state.hasServerSecret,
+        needsMigration: state.needsMigration,
+        stepUpActive: state.stepUpUntil > nowMs,
+        stepUpUntil: state.stepUpUntil,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка проверки статуса 2FA' });
+    }
+  });
+
+  // Audit I2: Серверный отзыв refresh-токенов пользователя (для «Завершить остальные сессии»)
+  app.post('/api/security/revoke-sessions', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
+    try {
+      const uid = req.user!.uid;
+      const result = await revokeUserRefreshTokens(uid);
+      await recordServerSecurityEvent(uid, {
+        event: 'SESSIONS_REVOKED',
+        title: 'Vernier · Сессии завершены',
+        details: result.revoked
+          ? 'Все refresh-токены других устройств отозваны на сервере.'
+          : 'Инициировано завершение других сессий (клиентская ревокация).',
+        severity: 'warning',
+      });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отзыва сессий' });
+    }
+  });
+
+  // 2FA Step 1 (Audit G1 + I2): Generate TOTP secret + QR code; blocks takeover if 2FA already active without step-up/currentCode
+  app.post('/api/security/totp/setup', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'totp')) return;
+    try {
+      const uid = req.user!.uid;
+      const body = req.body as { email?: unknown; currentCode?: unknown };
+      const authz = await authorize2faMutation(uid, {
+        currentCode: typeof body?.currentCode === 'string' ? body.currentCode : undefined,
+        isProd,
+      });
+      if (!authz.ok) {
+        res.status(authz.status || 403).json({ error: authz.error, code: authz.code });
+        return;
+      }
+
+      const email =
+        req.user!.email ||
+        (typeof body?.email === 'string' ? String(body.email).slice(0, 254) : '');
       if (!email) {
         res.status(400).json({ error: 'Некорректные параметры пользователя.' });
         return;
@@ -1285,19 +1427,27 @@ async function startServer() {
     }
   });
 
-  // 2FA Step 2: Verify initial 6-digit TOTP code and issue 8 HMAC-SHA256 10-char backup codes
-  app.post('/api/security/totp/confirm', requireAuth, strictAuthLimiter, async (req, res) => {
+  // 2FA Step 2 (Audit G1 + I2): Verify initial 6-digit TOTP code and issue 8 HMAC-SHA256 10-char backup codes
+  app.post('/api/security/totp/confirm', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
       const uid = req.user!.uid;
-      const { encryptedPendingSecret, code } = req.body as {
+      const { encryptedPendingSecret, code, currentCode } = req.body as {
         encryptedPendingSecret?: string;
         code?: string;
+        currentCode?: string;
       };
       if (!encryptedPendingSecret || !code) {
         res.status(400).json({ error: 'Укажите код подтверждения 2FA.' });
         return;
       }
+
+      const authz = await authorize2faMutation(uid, { currentCode, isProd });
+      if (!authz.ok) {
+        res.status(authz.status || 403).json({ error: authz.error, code: authz.code });
+        return;
+      }
+
       const plainSecret = decryptSecret(encryptedPendingSecret, uid, 'totp');
       const check = verifyTotpCodeWithStep(plainSecret, code, 1);
       if (!check.valid || check.matchedStep === null) {
@@ -1311,33 +1461,53 @@ async function startServer() {
         return;
       }
       clearAuthFailure(req, 'totp');
-      setBoundedMap(lastTotpStepByUid, uid, check.matchedStep);
-      const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
-      setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+      const nowMs = Date.now();
+      const stepUpUntil = nowMs + STEP_UP_TTL_MS;
 
       const { plaintext, hashes } = generateBackupCodes(8);
       const encryptedSecret = encryptSecret(plainSecret, uid, 'totp');
-      setBoundedMap(serverBackupHashesByUid, uid, new Set(hashes));
 
-      // Если доступен Admin SDK — фиксируем серверную запись безопасности для защиты от клиентских подмен
+      setMemoryTotpRecord(uid, {
+        totpEncryptedSecret: encryptedSecret,
+        backupCodeHashes: hashes,
+        lastTotpStep: check.matchedStep,
+        stepUpUntil,
+        updatedAtMs: nowMs,
+      });
+
       const adminDb = getAdminDb();
       if (adminDb) {
-        await adminDb
-          .collection('users')
-          .doc(uid)
-          .collection('serverSecurity')
-          .doc('totp')
-          .set(
-            {
-              totpEncryptedSecret: encryptedSecret,
-              backupCodeHashes: hashes,
-              lastTotpStep: check.matchedStep,
-              stepUpUntil,
-              updatedAtMs: Date.now(),
-            },
-            { merge: true }
-          );
+        await Promise.all([
+          adminDb
+            .collection('users')
+            .doc(uid)
+            .collection('serverSecurity')
+            .doc('totp')
+            .set(
+              {
+                totpEncryptedSecret: encryptedSecret,
+                backupCodeHashes: hashes,
+                lastTotpStep: check.matchedStep,
+                stepUpUntil,
+                updatedAtMs: nowMs,
+              },
+              { merge: true }
+            ),
+          adminDb
+            .collection('users')
+            .doc(uid)
+            .set({ twoFactorEnabled: true, updatedAtMs: nowMs }, { merge: true }),
+        ]);
       }
+
+      await recordServerSecurityEvent(uid, {
+        event: authz.isAlreadyEnabled ? '2FA_RECONFIGURED' : '2FA_ENABLED',
+        title: 'Vernier · Обновлена настройка 2FA',
+        details: authz.isAlreadyEnabled
+          ? 'Секрет двухфакторной аутентификации (TOTP) перенастроен и выпущены новые резервные коды.'
+          : 'Активирована двухфакторная аутентификация TOTP и выпущены 8 резервных кодов.',
+        severity: authz.isAlreadyEnabled ? 'warning' : 'info',
+      });
 
       res.json({
         verified: true,
@@ -1345,6 +1515,7 @@ async function startServer() {
         backupCodes: plaintext,
         backupCodeHashes: hashes,
         stepUpUntil,
+        serverPersisted: Boolean(adminDb),
       });
     } catch {
       recordAuthFailure(req, 'totp');
@@ -1352,7 +1523,63 @@ async function startServer() {
     }
   });
 
-  // 2FA Step-Up & Lock Screen Verification (anti-replay + authoritative backup codes + server stepUpUntil)
+  // Audit G1 + I2: Серверное отключение 2FA (требует активный step-up или действующий код 2FA)
+  app.post('/api/security/totp/disable', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
+    if (checkAuthBackoffLock(req, res, 'totp')) return;
+    try {
+      const uid = req.user!.uid;
+      const body = req.body as { code?: unknown; currentCode?: unknown };
+      const providedCode =
+        typeof body?.code === 'string'
+          ? body.code
+          : typeof body?.currentCode === 'string'
+            ? body.currentCode
+            : undefined;
+
+      const authz = await authorize2faMutation(uid, {
+        currentCode: providedCode,
+        isProd,
+      });
+      if (!authz.ok) {
+        recordAuthFailure(req, 'totp');
+        res.status(authz.status || 403).json({ error: authz.error, code: authz.code });
+        return;
+      }
+
+      clearAuthFailure(req, 'totp');
+      clearMemoryTotpRecord(uid);
+
+      const adminDb = getAdminDb();
+      if (adminDb) {
+        await Promise.all([
+          adminDb
+            .collection('users')
+            .doc(uid)
+            .collection('serverSecurity')
+            .doc('totp')
+            .delete()
+            .catch(() => undefined),
+          adminDb
+            .collection('users')
+            .doc(uid)
+            .set({ twoFactorEnabled: false, updatedAtMs: Date.now() }, { merge: true }),
+        ]);
+      }
+
+      await recordServerSecurityEvent(uid, {
+        event: '2FA_DISABLED',
+        title: 'Vernier · 2FA отключена',
+        details: 'Двухфакторная аутентификация (TOTP) отключена. Если это были не вы — немедленно завершите сессии.',
+        severity: 'critical',
+      });
+
+      res.json({ ok: true, disabled: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка отключения 2FA.' });
+    }
+  });
+
+  // 2FA Step-Up & Lock Screen Verification (Audit G3: запрет клиентских секретов/хешей в prod + anti-replay + server stepUpUntil)
   app.post('/api/security/totp/verify', requireAuth, strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'totp')) return;
     try {
@@ -1369,49 +1596,36 @@ async function startServer() {
       const cleanCode = code.trim();
       const adminDb = getAdminDb();
 
-      let authoritativeEncryptedSecret = typeof clientEncryptedSecret === 'string' ? clientEncryptedSecret : '';
-      let authoritativeBackupHashes: string[] = [];
-      let lastAcceptedStep = lastTotpStepByUid.get(uid) ?? -1;
+      if (isProd && !adminDb) {
+        res.status(503).json({
+          error: 'Серверная проверка 2FA временно недоступна в production (Admin SDK не настроен).',
+          code: 'SECURITY_UNAVAILABLE',
+        });
+        return;
+      }
 
-      if (adminDb) {
-        const secDocRef = adminDb.collection('users').doc(uid).collection('serverSecurity').doc('totp');
-        const secSnap = await secDocRef.get();
-        if (secSnap.exists) {
-          const d = secSnap.data() as {
-            totpEncryptedSecret?: string;
-            backupCodeHashes?: string[];
-            lastTotpStep?: number;
-          };
-          if (typeof d.totpEncryptedSecret === 'string' && d.totpEncryptedSecret) {
-            authoritativeEncryptedSecret = d.totpEncryptedSecret;
-          }
-          if (Array.isArray(d.backupCodeHashes)) {
-            authoritativeBackupHashes = d.backupCodeHashes;
-          }
-          if (typeof d.lastTotpStep === 'number' && d.lastTotpStep > lastAcceptedStep) {
-            lastAcceptedStep = d.lastTotpStep;
-          }
-        } else {
-          // Fallback к private/security в Firestore (не доверяем телу запроса)
-          const privSnap = await adminDb.collection('users').doc(uid).collection('private').doc('security').get();
-          if (privSnap.exists) {
-            const p = privSnap.data() as { totpEncryptedSecret?: string; backupCodeHashes?: string[] };
-            if (typeof p.totpEncryptedSecret === 'string' && p.totpEncryptedSecret) {
-              authoritativeEncryptedSecret = p.totpEncryptedSecret;
-            }
-            if (Array.isArray(p.backupCodeHashes)) {
-              authoritativeBackupHashes = p.backupCodeHashes;
-            }
-          }
+      const state = await resolveUser2faState(uid, { adminDb });
+      if (state.needsMigration) {
+        res.status(403).json({
+          error: 'Требуется миграция 2FA на серверное хранилище. Откройте Центр защиты → 2FA и завершите обновление.',
+          code: '2FA_MIGRATION_REQUIRED',
+        });
+        return;
+      }
+
+      let authoritativeEncryptedSecret = state.totpEncryptedSecret;
+      let authoritativeBackupHashes = [...state.backupCodeHashes];
+      const lastAcceptedStep = Math.max(state.lastTotpStep, getMemoryLastTotpStep(uid));
+
+      // В non-production без Admin SDK и без серверной записи допускаем локальный fallback для dev/preview
+      if (!isProd && !adminDb && !authoritativeEncryptedSecret) {
+        if (typeof clientEncryptedSecret === 'string' && clientEncryptedSecret) {
+          authoritativeEncryptedSecret = clientEncryptedSecret;
         }
-      } else {
-        // Dev/preview режим без Admin SDK: используем серверно-выданные хеши, если они были зарегистрированы в сессии;
-        // клиентский массив принимается только в non-production, если сервер ещё не хранил хеши
-        const knownServerHashes = serverBackupHashesByUid.get(uid);
-        if (knownServerHashes) {
-          authoritativeBackupHashes = Array.from(knownServerHashes);
-        } else if (!isProd && Array.isArray(clientBackupHashes)) {
-          authoritativeBackupHashes = clientBackupHashes.filter((h): h is string => typeof h === 'string').slice(0, 8);
+        if (authoritativeBackupHashes.length === 0 && Array.isArray(clientBackupHashes)) {
+          authoritativeBackupHashes = clientBackupHashes
+            .filter((h): h is string => typeof h === 'string')
+            .slice(0, 8);
         }
       }
 
@@ -1434,9 +1648,9 @@ async function startServer() {
           return;
         }
         clearAuthFailure(req, 'totp');
-        setBoundedMap(lastTotpStepByUid, uid, check.matchedStep);
+        setMemoryLastTotpStep(uid, check.matchedStep);
         const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
-        setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+        setMemoryStepUpUntil(uid, stepUpUntil);
         if (adminDb) {
           await adminDb
             .collection('users')
@@ -1453,11 +1667,13 @@ async function startServer() {
       if (matchedHash) {
         clearAuthFailure(req, 'totp');
         const stepUpUntil = Date.now() + STEP_UP_TTL_MS;
-        setBoundedMap(stepUpUntilByUid, uid, stepUpUntil);
+        setMemoryStepUpUntil(uid, stepUpUntil);
 
-        const knownSet = serverBackupHashesByUid.get(uid);
-        if (knownSet) {
-          knownSet.delete(matchedHash);
+        const memRec = getMemoryTotpRecord(uid);
+        if (memRec) {
+          memRec.backupCodeHashes = memRec.backupCodeHashes.filter((h) => h !== matchedHash);
+          memRec.stepUpUntil = stepUpUntil;
+          memRec.updatedAtMs = Date.now();
         }
 
         if (adminDb) {
@@ -1471,6 +1687,13 @@ async function startServer() {
             tx.set(secDocRef, { backupCodeHashes: remaining, stepUpUntil, updatedAtMs: Date.now() }, { merge: true });
           });
         }
+
+        await recordServerSecurityEvent(uid, {
+          event: '2FA_BACKUP_CODE_USED',
+          title: 'Vernier · Использован резервный код 2FA',
+          details: 'Выполнено подтверждение входа с помощью одноразового резервного кода.',
+          severity: 'warning',
+        });
 
         res.json({
           verified: true,
@@ -1651,56 +1874,15 @@ async function startServer() {
     });
   });
 
-  // Оплата PRO / MAX (криптовалюта через NOWPayments)
+  // Каталог тарифов PRO / MAX и серверные цены
   app.get('/api/billing/plans', (_req, res) => {
     res.json({
-      enabled: isBillingConfigured(),
+      enabled: false,
       plans: getPlanPrices(),
       tiers: getTieredPlanPrices(),
       maxMultipliers: getMaxMultiplierPlans(),
       creditCosts: CREDIT_COSTS,
     });
-  });
-
-  app.post('/api/billing/checkout', requireAuth, strictAuthLimiter, async (req, res) => {
-    try {
-      const body = req.body as { period?: unknown; tier?: unknown; maxMultiplier?: unknown };
-      const period = body?.period;
-      if (period !== 'month' && period !== 'year') {
-        res.status(400).json({ error: 'Выберите период подписки: месяц или год.' });
-        return;
-      }
-      const tier: SubscriptionTier = body?.tier === 'max' ? 'max' : 'pro';
-      const maxMultiplier: MaxMultiplier = Number(body?.maxMultiplier) === 20 ? 20 : 10;
-      const { invoiceUrl } = await createCheckout(req.user!.uid, period as BillingPeriod, tier, maxMultiplier);
-      res.json({ invoiceUrl });
-    } catch (err) {
-      serverLogger.error('billing:checkout', err instanceof Error ? err.message : err);
-      const safeMsg =
-        err instanceof Error &&
-        (err.message.includes('не настроена') ||
-          err.message.includes('Превышен лимит') ||
-          err.message.includes('Платёжный сервис'))
-          ? err.message
-          : 'Не удалось создать счёт на оплату. Попробуйте позже.';
-      res.status(503).json({ error: safeMsg });
-    }
-  });
-
-  // Уведомления NOWPayments (IPN). Без подписи — отказ; тариф выдаёт только проверенное уведомление.
-  app.post('/api/billing/ipn', async (req, res) => {
-    const signature = req.headers['x-nowpayments-sig'];
-    if (!verifyIpnSignature(req.body, typeof signature === 'string' ? signature : undefined)) {
-      res.status(401).json({ error: 'Invalid signature' });
-      return;
-    }
-    try {
-      await processIpn(req.body as Record<string, unknown>);
-      res.json({ ok: true });
-    } catch (err) {
-      serverLogger.error('billing', 'Ошибка обработки IPN:', err instanceof Error ? err.message : err);
-      res.status(500).json({ error: 'IPN processing failed' }); // NOWPayments повторит доставку
-    }
   });
 
   // Web Push: Public VAPID key for Service Worker subscription
@@ -2088,11 +2270,20 @@ async function startServer() {
     }
   });
 
-  // Exchange Integration: Verify API credentials against exchange, fetch initial balances, encrypt secrets
-  app.post('/api/exchanges/connect', requireAuth, strictAuthLimiter, async (req, res) => {
+  // Exchange Integration: Verify API credentials against exchange, fetch initial balances, encrypt secrets (Audit G2 + I2)
+  app.post('/api/exchanges/connect', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'exchange_connect')) return;
     try {
       const uid = req.user!.uid;
+      const stepUpCheck = await requireStepUpForUser(uid, {
+        actionLabel: 'подключения или обновления API-ключа биржи',
+        isProd,
+      });
+      if (!stepUpCheck.ok) {
+        res.status(stepUpCheck.status || 403).json({ error: stepUpCheck.error, code: stepUpCheck.code });
+        return;
+      }
+
       const body = req.body as Record<string, unknown>;
       const exchange = body.exchange;
       const permissions = body.permissions;
@@ -2145,10 +2336,19 @@ async function startServer() {
     }
   });
 
-  // Exchange Integration: Decrypt stored user credentials on server and sync live wallet balances
+  // Exchange Integration: Decrypt stored user credentials on server and sync live wallet balances (Audit G2)
   app.post('/api/exchanges/sync', requireAuth, expensiveLimiter, async (req, res) => {
     try {
       const uid = req.user!.uid;
+      const stepUpCheck = await requireStepUpForUser(uid, {
+        actionLabel: 'синхронизации балансов биржи',
+        isProd,
+      });
+      if (!stepUpCheck.ok) {
+        res.status(stepUpCheck.status || 403).json({ error: stepUpCheck.error, code: stepUpCheck.code });
+        return;
+      }
+
       const body = req.body as Record<string, unknown>;
       const exchange = body.exchange;
       const encryptedApiKey = typeof body.encryptedApiKey === 'string' ? body.encryptedApiKey : '';
@@ -2187,8 +2387,8 @@ async function startServer() {
     }
   });
 
-  // Exchange Integration: Execute Testnet Spot/Futures order (Live Trade заблокирован на сервере; клиентские permissions игнорируются)
-  app.post('/api/exchanges/order', requireAuth, strictAuthLimiter, async (req, res) => {
+  // Exchange Integration: Execute Testnet Spot/Futures order (Audit G2 + I2; Live Trade заблокирован на сервере)
+  app.post('/api/exchanges/order', requireAuth, requireFreshAuth(), strictAuthLimiter, async (req, res) => {
     if (checkAuthBackoffLock(req, res, 'exchange_order')) return;
     try {
       const uid = req.user!.uid;
@@ -2218,30 +2418,13 @@ async function startServer() {
         return;
       }
 
-      // Серверная проверка свежего 2FA step-up (10 минут) для пользователей с активной 2FA
-      const adminDb = getAdminDb();
-      if (adminDb) {
-        const totpSnap = await adminDb
-          .collection('users')
-          .doc(uid)
-          .collection('serverSecurity')
-          .doc('totp')
-          .get();
-        if (totpSnap.exists) {
-          const sec = totpSnap.data() as { totpEncryptedSecret?: string; stepUpUntil?: number };
-          const hasActive2fa = typeof sec.totpEncryptedSecret === 'string' && sec.totpEncryptedSecret.length > 0;
-          const validUntil = Math.max(
-            typeof sec.stepUpUntil === 'number' ? sec.stepUpUntil : 0,
-            stepUpUntilByUid.get(uid) ?? 0
-          );
-          if (hasActive2fa && validUntil <= Date.now()) {
-            res.status(403).json({
-              error: 'Требуется свежее подтверждение 2FA перед отправкой торгового ордера.',
-              code: 'STEP_UP_REQUIRED',
-            });
-            return;
-          }
-        }
+      const stepUpCheck = await requireStepUpForUser(uid, {
+        actionLabel: 'отправки торгового ордера',
+        isProd,
+      });
+      if (!stepUpCheck.ok) {
+        res.status(stepUpCheck.status || 403).json({ error: stepUpCheck.error, code: stepUpCheck.code });
+        return;
       }
 
       const order = await executeEncryptedExchangeOrder({
@@ -2275,7 +2458,63 @@ async function startServer() {
     }
   });
 
-  // Support & Feedback intake (persists to Firestore via Admin SDK; never fakes success in production)
+  // Audit H4: Антиспам-лимитер обращений в поддержку (5/день на IP, 3/день на email, TTL 180 дней)
+  const SUPPORT_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  const SUPPORT_IP_DAILY_CAP = 5;
+  const SUPPORT_EMAIL_DAILY_CAP = 3;
+  const SUPPORT_TTL_DAYS = 180;
+  const supportDailyCounters = new Map<string, number>();
+  let supportCounterDayKey = new Date().toISOString().slice(0, 10);
+
+  async function checkAndConsumeSupportQuota(ip: string, email: string): Promise<{ allowed: boolean; reason?: string }> {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    if (todayKey !== supportCounterDayKey) {
+      supportCounterDayKey = todayKey;
+      supportDailyCounters.clear();
+    }
+    const ipHash = crypto.createHash('sha256').update(`ip:${ip}`).digest('hex').slice(0, 24);
+    const emailHash = crypto.createHash('sha256').update(`email:${email.toLowerCase()}`).digest('hex').slice(0, 24);
+    const ipKey = `ip_${todayKey}_${ipHash}`;
+    const emailKey = `em_${todayKey}_${emailHash}`;
+
+    const adminDb = getAdminDb();
+    if (adminDb) {
+      const ipRef = adminDb.collection('supportRateLimits').doc(ipKey);
+      const emailRef = adminDb.collection('supportRateLimits').doc(emailKey);
+      return adminDb.runTransaction(async (tx) => {
+        const [ipSnap, emSnap] = await Promise.all([tx.get(ipRef), tx.get(emailRef)]);
+        const ipCount = typeof ipSnap.data()?.count === 'number' ? (ipSnap.data()!.count as number) : 0;
+        const emCount = typeof emSnap.data()?.count === 'number' ? (emSnap.data()!.count as number) : 0;
+        if (ipCount >= SUPPORT_IP_DAILY_CAP) {
+          return { allowed: false, reason: 'Превышен суточный лимит обращений с этого IP-адреса (макс. 5 в день).' };
+        }
+        if (emCount >= SUPPORT_EMAIL_DAILY_CAP) {
+          return { allowed: false, reason: 'Превышен суточный лимит обращений для этого email (макс. 3 в день).' };
+        }
+        const expiresAt = new Date(Date.now() + 2 * 86_400_000);
+        tx.set(ipRef, { count: ipCount + 1, dayKey: todayKey, expiresAt }, { merge: true });
+        tx.set(emailRef, { count: emCount + 1, dayKey: todayKey, expiresAt }, { merge: true });
+        return { allowed: true };
+      });
+    }
+
+    const curIp = supportDailyCounters.get(ipKey) ?? 0;
+    const curEm = supportDailyCounters.get(emailKey) ?? 0;
+    if (curIp >= SUPPORT_IP_DAILY_CAP) {
+      return { allowed: false, reason: 'Превышен суточный лимит обращений с этого IP-адреса (макс. 5 в день).' };
+    }
+    if (curEm >= SUPPORT_EMAIL_DAILY_CAP) {
+      return { allowed: false, reason: 'Превышен суточный лимит обращений для этого email (макс. 3 в день).' };
+    }
+    if (supportDailyCounters.size >= 5_000) {
+      supportDailyCounters.clear();
+    }
+    supportDailyCounters.set(ipKey, curIp + 1);
+    supportDailyCounters.set(emailKey, curEm + 1);
+    return { allowed: true };
+  }
+
+  // Support & Feedback intake (Audit H4: strict email regex, per-IP/email daily limits, 180d TTL)
   app.post('/api/support', expensiveLimiter, async (req, res) => {
     try {
       const body = req.body as Record<string, unknown>;
@@ -2285,7 +2524,12 @@ async function startServer() {
       const message = typeof body.message === 'string' ? body.message.trim() : '';
 
       const allowedCategories = new Set(['alerts', 'chart', 'billing', 'security', 'other']);
-      if (!contactEmail || contactEmail.length < 3 || contactEmail.length > 200 || !contactEmail.includes('@')) {
+      if (
+        !contactEmail ||
+        contactEmail.length < 5 ||
+        contactEmail.length > 200 ||
+        !SUPPORT_EMAIL_REGEX.test(contactEmail)
+      ) {
         res.status(400).json({ error: 'Укажите корректный email для обратной связи.' });
         return;
       }
@@ -2302,8 +2546,20 @@ async function startServer() {
         return;
       }
 
-      const ticketId = `sup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-      const createdAtIso = new Date().toISOString();
+      const trustedIp = (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+      const quota = await checkAndConsumeSupportQuota(trustedIp, contactEmail);
+      if (!quota.allowed) {
+        res.status(429).json({
+          error: quota.reason || 'Превышен суточный лимит обращений в поддержку.',
+          code: 'SUPPORT_RATE_LIMIT',
+        });
+        return;
+      }
+
+      const nowMs = Date.now();
+      const ticketId = `sup_${nowMs}_${crypto.randomBytes(4).toString('hex')}`;
+      const createdAtIso = new Date(nowMs).toISOString();
+      const expiresAtMs = nowMs + SUPPORT_TTL_DAYS * 86_400_000;
       const adminDb = getAdminDb();
 
       if (adminDb) {
@@ -2316,7 +2572,9 @@ async function startServer() {
           message,
           status: 'open',
           createdAtIso,
-          createdAtMs: Date.now(),
+          createdAtMs: nowMs,
+          expiresAt: new Date(expiresAtMs),
+          expiresAtMs,
         });
       } else if (isProd) {
         serverLogger.error('support', 'Не удалось сохранить обращение: Firebase Admin SDK не настроен в production.');
@@ -2326,6 +2584,7 @@ async function startServer() {
         return;
       }
 
+      serverLogger.info('support', `Зарегистрировано обращение ${ticketId} (категория: ${category}).`);
       res.json({ ok: true, ticketId, createdAt: createdAtIso });
     } catch (err) {
       serverLogger.error('support', err);
@@ -2356,7 +2615,12 @@ async function startServer() {
             .slice(-8)
         : [];
 
-      const reply = await askTerminalAssistant({ message, history });
+      const userTier = await resolveAuthoritativePlan(req.user!.uid);
+      const reply = await askTerminalAssistant({
+        message,
+        history,
+        budgetContext: { uid: req.user!.uid, tier: userTier },
+      });
       res.json({ reply });
     } catch (err) {
       if (err instanceof AiServiceError) {

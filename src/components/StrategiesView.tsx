@@ -25,6 +25,7 @@ import {
   Radar,
   Radio,
   RefreshCw,
+  Scale,
   Send,
   ShieldCheck,
   Sliders,
@@ -117,6 +118,7 @@ import { ExchangeApiGuideModal } from './ExchangeApiGuide';
 import { FeatureGuide } from './FeatureGuide';
 import { StaggerDeck, WorkspaceShell } from './MotionPrimitives';
 import { PositionSizeCalculator } from './PositionSizeCalculator';
+import { StrategyComparisonModal } from './StrategyComparisonModal';
 import { StrategyPnlChart } from './StrategyPnlChart';
 import { StrategyComparisonPanel } from './StrategyProMaxTools';
 import { NonCustodialRiskNotice } from './TradeRiskConfirmModal';
@@ -1560,6 +1562,34 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
   );
   const [builderOpen, setBuilderOpen] = useState(false);
   const [webhookOpen, setWebhookOpen] = useState(false);
+  const [compareModalOpen, setCompareModalOpen] = useState(false);
+  const [compareStrategyKeys, setCompareStrategyKeys] = useState<string[]>(() =>
+    STRATEGY_CATALOG.slice(0, 3).map((t) => t.key)
+  );
+
+  const toggleStrategyInCompare = useCallback((key: string) => {
+    triggerHaptic(8);
+    setCompareStrategyKeys((prev) => {
+      if (prev.includes(key)) {
+        return prev.length > 1 ? prev.filter((k) => k !== key) : prev;
+      }
+      if (prev.length >= 4) {
+        return [...prev.slice(1), key];
+      }
+      return [...prev, key];
+    });
+  }, []);
+
+  const handleOpenCompareModal = useCallback(() => {
+    triggerHaptic(10);
+    setCompareStrategyKeys((prev) => {
+      if (prev.length >= 2) return prev;
+      const enabledKeys = strategies.filter((s) => s.enabled).map((s) => s.strategyKey);
+      const merged = Array.from(new Set([...prev, ...enabledKeys, ...STRATEGY_CATALOG.map((t) => t.key)]));
+      return merged.slice(0, 3);
+    });
+    setCompareModalOpen(true);
+  }, [strategies]);
 
   useEffect(() => {
     const sync = () => setCustomStrategies(readCustomNoCodeStrategies());
@@ -2551,6 +2581,19 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
+                  onClick={handleOpenCompareModal}
+                  className="min-h-[36px] px-3 rounded-xl border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap transition-colors"
+                >
+                  <Scale className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                  <span>Сравнить</span>
+                  {compareStrategyKeys.length > 0 && (
+                    <span className="text-[10px] font-mono tabular-nums px-1.5 py-0.5 rounded bg-emerald-400/20 text-emerald-100">
+                      {compareStrategyKeys.length}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
                   onClick={() => {
                     triggerHaptic(10);
                     setBuilderOpen(true);
@@ -3318,41 +3361,64 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
                           <h3 className="mt-1.5 text-sm font-semibold text-white leading-snug">{tpl.name}</h3>
                         </div>
 
-                        {isLockedForUser ? (
+                        <div className="flex items-center gap-1.5 shrink-0">
                           <button
                             type="button"
-                            onClick={() => void onSwitchPlan(isMaxStrategy ? 'max' : 'pro')}
-                            className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors ${
-                              isMaxStrategy
-                                ? 'border-cyan-400/50 bg-cyan-500/20 text-cyan-100 hover:bg-cyan-500/30'
-                                : 'border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+                            onClick={() => toggleStrategyInCompare(tpl.key)}
+                            aria-pressed={compareStrategyKeys.includes(tpl.key)}
+                            title={
+                              compareStrategyKeys.includes(tpl.key)
+                                ? 'Убрать из сравнения'
+                                : 'Добавить к сравнению стратегий'
+                            }
+                            className={`min-h-[34px] px-2 rounded-lg text-[11px] font-medium border inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                              compareStrategyKeys.includes(tpl.key)
+                                ? 'border-emerald-400/45 bg-emerald-500/18 text-emerald-200'
+                                : 'border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
                             }`}
                           >
-                            <Lock className="w-3.5 h-3.5 shrink-0" />
-                            <span>{isMaxStrategy ? 'MAX' : 'PRO'}</span>
+                            <Scale className="w-3.5 h-3.5 shrink-0" />
+                            <span className="hidden sm:inline">
+                              {compareStrategyKeys.includes(tpl.key) ? 'В сравн.' : 'Сравнить'}
+                            </span>
                           </button>
-                        ) : (
-                          cfg && (
+
+                          {isLockedForUser ? (
                             <button
                               type="button"
-                              disabled={savingId === cfg.id}
-                              onClick={() => void handleToggle(cfg)}
-                              aria-pressed={cfg.enabled}
-                              className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-                                cfg.enabled
-                                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
-                                  : 'border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
+                              onClick={() => void onSwitchPlan(isMaxStrategy ? 'max' : 'pro')}
+                              className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 whitespace-nowrap shrink-0 transition-colors ${
+                                isMaxStrategy
+                                  ? 'border-cyan-400/50 bg-cyan-500/20 text-cyan-100 hover:bg-cyan-500/30'
+                                  : 'border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
                               }`}
                             >
-                              {cfg.enabled ? (
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                              ) : (
-                                <CircleOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                              )}
-                              <span>{cfg.enabled ? 'Активен' : 'Выкл'}</span>
+                              <Lock className="w-3.5 h-3.5 shrink-0" />
+                              <span>{isMaxStrategy ? 'MAX' : 'PRO'}</span>
                             </button>
-                          )
-                        )}
+                          ) : (
+                            cfg && (
+                              <button
+                                type="button"
+                                disabled={savingId === cfg.id}
+                                onClick={() => void handleToggle(cfg)}
+                                aria-pressed={cfg.enabled}
+                                className={`min-h-[34px] px-2.5 rounded-lg text-xs font-semibold border inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                                  cfg.enabled
+                                    ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                                    : 'border-white/10 bg-white/5 text-slate-400 hover:text-white hover:bg-white/10'
+                                }`}
+                              >
+                                {cfg.enabled ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                ) : (
+                                  <CircleOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                                )}
+                                <span>{cfg.enabled ? 'Активен' : 'Выкл'}</span>
+                              </button>
+                            )
+                          )}
+                        </div>
                       </div>
 
                       <p className="mt-2 text-xs text-slate-300 leading-relaxed">{tpl.description}</p>
@@ -4622,6 +4688,15 @@ export const StrategiesView: React.FC<StrategiesViewProps> = ({
         open={apiGuideOpen}
         onClose={() => setApiGuideOpen(false)}
         onOpenExchangeIntegrations={onOpenExchangeIntegrations}
+      />
+
+      <StrategyComparisonModal
+        open={compareModalOpen}
+        onClose={() => setCompareModalOpen(false)}
+        selectedKeys={compareStrategyKeys}
+        onChangeSelectedKeys={setCompareStrategyKeys}
+        strategies={strategies}
+        catalogBacktest={catalogBacktest}
       />
     </StaggerDeck>
   );

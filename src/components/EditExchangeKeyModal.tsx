@@ -5,6 +5,7 @@ import type {
   ExchangeKeyRecord,
   ExchangeSyncResult,
 } from '../types/domain';
+import { LegalDocumentModal, type LegalDocKind } from './LegalConsentModal';
 
 interface EditExchangeKeyModalProps {
   keyRecord: ExchangeKeyRecord | null;
@@ -34,6 +35,8 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
   const [apiSecret, setApiSecret] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [showSecret, setShowSecret] = useState(false);
+  const [acceptedApiConsent, setAcceptedApiConsent] = useState(false);
+  const [openLegalDoc, setOpenLegalDoc] = useState<LegalDocKind | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -46,6 +49,7 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
     setApiSecret('');
     setPassphrase('');
     setShowSecret(false);
+    setAcceptedApiConsent(false);
     setError(null);
   }, [keyRecord]);
 
@@ -76,6 +80,12 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
     }
     if (keyRecord.exchange === 'okx' && !passphrase.trim()) {
       setError('Для OKX необходимо указать Passphrase.');
+      return;
+    }
+    if (!acceptedApiConsent) {
+      setError(
+        'Подтвердите добровольную передачу API-ключей, согласие с Политикой конфиденциальности, отключение Withdrawals и личную ответственность.'
+      );
       return;
     }
 
@@ -244,6 +254,51 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
             </label>
           )}
 
+          <label className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-3 cursor-pointer text-[11px] text-slate-200 leading-relaxed">
+            <input
+              type="checkbox"
+              checked={acceptedApiConsent}
+              onChange={(e) => setAcceptedApiConsent(e.target.checked)}
+              className="mt-0.5 h-4 w-4 rounded accent-emerald-500 shrink-0"
+            />
+            <span>
+              Я подтверждаю, что самостоятельно и добровольно передаю обновлённые API-ключи, принимаю{' '}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setOpenLegalDoc('privacy');
+                }}
+                className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+              >
+                Политику конфиденциальности
+              </button>{' '}
+              и{' '}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setOpenLegalDoc('terms');
+                }}
+                className="text-emerald-400 hover:text-emerald-300 underline underline-offset-2 font-medium"
+              >
+                Условия использования
+              </button>
+              , право вывода средств (Withdrawals) отключено, а полную ответственность за операции я беру на себя (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setOpenLegalDoc('disclaimer');
+                }}
+                className="text-cyan-400 hover:text-cyan-300 underline underline-offset-2"
+              >
+                Отказ от ответственности
+              </button>
+              ).
+            </span>
+          </label>
+
           {error && (
             <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200 flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
@@ -278,8 +333,8 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={submitting}
-                className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors"
+                disabled={submitting || !acceptedApiConsent}
+                className="min-h-[40px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-45 disabled:cursor-not-allowed text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors"
               >
                 <KeyRound className="w-3.5 h-3.5" />
                 <span>{submitting ? 'Проверка...' : 'Проверить и сохранить'}</span>
@@ -288,6 +343,7 @@ export const EditExchangeKeyModal: React.FC<EditExchangeKeyModalProps> = ({
           </div>
         </form>
       </div>
+      <LegalDocumentModal doc={openLegalDoc} onClose={() => setOpenLegalDoc(null)} />
     </div>
   );
 };

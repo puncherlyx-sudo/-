@@ -25,6 +25,7 @@ export interface LegalConsentRecord {
   acceptedTerms: boolean;
   acceptedAiProcessing: boolean;
   acceptedDisclaimer: boolean;
+  acceptedAuthDataTransfer?: boolean;
 }
 
 export interface LocalReadOnlyExchangeKey {
